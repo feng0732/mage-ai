@@ -226,18 +226,60 @@ Pipeline.execute()
 
 适用于生产环境，由 [mage_ai/orchestration/pipeline_scheduler_original.py](mage_ai/orchestration/pipeline_scheduler_original.py) 中的 `PipelineScheduler` 驱动。
 
-**调度流程**：
+**`schedule()` 完整控制流**（[pipeline_scheduler_original.py:213](mage_ai/orchestration/pipeline_scheduler_original.py#L213)）：
 
 ```
-PipelineScheduler.start()
-  → PipelineRun.create_block_runs()       # 为所有可执行块创建 BlockRun 记录
-  → PipelineScheduler.schedule()
-    → update_block_run_statuses(initial_block_runs)  # 传播失败状态
-    → PipelineRun.executable_block_runs()             # 筛选当前可执行的 BlockRun
-    → 对每个可执行 BlockRun:
-        → job_manager.add_job(run_block, ...)         # 提交作业
-    → on_block_complete() → 再次 schedule()            # 递归调度
+1. 分布式锁保护（try_acquire_lock，10s 超时）
+2. __run_heartbeat()  ← 最先执行，可能触发内存超限清理
+3. block_runs.refresh()  ← 刷新所有块状态
+4. 分支：
+   ├── STREAMING 管道 → __schedule_pipeline()  （整体单作业模式）
+   └── 普通管道：
+         ├── 获取 schedule / backfill 信息
+         ├── if all_blocks_completed(allow_blocks_to_fail):
+         │     ├── 集成管道: calculate_pipeline_run_metrics()
+         │     ├── if any_blocks_failed():
+         │     │     → update(status=FAILED) + on_pipeline_run_failure()
+         │     └── else:
+         │           → complete() + send_pipeline_run_success_message()
+         │           + UsageStatisticLogger + backfill/schedule 状态更新
+         ├── elif __check_pipeline_run_timeout():
+         │     → update(status=timeout_status) + on_pipeline_run_failure()
+         ├── elif any_blocks_failed() and not allow_blocks_to_fail:
+         │     → update(status=FAILED) + backfill 状态 + on_pipeline_run_failure()
+         ├── elif INTEGRATION 管道:
+         │     → __schedule_integration_streams()
+         ├── elif run_pipeline_in_one_process:
+         │     → __schedule_pipeline()
+         └── else:
+               → if not __check_block_run_timeout():
+                     __schedule_blocks()
 ```
+
+**关键行为**：
+- 前三个 `if/elif` 分支（完成、超时、失败且不允许失败）在调用 `on_pipeline_run_failure()` 后，elif 链自然结束，**不会继续进入后续调度分支**
+- 但 `__run_heartbeat()` 是在分支之前独立调用的（第 2 步），无论是否触发 `memory_usage_failure()`，都会继续往下执行（详见 9.12 节）
+
+**心跳检测 `__run_heartbeat()`**（[pipeline_scheduler_original.py:906](mage_ai/orchestration/pipeline_scheduler_original.py#L906)）：
+
+```python
+def __run_heartbeat(self):
+    load1, load5, load15, cpu_count = get_compute()
+    cpu_usage = load15 / cpu_count if cpu_count else None
+    free_memory, used_memory, total_memory = get_memory()
+    memory_usage = used_memory / total_memory if total_memory else None
+
+    self.logger.info('Pipeline ... is alive.', **tags)
+
+    if (
+        memory_usage
+        and memory_usage >= MEMORY_USAGE_MAXIMUM
+        and ExecutorFactory.get_default_executor_type() == ExecutorType.LOCAL_PYTHON
+    ):
+        self.memory_usage_failure(tags=tags)   # ← 触发清理后无 return
+```
+
+心跳完成后无任何 return 或状态检查，`schedule()` 继续进入后续分支逻辑。
 
 **`executable_block_runs()` 方法**（[schedules.py:978](mage_ai/orchestration/db/models/schedules.py#L978)）实现了基于数据库状态的拓扑排序判断：
 
@@ -254,7 +296,7 @@ PipelineScheduler.start()
 
 ### 5.3 路径三：Streaming 管道
 
-[mage_ai/data_preparation/executors/streaming_pipeline_executor.py](mage_ai/data_preparation/executors/streaming_pipeline_executor.py) 中的 `StreamingPipelineExecutor` 采用不同的拓扑遍历策略：
+[mage_ai/data_preparation/executors/streaming_pipeline_executor.py](mage_ai/data_preparation/executors/streaming_pipeline_executor.py) 中的 `StreamingPipelineExecutor` 采用不同的拓扑遍历策略和调度模型。
 
 **验证阶段** `parse_and_validate_blocks()`（[streaming_pipeline_executor.py:35](mage_ai/data_preparation/executors/streaming_pipeline_executor.py#L35)）：
 - 强制要求恰好 1 个 DATA_LOADER 作为 source（且无上游），否则 `raise Exception`
@@ -262,6 +304,18 @@ PipelineScheduler.start()
 - DATA_EXPORTER 必须是叶子节点（无下游），否则 `raise Exception`
 
 **执行阶段**：从 source 块开始，通过 DFS 递归 `handle_batch_events_recursively()` 沿下游链路逐层处理数据。
+
+**与普通管道的关键调度差异**：
+
+| 维度 | 普通管道 | Streaming 管道 |
+|---|---|---|
+| **调度入口** | `schedule()` 根据类型走多个 elif 分支（集成/单进程/多进程） | `schedule()` 第 1 个分支直接 `__schedule_pipeline()`（[pipeline_scheduler_original.py:222](mage_ai/orchestration/pipeline_scheduler_original.py#L222)） |
+| **超时检测** | `__check_pipeline_run_timeout()` + `__check_block_run_timeout()` | ❌ **无管道超时**，也无块级超时检测 |
+| **完成/失败检测** | `all_blocks_completed()` / `any_blocks_failed()` 每轮调度都检查 | ❌ schedule() 中 **完全跳过**，依赖 StreamingPipelineExecutor 自身异常终止 |
+| **Executor 启动时状态检查** | `PipelineExecutor.execute()` 检查 `status != RUNNING` 则 early return（[pipeline_executor.py:73](mage_ai/data_preparation/executors/pipeline_executor.py#L73)） | ❌ `StreamingPipelineExecutor.execute()` **无状态检查**，直接启动 source/sink（[streaming_pipeline_executor.py:75](mage_ai/data_preparation/executors/streaming_pipeline_executor.py#L75)） |
+| **崩溃块恢复** | `__fetch_crashed_block_runs()` 将无作业的 RUNNING/QUEUED 块重置为 INITIAL | ❌ `__schedule_pipeline()` 中显式跳过（[pipeline_scheduler_original.py:858](mage_ai/orchestration/pipeline_scheduler_original.py#L858)） |
+| **重试策略** | 块级 `RetryConfig` + 管道级 `allow_blocks_to_fail` | Executor 级整体重试（`__execute_with_retry()`），无管道级 `allow_blocks_to_fail` |
+| **心跳后清理** | 多进程模式最终无作业可调度（块都为 CANCELLED）；单进程模式虽提交作业但 Executor 早退出 | ⚠️ 即使已 stop，仍会提交**新作业**且 Executor 不检查状态（详见 9.12） |
 
 ### 5.4 ExecutorFactory 执行器选择
 
@@ -947,6 +1001,110 @@ retry_config = merge_dict(
 
 `RetryConfig` 包含：`retries`、`delay`、`max_delay`、`exponential_backoff`。重试耗尽后异常向上传播，进入 9.2 的 FAILED 流程。
 
+### 9.12 心跳触发清理后 schedule() 的执行路径
+
+#### 核心问题
+
+`__run_heartbeat()` 在 `schedule()` 的**第 2 步**就被调用（[pipeline_scheduler_original.py:217](mage_ai/orchestration/pipeline_scheduler_original.py#L217)），位于所有分支逻辑之前。若心跳检测到内存超限并调用 `memory_usage_failure()` 执行清理，`schedule()` **不会提前 return**，会继续执行后续所有分支。
+
+完整代码结构：
+
+```python
+def schedule(self, block_runs=None):
+    if not lock.try_acquire_lock(...):
+        return
+    self.__run_heartbeat()            # 可能触发 memory_usage_failure() → stop()
+    # ↓ 无论是否触发清理，都会继续走到这里
+    for b in self.pipeline_run.block_runs:
+        b.refresh()
+    if PipelineType.STREAMING == self.pipeline.type:
+        self.__schedule_pipeline()    # ← 流式管道：直接去调度
+    else:
+        ...                           # ← 普通管道：进入 elif 链
+```
+
+`memory_usage_failure()` 函数本身无 return 也无异常，执行完 `stop()` + 发通知后，控制权返回 `schedule()`。
+
+#### 普通管道（非 STREAMING）的后续路径
+
+心跳 `stop()` 之后，所有 BlockRun 和 PipelineRun 的状态都被设为 CANCELLED。后续分支行为：
+
+| 分支 | 条件 | 结果 | 是否继续调度 |
+|---|---|---|---|
+| 1. `all_blocks_completed()` | 检查所有块状态是否在 `[COMPLETED, CONDITION_FAILED]`（或含 FAILED）| **返回 False** — CANCELLED 不在列表中（[schedules.py:1522](mage_ai/orchestration/db/models/schedules.py#L1522)） | — |
+| 2. `__check_pipeline_run_timeout()` | 比较运行时长与 timeout 配置 | 通常返回 False（除非恰好同时超时） | — |
+| 3. `any_blocks_failed()` | 检查是否有 FAILED 状态块 | **返回 False** — 所有块都是 CANCELLED（[schedules.py:1519](mage_ai/orchestration/db/models/schedules.py#L1519)） | — |
+| 4. `INTEGRATION` 管道 | 类型匹配 | 普通管道跳过 | — |
+| 5. `run_pipeline_in_one_process` | 配置为单进程模式 | **调用 `__schedule_pipeline()`** → 提交新的 PIPELINE_RUN 作业 | ⚠️ 是 |
+| 6. else（多进程模式） | 默认分支 | 先 `__check_block_run_timeout()`（无运行中块→False），再 `__schedule_blocks()` → `executable_block_runs()` 仅筛选 INITIAL → **无可调度块** | ❌ 否 |
+
+**普通多进程管道最终状态**：安全。无可调度块，管道停留在 CANCELLED 状态。
+
+**普通单进程管道**：`__schedule_pipeline()` 会提交新作业，但 `PipelineExecutor.execute()` 启动时会检查（[pipeline_executor.py:73](mage_ai/data_preparation/executors/pipeline_executor.py#L73)）：
+
+```python
+pipeline_run = PipelineRun.query.get(pipeline_run_id)
+if pipeline_run.status != PipelineRun.PipelineRunStatus.RUNNING:
+    return   # 当前状态是 CANCELLED，直接退出
+```
+
+因此单进程管道最终也安全——作业会启动但立即退出。
+
+#### Streaming 管道的后续路径
+
+心跳 `stop()` 之后，代码立即进入：
+
+```python
+if PipelineType.STREAMING == self.pipeline.type:
+    self.__schedule_pipeline()    # [pipeline_scheduler_original.py:223]
+```
+
+`__schedule_pipeline()`（[pipeline_scheduler_original.py:836](mage_ai/orchestration/pipeline_scheduler_original.py#L836)）：
+
+```python
+def __schedule_pipeline(self):
+    job_manager = get_job_manager()
+    if job_manager.has_pipeline_run_job(self.pipeline_run.id, ...):
+        return                     # 仅检查是否已有作业
+    # ❌ 无任何 pipeline_run.status 检查
+    if PipelineType.STREAMING != self.pipeline.type:
+        self.__fetch_crashed_block_runs()   # 流式管道显式跳过崩溃块恢复
+    job_manager.add_job(JobType.PIPELINE_RUN, ..., run_pipeline, ...)
+```
+
+**关键缺陷**：
+1. `__schedule_pipeline()` **不检查** `pipeline_run.status`，仅检查是否已有作业存在
+2. `stop()` 刚 kill 了作业，所以 `has_pipeline_run_job()` 返回 False
+3. 于是**提交一个全新的 PIPELINE_RUN 作业**
+
+`run_pipeline()` → `StreamingPipelineExecutor.execute()` 时，**也不检查状态**（[streaming_pipeline_executor.py:75](mage_ai/data_preparation/executors/streaming_pipeline_executor.py#L75)），直接初始化 source 和 sink 开始消费数据。
+
+**Streaming 管道的无限循环风险**：
+```
+心跳检测到内存超限 → memory_usage_failure() → stop()（CANCELLED + kill 作业）
+    → schedule() 继续 → __schedule_pipeline()（无作业→提交新作业）
+    → StreamingPipelineExecutor 启动（不检查 CANCELLED 状态）
+    → 运行中内存继续增长 → 下次心跳再次触发超限
+    → 无限循环
+```
+
+#### 三个失败入口 vs 心跳的行为对比
+
+| 清理触发方式 | 位置 | schedule() 是否继续往下走 |
+|---|---|---|
+| 入口 2/3/4 的 `on_pipeline_run_failure()` | 在 `if-elif-elif` 链内部调用 | ❌ 否。elif 链自然结束，函数退出 |
+| 入口 1 初始化失败 | `start()` 的 `except` 块中，`return False` | ❌ 否。函数显式 return |
+| 入口 5 `memory_usage_failure()`（心跳内） | 在 `schedule()` 最开头，所有分支之前 | ✅ **是**。心跳后无 return，所有分支继续执行 |
+
+#### 风险影响矩阵
+
+| 管道类型 × 模式 | 心跳后是否继续调度 | 最终实际影响 | 风险等级 |
+|---|---|---|---|
+| **普通 + 多进程** | 进入多进程分支，但无 INITIAL 块可调度 | 管道停留在 CANCELLED，无实际作业 | 低 |
+| **普通 + 单进程** | 提交新 PIPELINE_RUN 作业 | Executor 检查 status ≠ RUNNING 立即退出 | 低（有安全网） |
+| **Integration** | 进入 `__schedule_integration_streams()` | 需进一步评估（可能有 stream 级状态检查） | 中 |
+| **Streaming** | 提交新 PIPELINE_RUN 作业 | Executor 不检查状态，实际重新运行，可能无限循环 | **高** |
+
 ---
 
 ## 10. 模块间协作关系
@@ -1061,11 +1219,14 @@ retry_config = merge_dict(
 
 | 风险类别 | 描述 | 来源代码位置 | 严重程度 |
 |---|---|---|---|
+| **Streaming 管道内存超限死循环** | `__run_heartbeat()` 在所有分支之前触发 `memory_usage_failure() → stop()`，但 `schedule()` 无 return 继续执行；Streaming 管道直接进入 `__schedule_pipeline()`，其**不检查 pipeline_run.status**，且 `StreamingPipelineExecutor.execute()` 也不检查 CANCELLED 状态，导致"心跳超限 → stop → 重新提交作业 → 运行 → 再超限"的无限循环 | [pipeline_scheduler_original.py:217](mage_ai/orchestration/pipeline_scheduler_original.py#L217)、[pipeline_scheduler_original.py:223](mage_ai/orchestration/pipeline_scheduler_original.py#L223)、[pipeline_scheduler_original.py:836](mage_ai/orchestration/pipeline_scheduler_original.py#L836)、[streaming_pipeline_executor.py:75](mage_ai/data_preparation/executors/streaming_pipeline_executor.py#L75) | **高** |
 | **缺失节点静默忽略** | YAML 中引用不存在的块 UUID 不会报错，仅被列表推导式过滤，上游丢失使块意外成为 root block | [pipeline.py:1032](mage_ai/data_preparation/models/pipeline.py#L1032) | 高 |
 | **get_block() 仅 print 不抛异常** | 找不到块时 `print` 到 stdout 后返回 `None`，调用方若不检查则后续 AttributeError | [pipeline.py:1913](mage_ai/data_preparation/models/pipeline.py#L1913) | 高 |
+| **Streaming 管道无超时/无失败检测** | schedule() 中 Streaming 管道直接走 `__schedule_pipeline()`，完全跳过 `all_blocks_completed()`、`__check_pipeline_run_timeout()`、`any_blocks_failed()` 三个检测分支。管道挂起或异常后无调度器层面的兜底 | [pipeline_scheduler_original.py:222](mage_ai/orchestration/pipeline_scheduler_original.py#L222) | 中 |
 | **初始化失败缺失清理（入口1）** | `start()` 初始化异常是**唯一不执行任何清理**的失败路径：无 UsageStatisticLogger、无 cancel_block_runs、无作业 kill。集成管道若在 initialize_state_and_runs() 中途抛异常，可能残留 state/output 文件 | [pipeline_scheduler_original.py:176](mage_ai/orchestration/pipeline_scheduler_original.py#L176) | 中 |
 | **stacktrace 只取第一个失败块** | 多失败块场景下通知仅包含第一个有 `error.message` 的块的堆栈，其余失败原因被隐藏，排障困难 | [pipeline_scheduler_original.py:350](mage_ai/orchestration/pipeline_scheduler_original.py#L350) | 中 |
 | **stop_pipeline_run 状态守卫陷阱** | `stop_pipeline_run()` 开头检查 `status not in [INITIAL, RUNNING]` 直接 return。若代码路径中先 `update(status=FAILED)` 再调用 `stop()`，清理逻辑会被静默跳过。当前5个入口恰好避开，但后续代码变更易踩坑 | [pipeline_scheduler_original.py:1445](mage_ai/orchestration/pipeline_scheduler_original.py#L1445) | 中 |
+| **all_blocks_completed 不包含 CANCELLED** | `all_blocks_completed()` 的状态列表不含 CANCELLED。心跳 `stop()` 将块全部设为 CANCELLED 后，该检测返回 False，管道永远无法从调度器视角"完成"，只能依赖下一轮调度分支的隐性终止 | [schedules.py:1522](mage_ai/orchestration/db/models/schedules.py#L1522) | 中 |
 | **管道最终状态语义不一致** | 5 个失败入口产生 3 种管道最终状态：入口1/2/4 → FAILED，入口3 → timeout_status（默认 FAILED），入口5 → CANCELLED。下游消费方需同时处理多种失败态，且 CANCELLED 与 FAILED 的区分语义不明显 | [pipeline_scheduler_original.py:629](mage_ai/orchestration/pipeline_scheduler_original.py#L629)、[pipeline_scheduler_original.py:1452](mage_ai/orchestration/pipeline_scheduler_original.py#L1452) | 中 |
 | **通知内容策略不统一** | A 类入口传 `error+stacktrace`，B 类（入口5）传 `summary`，C 类（入口1）仅传固定 `error`。消费方（如 Slack hook）需同时适配三种参数组合 | [sender.py:187](mage_ai/orchestration/notification/sender.py#L187) | 低 |
 | **图结构修改无事务** | `add_block()` / `update_block()` 中先修改内存结构再 validate，环检测失败时内存状态已被修改 | [pipeline.py:1878](mage_ai/data_preparation/models/pipeline.py#L1878)、[pipeline.py:2137](mage_ai/data_preparation/models/pipeline.py#L2137) | 中 |
@@ -1079,30 +1240,38 @@ retry_config = merge_dict(
 
 ## 13. 后续研究方向
 
-1. **缺失节点校验增强**：在 `__initialize_blocks_by_uuid()` 中对缺失的引用产生警告日志（而非静默跳过），帮助用户及早发现配置错误
+1. **Streaming 管道心跳死循环修复**：在 `__schedule_pipeline()` 开头增加 `pipeline_run.status` 检查（参考 `PipelineExecutor.execute()` 的实现），同时在 `StreamingPipelineExecutor.execute()` 入口增加相同检查，打破心跳超限后的无限循环。并在 `__run_heartbeat()` 触发 `memory_usage_failure()` 后增加 early return，防止继续调度。
 
-2. **get_block() 异常化**：将 `print` 改为 `logger.error()` 并在关键调用路径中检查返回值，或提供 `get_block_strict()` 变体在找不到块时抛异常
+2. **Streaming 管道调度兜底补齐**：在 Streaming 管道的 schedule 分支中补充 `all_blocks_completed()`、`__check_pipeline_run_timeout()` 和 `any_blocks_failed()` 检测，或在 `StreamingPipelineExecutor` 内建立心跳回调机制，避免调度器层面完全无监控。
 
-3. **失败入口清理路径统一化**：将入口 1（初始化失败）改为调用统一的 `stop_pipeline_run()` 或 `on_pipeline_run_failure()`，确保 `UsageStatisticLogger`、`cancel_block_runs_and_jobs()` 等清理动作完整执行。考虑抽取 `PipelineFailureHandler` 统一处理所有失败入口
+3. **心跳清理后状态检查**：`__run_heartbeat()` 之后增加 `if pipeline_run.status not in [RUNNING, INITIAL]: return` 的早期退出，避免任何类型管道在清理后继续进入调度分支。
 
-4. **stop_pipeline_run 守卫策略重构**：将"状态不在 INITIAL/RUNNING 直接 return"改为"根据当前状态判定是否需要执行剩余清理步骤"，避免因调用顺序变化导致清理被静默跳过
+4. **all_blocks_completed 语义扩展**：考虑将 CANCELLED 状态纳入 `all_blocks_completed()` 的"完成"状态集合，使心跳清理后的管道能被正确识别为已终止。
 
-5. **管道最终状态语义统一**：明确 FAILED / CANCELLED 两种终止状态的语义边界，或统一为单终止态（如 FAILED）+ 子字段（failure_reason），简化下游消费方逻辑
+5. **缺失节点校验增强**：在 `__initialize_blocks_by_uuid()` 中对缺失的引用产生警告日志（而非静默跳过），帮助用户及早发现配置错误
 
-6. **多失败块 stacktrace 聚合**：当前仅取第一个失败块的错误消息，可改为聚合所有失败块的关键信息（如 `block1: KeyError x; block2: Timeout after 300s`），便于一次性排查
+6. **get_block() 异常化**：将 `print` 改为 `logger.error()` 并在关键调用路径中检查返回值，或提供 `get_block_strict()` 变体在找不到块时抛异常
 
-7. **增量环检测**：当前 `validate()` 每次全量遍历，对于大型管道可考虑增量检测算法，仅在修改影响范围内检查
+7. **失败入口清理路径统一化**：将入口 1（初始化失败）改为调用统一的 `stop_pipeline_run()` 或 `on_pipeline_run_failure()`，确保 `UsageStatisticLogger`、`cancel_block_runs_and_jobs()` 等清理动作完整执行。考虑抽取 `PipelineFailureHandler` 统一处理所有失败入口
 
-8. **图结构修改事务化**：将 `validate()` → `save()` 的过程包装为原子操作，验证失败时回滚内存状态（深拷贝 → 修改 → validate → 赋值）
+8. **stop_pipeline_run 守卫策略重构**：将"状态不在 INITIAL/RUNNING 直接 return"改为"根据当前状态判定是否需要执行剩余清理步骤"，避免因调用顺序变化导致清理被静默跳过
 
-9. **BFS 环检测优化**：`run_blocks()` 中的 tries >= 1000 兜底可替换为显式入度计数，在 O(V+E) 时间内判断是否有环，并输出具体环路径
+9. **管道最终状态语义统一**：明确 FAILED / CANCELLED 两种终止状态的语义边界，或统一为单终止态（如 FAILED）+ 子字段（failure_reason），简化下游消费方逻辑
 
-10. **BlockRun 超时清理**：对调度器中长期处于 INITIAL 状态的 BlockRun 增加 gc 逻辑或告警，避免因缺失节点导致管道永远无法完成
+10. **多失败块 stacktrace 聚合**：当前仅取第一个失败块的错误消息，可改为聚合所有失败块的关键信息（如 `block1: KeyError x; block2: Timeout after 300s`），便于一次性排查
 
-11. **并行度自适应**：当前 BFS 遍历中同一层的块全部并行执行，可考虑根据系统资源（CPU/内存）和 `concurrency_config.block_run_limit` 动态控制并行度
+11. **增量环检测**：当前 `validate()` 每次全量遍历，对于大型管道可考虑增量检测算法，仅在修改影响范围内检查
 
-12. **DAG 可视化与调试**：利用 [presenters/blocks/graph.py](mage_ai/presenters/blocks/graph.py) 中已有的图构建逻辑，增强运行时 DAG 可视化，展示动态块展开后的完整执行图
+12. **图结构修改事务化**：将 `validate()` → `save()` 的过程包装为原子操作，验证失败时回滚内存状态（深拷贝 → 修改 → validate → 赋值）
 
-13. **拓扑排序缓存**：对于结构不变的管道，可缓存拓扑排序结果，避免每次执行都重新遍历
+13. **BFS 环检测优化**：`run_blocks()` 中的 tries >= 1000 兜底可替换为显式入度计数，在 O(V+E) 时间内判断是否有环，并输出具体环路径
 
-14. **Streaming 管道的 DAG 扩展**：放宽单 source 限制，支持多源流式 DAG，适应更复杂的数据流场景
+14. **BlockRun 超时清理**：对调度器中长期处于 INITIAL 状态的 BlockRun 增加 gc 逻辑或告警，避免因缺失节点导致管道永远无法完成
+
+15. **并行度自适应**：当前 BFS 遍历中同一层的块全部并行执行，可考虑根据系统资源（CPU/内存）和 `concurrency_config.block_run_limit` 动态控制并行度
+
+16. **DAG 可视化与调试**：利用 [presenters/blocks/graph.py](mage_ai/presenters/blocks/graph.py) 中已有的图构建逻辑，增强运行时 DAG 可视化，展示动态块展开后的完整执行图
+
+17. **拓扑排序缓存**：对于结构不变的管道，可缓存拓扑排序结果，避免每次执行都重新遍历
+
+18. **Streaming 管道的 DAG 扩展**：放宽单 source 限制，支持多源流式 DAG，适应更复杂的数据流场景
