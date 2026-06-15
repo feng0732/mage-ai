@@ -178,8 +178,12 @@ __delete_show_or_update() 执行顺序（逐行核准）：
           ├── 注入 oauth_client / oauth_token / api_operation_action
           └── __parent_model() → 嵌套资源时预加载父对象
 
-  L585  2. Resource.process_member(pk, user, **updated_options)  ← ✅ 先加载业务对象
-          （Resource 类通过动态 import：resource 名 → singularize → classify → XxxResource）
+  L585  2. Resource.process_member(pk, user, **updated_options)  ← ✅ 先加载
+          ├── Resource 类通过动态 import：resource 名 → singularize → classify → XxxResource
+          │
+          └── 【各 action 的业务边界不同】：
+              ├── DETAIL：这一步就是 DETAIL 的业务本身（拿到了完整对象）
+              ├── DELETE/UPDATE：只是预加载，实际删除/更新还在后面
 
   L594  3. __run_hooks_before()  ← BEFORE Hooks
           ├── UPDATE: 先调 __payload_for_resource() 提取 payload，再跑 Hooks
@@ -196,24 +200,32 @@ __delete_show_or_update() 执行顺序（逐行核准）：
           parser = ParserClass(resource=res, user=user, policy=policy, **updated_options)
           （Parser 可选，不存在则跳过所有 Parser 步骤）
 
-  L612  6. Parser 解析 + 字段/查询授权（按 action 分支）：
+  L612  6. Parser 解析 + 字段/查询授权 + 实际业务（按 action 分支）：
           ┌─ DELETE（L612-L613）:
-          │    无 Parser 调用，直接执行 res.process_delete()
+          │    无 Parser 调用
+          │    执行业务：res.process_delete()
           │
           ├─ DETAIL（L614-L661）:
           │    Parser.parse_query_and_authorize(self.query, build_authorize_query)
           │    └── 内部调用 authorize_query() → 查询参数级授权
-          │    特殊：如 parser_found + error，会用修改后的 query 重新 process_member
+          │    【特殊回退】：如果 parser_found + error，
+          │         会用修改后的 query 重新 process_member(pk) 第二次加载对象
+          │         并再次 authorize_query() —— DETAIL 无额外"业务执行"步骤
           │
           └─ UPDATE（L663-L710）:
-               ① Parser.parse_write_attributes_and_authorize(payload, build_auth_attrs)
+               ① Parser.parse_write_attributes_and_authorize(payload)
                  └── 内部调用 authorize_attributes(WRITE) → 字段级写授权
-               ② Parser.parse_query_and_authorize(self.query, build_authorize_query)
+               ② Parser.parse_query_and_authorize(self.query)
                  └── 内部调用 authorize_query() → 查询参数级授权
-               ③ 执行 res.process_update(payload, query=...)
+               ③ 执行业务：res.process_update(payload, query=...)
 
   L712  7. return res  ← 返回 Resource 对象（可能已被 DELETE/UPDATE 修改状态）
 ```
+
+> **各 action 的业务操作边界总结**：
+> - DETAIL：业务在第 2 步（process_member）；第 4、6 步都是**事后校验**（不通过就丢弃）
+> - DELETE：加载在第 2 步，业务删除在第 6 步，中间隔着 Hooks + 授权
+> - UPDATE：加载在第 2 步，写授权在第 6 步①②，业务更新在第 6 步③
 
 ### 3.3 路径 B：CREATE / LIST 执行顺序（`__create_or_index` L485-L580）
 
@@ -384,101 +396,114 @@ __create_or_index() 执行顺序（逐行核准）：
 
 同样是 Parser，5 种 action 实际调用的方法和授权层级不同：
 
-| Action | 所属路径 | Parser 调用（业务操作前） | 授权层级 | 最终 Resource 调用 |
-|--------|---------|--------------------------|---------|-------------------|
-| **DETAIL** | 路径 A | `parse_query_and_authorize(query, build_authorize_query)` | authorize_query（查询级） | 已在第 2 步通过 `process_member()` 加载完成 |
-| **DELETE** | 路径 A | ❌ 无 Parser 调用 | 仅 authorize_action（动作级） | `res.process_delete()` |
-| **UPDATE** | 路径 A | ① `parse_write_attributes_and_authorize(payload, build_auth_attrs)`  <br> ② `parse_query_and_authorize(query, build_authorize_query)` | authorize_attributes(WRITE)（字段级写） + authorize_query（查询级） | `res.process_update(payload, query=...)` |
-| **CREATE** | 路径 B | `parse_write_attributes_and_authorize(payload, build_auth_attrs)` | authorize_attributes(WRITE)（字段级写） | `XxxResource.process_create(payload, ...)` |
-| **LIST** | 路径 B | `parse_query_and_authorize(query, build_authorize_query)` | authorize_query（查询级） | `XxxResource.process_collection(query, meta, ...)` |
+| Action | 所属路径 | Parser 调用位置（相对业务操作） | 授权层级 | Resource 业务调用边界 |
+|--------|---------|--------------------------------|---------|---------------------|
+| **DETAIL** | 路径 A | Parser 在 **process_member 之后**（L633） | authorize_query（查询级） | 业务操作就是 `process_member()`（L585），Parser 是事后过滤<br>⚠️ 解析失败会再 `process_member()` 一次（L643） |
+| **DELETE** | 路径 A | ❌ 无 Parser 调用 | 仅 authorize_action（动作级） | 加载：`process_member()`（L585）<br>删除：`res.process_delete()`（L613），都在授权之后 |
+| **UPDATE** | 路径 A | Parser 在 **process_member 之后，process_update 之前**（L673/L698） | authorize_attributes(WRITE) + authorize_query | 加载：`process_member()`（L585）<br>更新：`res.process_update()`（L710），在 Parser 之后 |
+| **CREATE** | 路径 B | Parser 在 **process_create 之前**（L523） | authorize_attributes(WRITE)（字段级写） | 创建：`process_create()`（L534），在 Parser 之后 |
+| **LIST** | 路径 B | Parser 在 **process_collection 之前**（L561） | authorize_query（查询级） | 查询：`process_collection()`（L574），在 Parser 之后 |
 
-> **所有 action 的公共授权（业务操作后）**：在 execute() 第 9、10 步还会再做一次
+> **所有 action 的公共授权（业务操作后）**：Presenter 转换 + AFTER Hooks 之后，还会再遍历每条结果做一次
 > `authorize_attributes(READ)` + `parse_read_attributes_and_authorize()` 的字段级读过滤。
 > 即：写操作会经历 WRITE 授权 + READ 授权两次；读操作会经历 QUERY 授权 + READ 授权两次。
 
 ---
 
-### 5.4 授权的完整生命周期（双路径 + 三重漏斗 + 前后双段）
+### 5.4 授权的完整生命周期（5 种 action 精确顺序对照）
 
-> **重要**：授权层级（动作级 → 查询/字段级 → 字段级读过滤）是一致的，但
-> **Resource 加载/调用与 authorize_action() 的先后顺序在两条路径上相反**。
+> **重要修正**：**不存在统一的"漏斗1 → 漏斗2 → Resource"顺序**。
+> 两种路径的漏斗与 Resource 的相对位置不同；同属路径 A 的 DETAIL 与 DELETE/UPDATE 也有差异。
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                           业务操作前（第 5 步 __executed_result() 内部）              │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   ┌──────────────────────── 路径 A：DELETE / DETAIL / UPDATE ──────────────────────┐│
-│   │                                                                                ││
-│   │  ① Resource.process_member(pk)  ← 先加载对象                                    ││
-│   │     （已拿到 res，Policy 条件可依赖对象属性）                                     ││
-│   │                                                                                ││
-│   │  ② __run_hooks_before()  ← BEFORE Hooks                                        ││
-│   │                                                                                ││
-│   │  ③ policy.authorize_action(ACTION)  ← 漏斗 1：动作级授权（后做）                 ││
-│   │     └─ Policy 实例化时传入 resource=res                                          ││
-│   │                                                                                ││
-│   │  ④ Parser 解析 + 授权（漏斗 2）：                                               ││
-│   │     ├─ DELETE: 无 Parser                                                        ││
-│   │     ├─ DETAIL: parse_query_and_authorize()                                      ││
-│   │     │          → authorize_query()  ← 查询级                                     ││
-│   │     └─ UPDATE: ① parse_write_attributes_and_authorize()                         ││
-│   │                  → authorize_attributes(WRITE)  ← 字段级写                       ││
-│   │               ② parse_query_and_authorize()                                     ││
-│   │                  → authorize_query()  ← 查询级                                   ││
-│   │                                                                                ││
-│   │  ⑤ 执行业务：                                                                   ││
-│   │     ├─ DELETE: res.process_delete()                                             ││
-│   │     ├─ UPDATE: res.process_update(payload)                                      ││
-│   │     └─ DETAIL: （已在第 ① 步加载完成）                                           ││
-│   │                                                                                ││
-│   └─────────────────────────────────────────────────────────────────────────────────┘│
-│                                                                                     │
-│   ┌──────────────────────── 路径 B：CREATE / LIST ────────────────────────────────┐ │
-│   │                                                                                │ │
-│   │  ① __run_hooks_before()  ← BEFORE Hooks（先跑）                                 │ │
-│   │                                                                                │ │
-│   │  ② policy.authorize_action(ACTION)  ← 漏斗 1：动作级授权（先做）                 │ │
-│   │     └─ Policy 实例化时传入 resource=None                                         │ │
-│   │                                                                                │ │
-│   │  ③ Parser 解析 + 授权（漏斗 2）：                                               │ │
-│   │     ├─ CREATE: parse_write_attributes_and_authorize()                           │ │
-│   │     │          → authorize_attributes(WRITE)  ← 字段级写                         │ │
-│   │     └─ LIST:   parse_query_and_authorize()                                      │ │
-│   │                → authorize_query()  ← 查询级                                     │ │
-│   │                                                                                │ │
-│   │  ④ Resource 业务调用  ← 最后才调用                                               │ │
-│   │     ├─ CREATE: XxxResource.process_create(payload)                               │ │
-│   │     └─ LIST:   XxxResource.process_collection(query, meta)                       │ │
-│   │                                                                                │ │
-│   └─────────────────────────────────────────────────────────────────────────────────┘ │
-│                                                                                     │
-│   共同点：漏斗 1（动作级）→ 漏斗 2（查询/字段级写）→ Resource 业务操作                │
-│   差异点：漏斗 1 之前，路径 A 先加载 Resource，路径 B 先跑 Hooks                     │
-│                                                                                     │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                         业务操作后（execute() 第 9、10 步，所有 action 一致）          │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│  ① Presenter.present_resource()  → Resource 对象转成 dict（可能含嵌套资源）          │
-│                                                                                     │
-│  ② __run_hooks_after(SUCCESS)  ← AFTER Hooks                                       │
-│     可修改 presented 结果 / metadata / 注入 error                                   │
-│                                                                                     │
-│  ③ 遍历每条结果，漏斗 3：字段级读授权                                                │
-│     ├─ policy.authorize_attributes(READ, presented.keys())                          │
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                      业务操作前（第 5 步 __executed_result() 内部）                    │
+│                按 5 种 action 分别列出精确顺序（代码行号来自 base.py L582-L712）         │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  ┌──── DELETE（路径 A，L612-L613）─────────────────────────────────────────────┐     │
+│  │  ① process_member(pk)        ← Resource 加载（L585）                         │     │
+│  │  ② __run_hooks_before()      ← BEFORE Hooks（L594）                          │     │
+│  │  ③ authorize_action(DELETE)  ← 漏斗 1：动作级授权（L600）                     │     │
+│  │  ④ ——无 Parser——                                                             │     │
+│  │  ⑤ res.process_delete()      ← Resource 业务：删除（L613）                    │     │
+│  └──────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                      │
+│  ┌──── DETAIL（路径 A，L614-L661）─────────────────────────────────────────────┐     │
+│  │  ① process_member(pk)        ← Resource 业务：加载对象本身即为 DETAIL（L585） │     │
+│  │  ② __run_hooks_before()      ← BEFORE Hooks（L594）                          │     │
+│  │  ③ authorize_action(DETAIL)  ← 漏斗 1：动作级授权（L600）                     │     │
+│  │  ④ parse_query_and_authorize()                                               │     │
+│  │       → authorize_query()     ← 漏斗 2a：查询级授权（L633）                   │     │
+│  │     └── 如果 parser_found + error：                                           │     │
+│  │           重新 process_member()  ← ⚠️ 第二次 Resource 调用（L643）            │     │
+│  │           重新 authorize_query() ← 再做一次查询授权（L649）                   │     │
+│  │  ⑤ ——无额外业务——（业务已在第 ① 步完成）                                       │     │
+│  └──────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                      │
+│  ┌──── UPDATE（路径 A，L663-L710）─────────────────────────────────────────────┐     │
+│  │  ① process_member(pk)        ← Resource 加载（L585）                         │     │
+│  │  ② __run_hooks_before()      ← BEFORE Hooks + 提取 payload（L592-L597）      │     │
+│  │  ③ authorize_action(UPDATE)  ← 漏斗 1：动作级授权（L600）                     │     │
+│  │  ④ parse_write_attributes_and_authorize(payload)                             │     │
+│  │       → authorize_attributes(WRITE)  ← 漏斗 2b：字段级写授权（L673）         │     │
+│  │  ⑤ parse_query_and_authorize(query)                                           │     │
+│  │       → authorize_query()     ← 漏斗 2a：查询级授权（L698）                   │     │
+│  │  ⑥ res.process_update(payload, query=...)  ← Resource 业务：更新（L710）     │     │
+│  └──────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                      │
+│  ┌──── CREATE（路径 B，L513-L541）─────────────────────────────────────────────┐     │
+│  │  ① __run_hooks_before()      ← BEFORE Hooks + 提取 payload（L490-L498）      │     │
+│  │  ② authorize_action(CREATE)  ← 漏斗 1：动作级授权（L501）                     │     │
+│  │  ③ parse_write_attributes_and_authorize(payload)                             │     │
+│  │       → authorize_attributes(WRITE)  ← 漏斗 2b：字段级写授权（L523）         │     │
+│  │  ④ XxxResource.process_create(payload)  ← Resource 业务：创建（L534）        │     │
+│  └──────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                      │
+│  ┌──── LIST（路径 B，L542-L580）───────────────────────────────────────────────┐     │
+│  │  ① __run_hooks_before()      ← BEFORE Hooks（L493）                          │     │
+│  │  ② authorize_action(LIST)    ← 漏斗 1：动作级授权（L501）                     │     │
+│  │  ③ parse_query_and_authorize(query)                                           │     │
+│  │       → authorize_query()     ← 漏斗 2a：查询级授权（L561）                   │     │
+│  │  ④ XxxResource.process_collection(query, meta)  ← Resource 业务：列表（L574）│     │
+│  └──────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                      │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│                          业务操作后（execute() 第 6~11 步，所有 action 一致）           │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  ⑥ Presenter.present_resource()  → Resource 对象转 dict（可能嵌套资源）              │
+│                                                                                      │
+│  ⑦ 提取 ResultSet.metadata（仅 LIST 返回 ResultSet 时生效）                          │
+│                                                                                      │
+│  ⑧ __run_hooks_after(SUCCESS)   ← AFTER Hooks                                       │
+│     可修改 presented 结果 / metadata / 注入 error                                    │
+│                                                                                      │
+│  ⑨ 遍历每条结果：漏斗 3 — 字段级读授权                                               │
+│     ├─ policy.authorize_attributes(READ, presented.keys())                           │
 │     │    ← 对 presented dict 的每个 key 检查 READ 权限                               │
-│     │                                                                               │
-│     └─ Parser（存在时）：                                                            │
-│        parse_read_attributes_and_authorize()  → 输出字段再过滤 + 再授权             │
-│                                                                                     │
-│  ④ 组装最终响应：{ "resource": {...}, "metadata": {...}, "debug": {...} }           │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
+│     │                                                                                │
+│     └─ Parser（存在时）：                                                             │
+│        parse_read_attributes_and_authorize()  → 输出字段再过滤 + 再授权              │
+│                                                                                      │
+│  ⑩ 组装最终响应：{ "resource": {...}, "metadata": {...}, "debug": {...} }            │
+│                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-> 总结一句：**成员资源（DELETE/DETAIL/UPDATE）先加载对象再授权，集合创建（CREATE/LIST）先授权后调用 Resource。**
-> 授权的"三层漏斗"概念是一致的——动作级最粗、查询/字段级居中、读过滤最细——但 Resource 调用与第一层授权的先后顺序因路径而异。
+---
+
+#### 顺序差异关键结论
+
+| 对比维度 | DELETE / DETAIL / UPDATE（路径 A） | CREATE / LIST（路径 B） |
+|---------|-------------------------------------|-------------------------|
+| **process_member 与 authorize_action 的关系** | 先 `process_member(pk)` 加载对象 → 再 `authorize_action()` | **不调用** process_member；先 `authorize_action()` |
+| **BEFORE Hooks 与 Resource 调用的关系** | Hooks 在 Resource 加载**之后**执行（已拿到对象） | Hooks 在所有 Resource 调用**之前**执行 |
+| **Policy/Parser 实例化参数** | `Policy(resource=res)` `Parser(resource=res)` | `Policy(resource=None)` `Parser(resource=None)` |
+| **漏斗与 Resource 的相对位置** | DELETE：Resource 调用分为**两段**（加载在前，删除在后）<br>DETAIL：Resource 加载就是**业务本身**，两个漏斗都在其后<br>UPDATE：Resource 加载在前，漏斗居中，更新在后 | CREATE / LIST：漏斗 1 和漏斗 2 都在 **Resource 业务调用之前** |
+
+> **一句话记忆**：**成员资源（pk）先加载对象，再做漏斗校验；集合/创建先过完所有漏斗，再调用 Resource。**
+> 特别注意 DETAIL：它的"业务操作"就是最开头的 `process_member()`，授权和查询过滤都是**事后检查**（不通过就丢弃已加载的对象，必要时用过滤条件重新加载）。
 
 ---
 
