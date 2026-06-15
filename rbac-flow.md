@@ -230,19 +230,304 @@ validate_condition_with_cache(policy, operation)
     否则 → (False, False)
 ```
 
-### 3.4 entity_name 与 entity 的关键区别
+### 3.4 资源对象为空时的 entity_id 匹配（LIST/CREATE 场景）
 
-| 概念 | 类型 | 用途 | 层级继承 |
-|------|------|------|---------|
-| `Entity` (GLOBAL/PROJECT/PIPELINE) | 枚举 | 旧模式：权限作用的**层级范围** | 有，向上继承 |
-| `entity_name` (Pipeline, Block, ...) | 枚举 | 新模式：权限作用的**资源类型** | 无层级，但有通配符 |
+#### 3.4.1 核心判断逻辑
+
+**文件**: `mage_ai/api/policies/mixins/user_permissions.py` [L117-L127]
+
+```python
+# If the permission has an entity_id, check to see if it matches.
+if permission.entity_id is not None and resource:
+    id_attribute_name = 'id'
+    if entity_name in ENTITY_NAME_ENTITY_ID_ATTRIBUTE_NAME_MAPPING:
+        id_attribute_name = ENTITY_NAME_ENTITY_ID_ATTRIBUTE_NAME_MAPPING[entity_name]
+
+    if not hasattr(resource, id_attribute_name) or \
+            str(permission.entity_id) != str(getattr(resource, id_attribute_name)):
+        return (False, False)
+```
+
+**关键条件**: `permission.entity_id is not None and resource`
+
+这是一个 `AND` 逻辑，**两个条件同时满足才会进行 entity_id 检查**。这意味着：
+
+| 场景 | permission.entity_id | resource | entity_id 检查 | 权限是否参与判断 |
+|------|---------------------|----------|---------------|-----------------|
+| 详情/更新/删除 | 有值 | 存在 | ✅ 执行精确匹配 | 匹配则参与，不匹配则跳过 |
+| 详情/更新/删除 | None | 存在 | ❌ 跳过 | ✅ 参与（通配） |
+| **列表/创建** | 有值 | **None** | **❌ 跳过** | **✅ 参与（即使 entity_id 不匹配）** |
+| 列表/创建 | None | None | ❌ 跳过 | ✅ 参与 |
+
+#### 3.4.2 LIST 操作的两阶段权限检查
+
+**文件**: `mage_ai/api/operations/base.py`
+
+LIST 操作有两个独立的权限检查阶段：
+
+**阶段 1：操作级检查（获取列表前）** [L500-L501]
+```python
+policy = self.__policy_class()(None, self.user, **updated_options)  # resource=None
+await policy.authorize_action(self.action)  # LIST 操作级检查
+```
+- resource = None
+- entity_id 检查被跳过
+- 带具体 entity_id 的权限也会参与授权判断
+- 结果：决定"能不能调用列表接口"
+
+**阶段 2：属性级检查（返回结果前，逐个资源）** [L145-L188]
+```python
+for idx, res in enumerate(results):
+    policy = self.__policy_class()(res, self.user, **updated_options)  # resource=具体资源
+    await policy.authorize_attributes(READ, resource_attributes, ...)
+```
+- resource = 具体资源对象
+- entity_id 检查生效
+- 每个资源独立判断
+- 结果：决定"能不能读取这个资源的属性"
+- ⚠️ 任何一个资源检查失败 → 整个请求抛出 403
+
+#### 3.4.3 CREATE 操作的权限检查
+
+**阶段 1：操作级检查（创建前）** [L500-L501]
+- resource = None
+- entity_id 检查被跳过
+
+**阶段 2：写属性检查（创建前）** [L515-L529]
+- resource = None（因为还没创建出来）
+- entity_id 检查被跳过
+- 检查 payload 中的字段是否可写
+
+#### 3.4.4 对跨项目隔离的影响
+
+由于新模式**不使用** `Permission.entity` 字段（GLOBAL/PROJECT/PIPELINE 层级），且 resource=None 时 entity_id 检查被跳过，导致：
+
+1. **LIST 操作级检查无法实现项目隔离**：
+   - 用户在项目 A 中有一个特定 pipeline 的权限（entity_id="pipeline-in-proj-A"）
+   - 用户切换到项目 B，调用 LIST /pipelines
+   - 阶段 1 操作级检查：resource=None → entity_id 检查跳过 → 权限有效 → ✅ 通过
+   - 阶段 2 属性级检查：如果项目 B 中没有 entity_id 匹配的 pipeline → 所有 pipeline 都不匹配 → ❌ 403
+
+2. **CREATE 操作完全无法通过 entity_id 控制**：
+   - CREATE 时 resource 始终为 None
+   - entity_id 检查永远被跳过
+   - 只要有 entity_name 级别的 CREATE 权限就可以创建
+
+3. **实际隔离效果**：
+   - 操作级（能不能访问接口）：❌ 无隔离
+   - 属性级（能不能读具体资源的字段）：✅ 有隔离，但失败时整体 403，而非过滤掉无权限资源
+
+---
+
+### 3.5 授权缓存机制与跨资源污染
+
+#### 3.5.1 缓存结构
+
+**文件**: `mage_ai/api/mixins/result_set.py` [L81-L170]
+
+缓存存储在 `ResultSet.context.data` 中，key 结构如下：
+
+```
+操作级缓存：
+  operations → entity_name → operation → authorized(bool)
+
+属性级缓存：
+  attribute_operations → entity_name → operation → attribute_operation_type → resource_attribute → authorized(bool)
+```
+
+**关键观察**：缓存 key 中**不包含 entity_id**！
+
+#### 3.5.2 缓存读写流程
+
+**文件**: `mage_ai/api/policies/mixins/user_permissions.py` [L28-L57]
+
+```python
+async def validate_condition_with_cache(policy, operation, ...):
+    # 1. 尝试读取缓存
+    result = await (policy.resource or policy).load_cached_permission_authorization(...)
+    if result is not None:
+        return result  # 缓存命中，直接返回，不做任何检查
+
+    # 2. 缓存未命中，执行完整检查（包括 entity_id 匹配）
+    authorized = await validate_condition_with_permissions(policy, ...)
+
+    # 3. 写入缓存
+    await (policy.resource or policy).cache_permission_authorization(authorized, ...)
+
+    return authorized
+```
+
+#### 3.5.3 跨资源污染问题
+
+由于同一个 ResultSet 中的所有资源共享同一个缓存（`BasePolicy.result_set()` [BasePolicy.py L610-L614] 返回资源所属的 result_set），且缓存 key 不含 entity_id，会出现以下问题：
+
+**场景示例**：用户只有 pipeline-a 的权限，调用 LIST /pipelines 返回 [pipeline-a, pipeline-b, pipeline-c]
+
+```
+遍历第 1 个资源 pipeline-a:
+  ├─ 查缓存：operations → Pipeline → LIST → 无
+  ├─ 执行完整检查:
+  │   └─ entity_id 匹配（pipeline-a == pipeline-a）→ ✅ 授权
+  └─ 写入缓存：operations → Pipeline → LIST → True
+
+遍历第 2 个资源 pipeline-b:
+  ├─ 查缓存：operations → Pipeline → LIST → True（命中！）
+  └─ 直接返回 True ❌（跳过了 entity_id 检查）
+
+遍历第 3 个资源 pipeline-c:
+  ├─ 查缓存：operations → Pipeline → LIST → True（命中！）
+  └─ 直接返回 True ❌（跳过了 entity_id 检查）
+```
+
+**结果**：原本只有 pipeline-a 权限的用户，会被认为对所有 pipeline 都有权限。
+
+#### 3.5.4 对跨项目隔离的影响
+
+缓存污染会进一步加剧跨项目隔离的失效：
+
+1. **放大效应**：只要有一个资源匹配了权限，同类型的所有资源都会被认为有权限
+2. **项目间泄漏**：如果在项目 A 中缓存了授权结果，切换到项目 B 后（如果共享 result_set）缓存仍然有效
+3. **属性级同样受影响**：属性级缓存的 key 也不含 entity_id，同样存在污染问题
+
+---
+
+### 3.6 禁用优先原则与跨项目影响
+
+#### 3.6.1 禁用优先的聚合逻辑
+
+**文件**: `mage_ai/api/policies/mixins/user_permissions.py` [L243-L253]
+
+```python
+authorized = False
+unauthorized = False
+for permission_granted, permission_disabled in permission_access_arr:
+    if permission_granted:
+        authorized = True
+    if permission_disabled:
+        unauthorized = True
+
+return authorized and not unauthorized  # 禁用优先
+```
+
+**禁用优先原则**：只要有任何一个权限标记为禁用（`permission_disabled=True`），即使其他权限授予了访问，整体也会被拒绝。
+
+#### 3.6.2 禁用权限的三种来源
+
+| 禁用类型 | 触发条件 | 代码位置 |
+|----------|---------|---------|
+| 操作级禁用 | `permission.access & disable_access` | `user_permissions.py L130-L131` |
+| 属性操作全禁用 | `permission.access & DISABLE_QUERY_ALL` 等 | `user_permissions.py L172-L174` |
+| 具体属性禁用 | `attribute in permission.access_options['disabled_attributes']` | `user_permissions.py L185-L198` |
+
+#### 3.6.3 跨项目场景下的禁用优先问题
+
+由于新模式不区分 Entity 层级，且 entity_id 在 resource=None 时不检查，禁用权限可能产生跨项目的影响：
+
+**场景示例**：
+- 项目 A 中，用户有一个全局 Viewer 权限（entity_name=ALL, access=VIEWER）
+- 项目 B 中，管理员设置了一个禁用权限（entity_name=Pipeline, entity_id=None, access=DISABLE_OPERATION_ALL）
+- 用户在项目 A 调用 LIST /pipelines
+
+```
+阶段 1 操作级检查（resource=None）:
+  ├─ Permission 1: entity_name=ALL, access=VIEWER
+  │   └─ entity_name 匹配 → LIST 位扩展 → ✅ 授权
+  └─ Permission 2: entity_name=Pipeline, access=DISABLE_OPERATION_ALL
+      └─ resource=None → entity_id 检查跳过 → ❌ 禁用
+结果: authorized=True, unauthorized=True → ❌ 被禁用
+```
+
+**问题**：项目 B 的禁用权限，影响了用户在项目 A 的访问。
+
+#### 3.6.4 禁用权限与缓存的交互
+
+禁用权限同样会被缓存，且由于缓存 key 不含 entity_id：
+
+1. 如果第一个检查的资源触发了禁用 → 缓存写入 `authorized=False`
+2. 后续所有同类型资源都会读取到 `False` → 全部被拒绝
+3. 反之，如果第一个资源授权通过 → 缓存 `True` → 后续资源都通过（即使有禁用权限）
+
+**结果**：禁用优先的效果取决于遍历顺序，具有不确定性。
+
+---
+
+### 3.7 LIST 操作完整权限时序
+
+以用户只有 pipeline-a 的权限（entity_id 精确匹配）为例，完整时序如下：
+
+```
+用户请求: GET /pipelines （LIST 操作）
+│
+├─ 阶段 1: 操作级检查 [base.py L500-L501]
+│   ├─ policy = PipelinePolicy(None, user)  # resource=None
+│   └─ authorize_action(LIST)
+│       └─ validate_condition_with_cache()
+│           ├─ 查缓存 → 无
+│           ├─ validate_condition_with_permissions()
+│           │   ├─ 遍历用户所有权限
+│           │   ├─ permission(entity_id="pipeline-a"):
+│           │   │   ├─ entity_name 匹配 Pipeline → ✅
+│           │   │   ├─ resource=None → entity_id 检查跳过 → ✅
+│           │   │   └─ LIST 位匹配 → (True, False)
+│           │   └─ 聚合: authorized=True, unauthorized=False → True
+│           └─ 缓存写入: operations → Pipeline → LIST → True
+│   结果: ✅ 通过操作级检查
+│
+├─ 阶段 2: 查询级检查 [base.py L568]
+│   └─ authorize_query(query_params)
+│       └─ （类似操作级，resource=None，entity_id 检查跳过）
+│
+├─ 阶段 3: 获取数据
+│   └─ process_collection() → 返回 [pipeline-a, pipeline-b, pipeline-c]
+│
+└─ 阶段 4: 属性级检查（逐个资源）[base.py L145-L188]
+    │
+    ├─ 资源 1: pipeline-a
+    │   ├─ policy = PipelinePolicy(pipeline-a, user)  # resource=pipeline-a
+    │   └─ authorize_attributes(READ, attributes)
+    │       └─ 对每个属性调用 authorize_attribute()
+    │           └─ validate_condition_with_cache()
+    │               ├─ 查缓存 → 无（属性级缓存是空的）
+    │               ├─ validate_condition_with_permissions()
+    │               │   ├─ entity_name 匹配 → ✅
+    │               │   ├─ entity_id 匹配（pipeline-a）→ ✅
+    │               │   └─ READ 位匹配 → ✅ 通过
+    │               └─ 缓存写入: attribute_operations → Pipeline → LIST → READ → attr → True
+    │   结果: ✅ 通过
+    │
+    ├─ 资源 2: pipeline-b
+    │   ├─ policy = PipelinePolicy(pipeline-b, user)  # resource=pipeline-b
+    │   └─ authorize_attributes(READ, attributes)
+    │       └─ 对每个属性调用 authorize_attribute()
+    │           └─ validate_condition_with_cache()
+    │               ├─ 查缓存: attribute_operations → Pipeline → LIST → READ → attr → True
+    │               └─ 直接返回 True ⚠️（缓存命中，跳过 entity_id 检查）
+    │   结果: ❌ 本应失败，但因缓存污染而通过
+    │
+    └─ 资源 3: pipeline-c
+        └─ 同样因缓存污染而通过 ⚠️
+```
+
+**最终结论**：在新模式下，由于 entity_id 检查在 resource=None 时被跳过，且授权缓存不含 entity_id 维度，细粒度的 entity_id 权限在 LIST 操作中基本起不到隔离作用，反而可能因缓存污染导致权限泄漏。
+
+---
+
+### 3.8 entity_name 与 entity 的关键区别
+
+| 概念 | 类型 | 用途 | 层级继承 | 缓存是否区分 |
+|------|------|------|---------|-------------|
+| `Entity` (GLOBAL/PROJECT/PIPELINE) | 枚举 | 旧模式：权限作用的**层级范围** | 有，向上继承 | 不适用 |
+| `entity_name` (Pipeline, Block, ...) | 枚举 | 新模式：权限作用的**资源类型** | 无层级，但有通配符 | ✅ 区分 |
+| `entity_id` (资源实例 ID) | 字符串 | 新模式：权限作用的**具体资源** | 无，但 resource=None 时跳过 | ❌ 不区分 |
 
 **重要结论**:
 - 新模式**完全不使用** `Permission.entity` 字段（GLOBAL/PROJECT/PIPELINE 层级）
 - 新模式只使用 `permission.entity_name`（资源类型）和 `permission.entity_id`（资源实例）
 - 新模式下，所有 Permission 记录不论 entity 字段值为何，都会被加载和检查
+- entity_id 精确匹配在操作级和列表场景下基本失效，仅在单资源操作（DETAIL/UPDATE/DELETE）中有效
+- 缓存进一步削弱了 entity_id 的隔离作用
 
-### 3.5 资源类型匹配规则
+### 3.9 资源类型匹配规则
 
 **文件**: `mage_ai/authentication/permissions/constants.py`
 
@@ -268,9 +553,9 @@ RESERVED_ENTITY_NAMES = [
 2. `ALL_EXCEPT_RESERVED` 通配符 → 排除保留实体
 3. `ALL` 通配符 → 所有实体
 
-### 3.6 失败分支（新模式）
+### 3.10 失败分支（新模式）
 
-新模式的失败发生在两个层面：
+新模式的失败发生在三个层面：
 
 **层面 1: Policy 框架层（与旧模式共用）**
 - 同旧模式的 1~3 点（无规则配置、Scope 失败、条件验证失败）
@@ -282,7 +567,7 @@ RESERVED_ENTITY_NAMES = [
 |----------|------|--------|
 | permission.access 为空 | `user_permissions.py L98-L99` | `(False, False)` |
 | entity_name 不匹配 | `user_permissions.py L107-L115` | `(False, False)` |
-| entity_id 不匹配 | `user_permissions.py L118-L127` | `(False, False)` |
+| entity_id 不匹配（resource 存在时） | `user_permissions.py L118-L127` | `(False, False)` |
 | 操作权限被禁用（disable_access） | `user_permissions.py L130-L131` | `(False, True)` 禁用标记 |
 | 属性权限被禁用（DISABLE_QUERY_ALL 等） | `user_permissions.py L172-L174` | `(False, True)` 禁用标记 |
 | 具体属性在 disabled_attributes 中 | `user_permissions.py L185-L198` | `(False, True)` 禁用标记 |
@@ -293,6 +578,17 @@ RESERVED_ENTITY_NAMES = [
 | 任一权限标记禁用 | 聚合逻辑 | `unauthorized=True` → 最终 False（禁用优先） |
 
 **禁用优先原则**: 只要有一个 permission 返回 `permission_disabled=True`，即使其他权限授予了访问，整体也会被拒绝。
+
+**层面 3: 缓存层（隐性失败/绕过）**
+
+缓存可能导致权限检查被绕过，产生非预期的失败或通过：
+
+| 缓存相关场景 | 结果 | 原因 |
+|-------------|------|------|
+| 第一个资源授权通过 → 后续资源缓存命中 | 全部通过 | 缓存 key 不含 entity_id |
+| 第一个资源被禁用 → 后续资源缓存命中 | 全部失败 | 禁用结果也会被缓存 |
+| resource=None 时缓存的结果应用到有 resource 的场景 | 结果不确定 | 两种场景 entity_id 检查行为不同 |
+| 不同项目共享 ResultSet | 跨项目权限泄漏 | 缓存在 ResultSet 级别共享 |
 
 ---
 
@@ -400,7 +696,9 @@ Permission 3:
 
 ### 5.2 新模式下的多租户
 
-新模式**没有显式的租户边界**（因为不使用 Entity.PROJECT 层级），但可以通过以下方式实现类似效果：
+新模式**没有显式的租户边界**（因为不使用 Entity.PROJECT 层级），理论上可以通过 `entity_name + entity_id` 实现细粒度控制，但实际效果受多重因素制约：
+
+#### 5.2.1 理论上的隔离方式
 
 ```
 方式 1: 通过 entity_name + entity_id 控制具体资源
@@ -408,7 +706,7 @@ Permission 3:
       entity_name = "Pipeline"
       entity_id = "pipeline-in-project-a"
       access = EDITOR
-    → 只能操作项目A中的特定流水线
+    → 理论上只能操作项目A中的特定流水线
 
 方式 2: 通过 entity_name 通配控制一类资源
     Permission:
@@ -418,7 +716,50 @@ Permission 3:
     → 可以查看所有 Pipeline（跨项目！）
 ```
 
-**重要提醒**: 新模式下如果不做额外处理，权限默认是跨项目的。因为新模式不检查 `permission.entity` 字段，只检查 `entity_name` 和 `entity_id`。
+#### 5.2.2 实际隔离效果（三大削弱因素）
+
+| 操作类型 | 理论隔离 | 实际效果 | 削弱因素 |
+|----------|---------|---------|---------|
+| DETAIL（详情） | ✅ 精确匹配 | ✅ 基本有效 | 仅单资源操作 |
+| UPDATE（更新） | ✅ 精确匹配 | ✅ 基本有效 | 仅单资源操作 |
+| DELETE（删除） | ✅ 精确匹配 | ✅ 基本有效 | 仅单资源操作 |
+| LIST（列表）- 操作级 | ✅ 精确匹配 | ❌ 完全失效 | resource=None → entity_id 检查跳过 |
+| LIST（列表）- 属性级 | ✅ 精确匹配 | ❌ 基本失效 | 缓存污染 → 第一个通过全部通过 |
+| CREATE（创建） | ❌ 无法控制 | ❌ 完全失效 | resource 始终为 None |
+| 跨项目访问 | ✅ 项目隔离 | ❌ 完全失效 | 不使用 Entity.PROJECT 层级 |
+
+#### 5.2.3 三大核心问题
+
+**问题 1：resource=None 时 entity_id 检查被跳过**
+
+代码位置：`mage_ai/api/policies/mixins/user_permissions.py` [L117-L127]
+```python
+if permission.entity_id is not None and resource:  # AND 逻辑
+    # 只有两个条件都满足才检查 entity_id
+```
+- LIST/CREATE 操作级检查时，resource 始终为 None
+- 带具体 entity_id 的权限在操作级被当作全量权限使用
+
+**问题 2：缓存不含 entity_id，导致跨资源污染**
+
+代码位置：`mage_ai/api/mixins/result_set.py` [L81-L170]
+- 缓存 key：`entity_name → operation → authorized`
+- 同一 ResultSet 中的所有资源共享缓存
+- 第一个资源的授权结果会影响后续所有同类型资源
+
+**问题 3：完全不使用 Entity 层级**
+
+- Permission 表的 `entity` 字段（GLOBAL/PROJECT/PIPELINE）在新模式下完全不被检查
+- 所有权限记录不论属于哪个项目层级，都会被加载和判断
+- 禁用权限可以跨项目生效
+
+#### 5.2.4 重要提醒
+
+新模式下如果不做额外处理，权限默认是跨项目的。这是因为：
+1. 不检查 `permission.entity` 字段（PROJECT 层级）
+2. 只检查 `entity_name` 和 `entity_id`
+3. entity_id 在列表/创建场景下检查被跳过
+4. 缓存进一步放大了权限范围
 
 ---
 
@@ -429,11 +770,15 @@ Permission 3:
 | 无 action 规则配置 | ✅ | ✅（自动生成规则，不会出现） | ✅ |
 | Scope 验证失败 | ✅ | ✅ | ✅ |
 | 条件函数返回 False | ✅ (has_at_least_... 等) | ✅ (validate_condition_...) | 机制相同，函数不同 |
-| Entity 层级不匹配 | ✅ | ❌（不使用 Entity 层级） | - |
+| Entity 层级不匹配 | ✅（有继承兜底） | ❌（不使用 Entity 层级） | - |
 | entity_name 不匹配 | ❌ | ✅ | - |
-| entity_id 不匹配 | ✅（但继承可绕过） | ✅（无继承，精确匹配） | 机制不同 |
+| entity_id 不匹配（resource 存在时） | ✅（但继承可绕过） | ✅（无继承，精确匹配） | 机制不同 |
+| entity_id 检查被跳过（resource 为空时） | ❌ | ✅（LIST/CREATE 操作级） | - |
 | 禁用权限优先 | ❌（位或聚合，禁用位不会抵消授权位） | ✅（显式禁用优先逻辑） | - |
 | 属性级禁用 | ❌（属性级只有 allow/deny） | ✅（disabled_attributes 白/黑名单） | - |
+| 缓存导致隐性绕过 | ❌ | ✅（缓存 key 不含 entity_id） | - |
+| 跨项目禁用影响 | ❌（项目层级隔离） | ✅（禁用权限跨项目生效） | - |
+| LIST 整体 403 | ❌（按项目过滤结果） | ✅（一个不通过全部失败） | - |
 | DEBUG 调试信息 | ✅ | ✅ | ✅ |
 | 指标埋点 | ✅ | ✅ | ✅ |
 | 无项目权限友好提示 | ✅（旧模式特有） | ❌ | - |
@@ -455,36 +800,82 @@ policy.authorize_action(action)
         ├─ 任一条件返回 True → ✅ 通过
         └─ 全部返回 False → ❌ 403 (failed condition)
            ↓
-           [BaseOperation]
+           [BaseOperation.execute]
            ├─ 403 + 无项目权限 → 修改错误消息
            ├─ 运行失败钩子
            └─ DEBUG 模式重新抛出
 ```
 
-### 6.2 新模式失败流程图
+### 6.2 新模式失败流程图（完整链路）
 
 ```
-validate_condition_with_permissions()
+validate_condition_with_cache()  ← 入口
     │
-    ├─ user 有 Owner 权限？→ 是 → ✅ 通过
+    ├─ 查缓存
+    │   ├─ 命中 → 直接返回结果（跳过所有检查！）
+    │   └─ 未命中 → 继续执行
     │
-    └─ 并行检查所有 permission
+    └─ validate_condition_with_permissions()
         │
-        ├─ permission.access 为空？→ 跳过
-        ├─ entity_name 不匹配？→ 跳过
-        ├─ entity_id 不匹配？→ 跳过
+        ├─ 全局 Owner 检查：任一 permission 含 OWNER → ✅ 通过
         │
-        ├─ 操作被禁用 (disable_access)？→ 标记 unauthorized += 1
-        ├─ 属性操作被禁用？→ 标记 unauthorized += 1
+        └─ 并行检查所有 permission
+            │
+            ├─ permission.access 为空？→ 跳过 (False, False)
+            ├─ entity_name 不匹配？→ 跳过 (False, False)
+            │
+            ├─ resource 存在 且 permission.entity_id 有值？
+            │   ├─ 是 → 比较 entity_id → 不匹配则跳过 (False, False)
+            │   └─ 否 → entity_id 检查被跳过 → 继续
+            │
+            ├─ disable_access 匹配？→ ❌ 禁用 (False, True)
+            ├─ 属性操作全禁用？→ ❌ 禁用 (False, True)
+            ├─ 具体属性被禁用？→ ❌ 禁用 (False, True)
+            │
+            ├─ ALL 权限？→ ✅ 授权 (True, False)
+            ├─ OPERATION_ALL + 具体操作？→ ✅ 授权 (True, False)
+            ├─ 具体操作位 + 属性位？→ ✅ 授权 (True, False)
+            │
+            └─ 不匹配 → 跳过 (False, False)
         │
-        ├─ ALL 权限？→ 标记 authorized += 1
-        ├─ OPERATION_ALL + 具体操作位？→ 标记 authorized += 1
-        └─ 具体操作位匹配 + 属性位匹配？→ 标记 authorized += 1
+        └─ 结果聚合：
+            authorized = any(permission_granted)     ← 任一授权则 True
+            unauthorized = any(permission_disabled)   ← 任一禁用则 True
+            return authorized and not unauthorized    ← 禁用优先
     │
-    └─ 结果聚合
-        ├─ unauthorized > 0 → ❌ 失败（禁用优先）
-        ├─ authorized > 0 → ✅ 通过
-        └─ 都没有 → ❌ 失败（无匹配权限）
+    └─ 写入缓存（无论成功失败都缓存）
+```
+
+### 6.3 LIST 操作特殊失败路径
+
+```
+GET /pipelines (LIST)
+    │
+    ├─ 阶段 1：操作级检查（resource=None）
+    │   ├─ entity_id 检查被跳过
+    │   ├─ 任一权限授权 → ✅ 通过（即使只授权了某个 entity_id）
+    │   └─ 全部不授权或被禁用 → ❌ 403
+    │
+    ├─ 阶段 2：查询级检查（resource=None）
+    │   └─ 同操作级
+    │
+    ├─ 阶段 3：获取数据列表
+    │   └─ 返回 N 个资源
+    │
+    └─ 阶段 4：属性级检查（逐个 resource）
+        │
+        ├─ 资源 1：entity_id 匹配 → ✅ 授权 → 写入缓存 True
+        │
+        ├─ 资源 2：entity_id 不匹配
+        │   ├─ 查缓存 → 命中 True ← 缓存污染！
+        │   └─ 直接返回 True ⚠️（本应失败）
+        │
+        ├─ ... 后续资源全部因缓存污染通过
+        │
+        └─ 或者（如果第一个资源就不匹配）：
+            ├─ 资源 1：entity_id 不匹配 → ❌ 不授权
+            ├─ 所有资源都不授权 → ❌ 403
+            └─ 整个请求失败，而不是过滤掉无权限资源
 ```
 
 ---
@@ -538,9 +929,11 @@ validate_condition_with_permissions()
 
 ## 八、易混淆点总结
 
+### 8.1 核心概念区分
+
 1. **Entity vs entity_name**:
-   - `Entity` (GLOBAL/PROJECT/PIPELINE): 旧模式的层级范围概念，有纵向继承
-   - `entity_name` (Pipeline/Block/...): 新模式的资源类型概念，有横向通配符
+   - `Entity` (GLOBAL/PROJECT/PIPELINE): 旧模式的**层级范围**概念，有纵向继承
+   - `entity_name` (Pipeline/Block/...): 新模式的**资源类型**概念，有横向通配符
 
 2. **entity_id 的两种含义**:
    - 旧模式：配合 `Entity` 枚举使用，表示实体范围的实例 ID（如 project uuid）
@@ -557,3 +950,58 @@ validate_condition_with_permissions()
 5. **多租户隔离**:
    - 旧模式：通过 `Entity.PROJECT + project_uuid` 天然隔离
    - 新模式：不使用 Entity 层级，需要通过 entity_id 或额外逻辑实现隔离
+
+### 8.2 资源对象为空时的特殊行为
+
+6. **resource=None 时 entity_id 检查被跳过**:
+   - 触发场景：LIST/CREATE 的操作级检查、CREATE 的写属性检查
+   - 代码位置：`mage_ai/api/policies/mixins/user_permissions.py` [L117-L127]
+   - 关键条件：`if permission.entity_id is not None and resource:`（AND 逻辑）
+   - 后果：带具体 entity_id 的权限在列表/创建时被当作全量权限使用
+
+7. **LIST 操作的两阶段权限检查**:
+   - 阶段 1（操作级）：resource=None → entity_id 检查跳过 → 决定"能不能访问列表接口"
+   - 阶段 2（属性级）：逐个 resource 检查 → entity_id 检查生效 → 决定"能不能读具体资源的字段"
+   - 注意：阶段 2 中任何一个资源失败 → 整个请求 403，而非过滤掉无权限资源
+
+### 8.3 缓存相关的陷阱
+
+8. **缓存 key 不含 entity_id**:
+   - 操作级缓存 key：`entity_name → operation → authorized`
+   - 属性级缓存 key：`entity_name → operation → attribute_operation → attribute → authorized`
+   - 后果：同类型不同资源共享缓存，第一个资源的结果决定全部
+
+9. **缓存污染的放大效应**:
+   - 只要有一个资源授权通过 → 同类型所有资源都被认为有权限
+   - 只要有一个资源被禁用 → 同类型所有资源都被认为被禁用
+   - 遍历顺序决定最终结果，具有不确定性
+
+10. **缓存的作用域**:
+    - 存储位置：`ResultSet.context.data`
+    - 共享范围：同一个 ResultSet 中的所有资源共享
+    - 跨请求：不共享（每次请求新建 ResultSet）
+
+### 8.4 禁用优先原则的影响
+
+11. **禁用优先 vs 位或聚合**:
+    - 旧模式：位或运算，禁用位不会抵消授权位（没有显式禁用概念）
+    - 新模式：`authorized and not unauthorized`，任一禁用则整体拒绝
+
+12. **禁用权限的跨项目影响**:
+    - 新模式不检查 Permission.entity 层级
+    - 一个项目中的禁用权限可能影响另一个项目的访问
+    - 特别是 resource=None 时，entity_id 检查被跳过，禁用影响范围更大
+
+### 8.5 多租户隔离效果总结
+
+13. **新模式下的实际隔离能力**:
+    - DETAIL/UPDATE/DELETE：✅ 基本有效（单资源操作，entity_id 精确匹配）
+    - LIST 操作级：❌ 完全失效（resource=None，entity_id 检查跳过）
+    - LIST 属性级：❌ 基本失效（缓存污染）
+    - CREATE：❌ 完全失效（resource 始终为 None）
+    - 跨项目：❌ 完全失效（不使用 Entity.PROJECT 层级）
+
+14. **新旧模式对比**:
+    - 旧模式：粗粒度但可靠的项目级隔离
+    - 新模式：细粒度但有缺陷的资源级隔离
+    - 注意：新模式的 entity_id 精确匹配在单资源操作时是可靠的，但列表和创建场景存在设计缺陷
