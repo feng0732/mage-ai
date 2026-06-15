@@ -7,23 +7,23 @@ Mage AI 的 Block 系统是一个基于有向无环图(DAG)的数据流处理框
 ### 1.1 核心类层次结构
 
 ```
-Block [mage_ai/data_preparation/models/block/__init__.py#L349]
-├── SQLBlock [mage_ai/data_preparation/models/block/sql/__init__.py#L734]
-├── RBlock [mage_ai/data_preparation/models/block/r/__init__.py#L178]
-├── DBTBlock [mage_ai/data_preparation/models/block/dbt/block.py#L28]
-│   ├── DBTBlockYAML [mage_ai/data_preparation/models/block/dbt/block_yaml.py#L25]
-│   └── DBTBlockSQL [mage_ai/data_preparation/models/block/dbt/block_sql.py#L35]
-├── IntegrationBlock [mage_ai/data_preparation/models/block/integration/__init__.py#L28]
+Block                         mage_ai/data_preparation/models/block/__init__.py:349
+├── SQLBlock                  mage_ai/data_preparation/models/block/sql/__init__.py:734
+├── RBlock                    mage_ai/data_preparation/models/block/r/__init__.py:178
+├── DBTBlock                  mage_ai/data_preparation/models/block/dbt/block.py:28
+│   ├── DBTBlockYAML          mage_ai/data_preparation/models/block/dbt/block_yaml.py:25
+│   └── DBTBlockSQL           mage_ai/data_preparation/models/block/dbt/block_sql.py:35
+├── IntegrationBlock          mage_ai/data_preparation/models/block/integration/__init__.py:28
 │   ├── SourceBlock
 │   ├── DestinationBlock
 │   └── TransformerBlock
-├── HookBlock [mage_ai/data_preparation/models/block/hook/block.py#L7]
-├── ExtensionBlock [mage_ai/data_preparation/models/block/extension/block.py#L10]
+├── HookBlock                 mage_ai/data_preparation/models/block/hook/block.py:7
+├── ExtensionBlock            mage_ai/data_preparation/models/block/extension/block.py:10
 ├── GlobalDataProductBlock
-├── SensorBlock [mage_ai/data_preparation/models/block/__init__.py#L4274]
-└── AddonBlock [mage_ai/data_preparation/models/block/__init__.py#L4308]
-    ├── ConditionalBlock [mage_ai/data_preparation/models/block/__init__.py#L4355]
-    └── CallbackBlock [mage_ai/data_preparation/models/block/__init__.py#L4407]
+├── SensorBlock               mage_ai/data_preparation/models/block/__init__.py:4274
+└── AddonBlock                mage_ai/data_preparation/models/block/__init__.py:4308
+    ├── ConditionalBlock      mage_ai/data_preparation/models/block/__init__.py:4355
+    └── CallbackBlock         mage_ai/data_preparation/models/block/__init__.py:4407
 ```
 
 ---
@@ -32,7 +32,7 @@ Block [mage_ai/data_preparation/models/block/__init__.py#L349]
 
 ### 2.1 Block 基类定义
 
-[Block 类](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L349-L450) 采用多继承 Mixin 模式，整合了数据集成、Spark、动态块、全局数据产品等能力：
+`Block` 类（`mage_ai/data_preparation/models/block/__init__.py:349`）采用多继承 Mixin 模式，整合了数据集成、Spark、动态块、全局数据产品等能力：
 
 ```python
 class Block(
@@ -49,29 +49,31 @@ class Block(
 
 | 属性 | 类型 | 职责 | 源码位置 |
 |------|------|------|----------|
-| `upstream_blocks` | `List[Block]` | 上游依赖块列表 | [L404](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L404) |
-| `downstream_blocks` | `List[Block]` | 下游依赖块列表 | [L405](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L405) |
-| `conditional_blocks` | `List[Block]` | 条件块列表 | [L402](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L402) |
-| `callback_blocks` | `List[Block]` | 回调块列表 | [L403](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L403) |
-| `status` | `BlockStatus` | 内存执行状态 | [L389](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L389) |
-| `_outputs` | `List` | 输出数据缓存 | [L400](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L400) |
+| `upstream_blocks` | `List[Block]` | 上游依赖块列表 | `block/__init__.py:404` |
+| `downstream_blocks` | `List[Block]` | 下游依赖块列表 | `block/__init__.py:405` |
+| `conditional_blocks` | `List[Block]` | 条件块列表 | `block/__init__.py:402` |
+| `callback_blocks` | `List[Block]` | 回调块列表 | `block/__init__.py:403` |
+| `status` | `BlockStatus` | 内存执行状态 | `block/__init__.py:389` |
+| `_outputs` | `List` | 输出数据缓存 | `block/__init__.py:400` |
+
+> 本节及下文中，`block/__init__.py` 等短路径均相对于 `mage_ai/data_preparation/models/` 目录，完整路径见第13章代码索引。
 
 **依赖辅助属性**：
 
 | 属性 | 类型 | 职责 | 源码位置 |
 |------|------|------|----------|
-| `upstream_block_uuids` | `List[str]` | 上游块 UUID 列表（计算属性） | [L855-L856](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L855-L856) |
-| `downstream_block_uuids` | `List[str]` | 下游块 UUID 列表（计算属性） | [L859-L860](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L859-L860) |
+| `upstream_block_uuids` | `List[str]` | 上游块 UUID 列表（计算属性） | `block/__init__.py:855-856` |
+| `downstream_block_uuids` | `List[str]` | 下游块 UUID 列表（计算属性） | `block/__init__.py:859-860` |
 
 ### 2.3 复用边界设计
 
 Block 通过以下机制实现复用边界控制：
 
-1. **内容复用**：`replicated_block` 属性支持块内容的跨块引用，通过 [content property](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L500-L510) 实现内容代理
+1. **内容复用**：`replicated_block` 属性支持块内容的跨块引用，通过 `content` 属性（`block/__init__.py:500-510`）实现内容代理
 
 2. **执行隔离**：每个 Block 实例维护独立的 `status`、`execution_uuid`、`resource_usage`，确保执行状态隔离
 
-3. **配置隔离**：`configuration` 属性支持每个块实例的独立配置，通过 [clean_file_paths](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L480) 进行路径标准化
+3. **配置隔离**：`configuration` 属性支持每个块实例的独立配置，通过 `clean_file_paths`（`block/__init__.py:480`）进行路径标准化
 
 ---
 
@@ -79,13 +81,13 @@ Block 通过以下机制实现复用边界控制：
 
 ### 3.1 输入变量获取机制
 
-[fetch_input_variables](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L2286-L2366) 是输入处理的核心入口，采用分层路由策略：
+`fetch_input_variables`（`block/__init__.py:2286-2366`）是输入处理的核心入口，采用分层路由策略：
 
 ```
 fetch_input_variables()
 ├── 动态块检测
 │   └── 动态上游 → fetch_input_variables_for_dynamic_upstream_blocks()
-└── 常规流程 → fetch_input_variables() [mage_ai/data_preparation/models/block/utils.py#L389]
+└── 常规流程 → fetch_input_variables()   block/utils.py:389
     ├── input_variables() → 获取上游输出变量名
     ├── should_reduce_output() → 判断是否需要归约
     ├── reduce_output_from_block() → 动态块归约处理
@@ -94,7 +96,7 @@ fetch_input_variables()
 
 ### 3.2 变量命名规范
 
-输出变量采用 `output_{index}` 命名约定，在 [is_output_variable](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/utils.py#L289-L304) 中定义：
+输出变量采用 `output_{index}` 命名约定，在 `is_output_variable`（`block/utils.py:289-304`）中定义：
 
 ```python
 def is_output_variable(variable_uuid: str, include_df: bool = True) -> bool:
@@ -103,7 +105,7 @@ def is_output_variable(variable_uuid: str, include_df: bool = True) -> bool:
 
 ### 3.3 输出格式化系统
 
-[format_output_data](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/outputs.py#L49-L447) 实现了多类型数据的统一格式化，支持：
+`format_output_data`（`block/outputs.py:49-447`）实现了多类型数据的统一格式化，支持：
 
 | 数据类型 | 处理方式 | 输出类型 |
 |----------|----------|----------|
@@ -116,7 +118,7 @@ def is_output_variable(variable_uuid: str, include_df: bool = True) -> bool:
 
 ### 3.4 变量存储机制
 
-在 [execute_sync](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1595-L1645) 中完成输出持久化：
+在 `execute_sync`（`block/__init__.py:1595-1645`）中完成输出持久化：
 
 ```python
 variable_keys = [f'output_{idx}' for idx in range(output_count)]
@@ -130,11 +132,11 @@ self._store_variables_in_block_function(variable_mapping)
 
 ### 4.1 Pipeline 依赖管理
 
-[Pipeline](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/pipeline.py) 通过以下方法维护依赖关系：
+`Pipeline`（`mage_ai/data_preparation/models/pipeline.py`）通过以下方法维护依赖关系：
 
 #### 4.1.1 添加块与依赖
 
-[add_block](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/pipeline.py#L1806-L1880) 方法在添加块时自动建立连接：
+`add_block`（`pipeline.py:1806-1880`）方法在添加块时自动建立连接：
 
 ```python
 def add_block(self, block: Block, upstream_block_uuids: List[str] = None,
@@ -150,7 +152,7 @@ def add_block(self, block: Block, upstream_block_uuids: List[str] = None,
 
 #### 4.1.2 更新依赖关系
 
-[update_block](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/pipeline.py#L2008-L2145) 处理依赖变更：
+`update_block`（`pipeline.py:2008-2145`）处理依赖变更：
 
 ```python
 # 新增上游连接
@@ -173,19 +175,19 @@ block.update_upstream_blocks(
 
 ### 4.2 循环检测机制（DFS 迭代实现）
 
-[validate](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/pipeline.py#L2497-L2548) 方法实现 DAG 合法性校验，采用**迭代式深度优先搜索(DFS)** + **三状态标记**算法：
+`validate`（`pipeline.py:2497-2548`）方法实现 DAG 合法性校验，采用**迭代式深度优先搜索(DFS)** + **三状态标记**算法：
 
 #### 4.2.1 算法数据结构
 
 ```python
-# 辅助类：DFS 栈帧
+# 辅助类：DFS 栈帧   pipeline.py:2560-2564
 class StackFrame:
     def __init__(self, block):
         self.uuid = block.uuid
         self.children = block.downstream_block_uuids  # 待遍历的下游节点
         self.accessed = False                         # 是否已被首次访问
 
-# 节点状态标记
+# 节点状态标记   pipeline.py:2516
 status = {uuid: 'unvisited' for uuid in combined_blocks}
 # 'unvisited' : 未访问
 # 'processing': 正在当前 DFS 路径中（用于检测回边）
@@ -195,7 +197,7 @@ status = {uuid: 'unvisited' for uuid in combined_blocks}
 #### 4.2.2 DFS 迭代执行过程
 
 ```
-__check_cycle(block):
+__check_cycle(block):                           pipeline.py:2526-2544
     1. 初始化虚拟栈 virtual_stack = [StackFrame(block)]
     2. 当栈非空时循环：
        a. 取栈顶帧 frame = virtual_stack[-1]
@@ -215,7 +217,7 @@ __check_cycle(block):
 
 #### 4.2.3 循环检测与路径回溯
 
-当发现 `status[frame.uuid] == 'processing'` 时，说明当前帧的块在当前 DFS 路径中再次出现，形成回边。此时调用 `__print_cycle` 回溯完整循环路径：
+当发现 `status[frame.uuid] == 'processing'` 时，说明当前帧的块在当前 DFS 路径中再次出现，形成回边。此时调用 `__print_cycle`（`pipeline.py:2518-2524`）回溯完整循环路径：
 
 ```python
 def __print_cycle(start_uuid: str, virtual_stack: List[StackFrame]):
@@ -230,7 +232,7 @@ def __print_cycle(start_uuid: str, virtual_stack: List[StackFrame]):
 
 #### 4.2.4 检测范围
 
-循环检测覆盖以下所有块类型：
+循环检测覆盖以下所有块类型（`pipeline.py:2507-2515`）：
 - 扩展块：`self.extensions['blocks_by_uuid']`
 - 组件块：`self.widgets_by_uuid`
 - 回调块：`self.callbacks_by_uuid`
@@ -239,7 +241,7 @@ def __print_cycle(start_uuid: str, virtual_stack: List[StackFrame]):
 
 ### 4.3 双向引用维护
 
-Block 内部通过 [update_upstream_blocks](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L3169-L3170) 维护双向引用：
+Block 内部通过 `update_upstream_blocks`（`block/__init__.py:3169-3170`）维护双向引用：
 
 ```python
 def update_upstream_blocks(self, upstream_blocks: List[Any], **kwargs) -> None:
@@ -258,7 +260,7 @@ Pipeline 提供两种执行模式：
 
 #### 5.1.1 异步并行执行
 
-[execute](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/pipeline.py#L755-L787) 方法：
+`execute`（`pipeline.py:755-787`）方法：
 
 ```python
 async def execute(self, ...) -> None:
@@ -272,7 +274,7 @@ async def execute(self, ...) -> None:
 
 #### 5.1.2 同步串行执行
 
-[execute_sync](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/pipeline.py#L789-L834) 方法：
+`execute_sync`（`pipeline.py:789-834`）方法：
 
 ```python
 def execute_sync(self, ...) -> None:
@@ -286,7 +288,7 @@ def execute_sync(self, ...) -> None:
 
 ### 5.2 并行执行调度算法
 
-[run_blocks](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L170-L264) 实现了基于队列的拓扑调度：
+`run_blocks`（`block/__init__.py:170-264`）实现了基于队列的拓扑调度：
 
 ```
 算法流程：
@@ -332,7 +334,7 @@ while not blocks.empty():
 
 ### 5.3 串行执行调度
 
-[run_blocks_sync](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L267-L346) 使用相同拓扑逻辑但同步执行：
+`run_blocks_sync`（`block/__init__.py:267-346`）使用相同拓扑逻辑但同步执行：
 
 ```python
 while not blocks.empty():
@@ -377,7 +379,7 @@ Pipeline 运行时通过两层筛选决定块的执行顺序：
 
 #### 6.1.1 第一层：Pipeline 调度层筛选
 
-[PipelineExecutor.__run_blocks](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/pipeline_executor.py#L94-L171) 中的主循环：
+`PipelineExecutor.__run_blocks`（`mage_ai/data_preparation/executors/pipeline_executor.py:94-171`）中的主循环：
 
 ```python
 while not pipeline_run.all_blocks_completed(allow_blocks_to_fail):
@@ -401,9 +403,9 @@ while not pipeline_run.all_blocks_completed(allow_blocks_to_fail):
 
 #### 6.1.2 第二层：可执行性判定
 
-[executable_block_runs](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/orchestration/db/models/schedules.py#L978-L1221) 实现多维度依赖筛选：
+`executable_block_runs`（`mage_ai/orchestration/db/models/schedules.py:978-1221`）实现多维度依赖筛选：
 
-**状态集合构建**：
+**状态集合构建**（`schedules.py:1003-1024`）：
 ```python
 # completed: COMPLETED 状态的块
 completed_block_uuids = _build_block_uuids(self.completed_block_runs)
@@ -411,7 +413,7 @@ completed_block_uuids = _build_block_uuids(self.completed_block_runs)
 finished_block_uuids = _build_block_uuids(self.block_runs)
 ```
 
-**常规块筛选逻辑**：
+**常规块筛选逻辑**（`schedules.py:1209-1216`）：
 ```python
 if block and block.all_upstream_blocks_completed(
     completed_block_uuids,       # 必须全部成功完成
@@ -420,7 +422,7 @@ if block and block.all_upstream_blocks_completed(
     executable_block_runs.append(block_run)
 ```
 
-**`allow_blocks_to_fail` 模式下的宽松筛选**：
+**`allow_blocks_to_fail` 模式下的宽松筛选**（`schedules.py:1124-1127`）：
 ```python
 if allow_blocks_to_fail:
     # 允许上游失败，只要 finished（含 FAILED）即可
@@ -432,7 +434,7 @@ else:
 
 #### 6.1.3 上游完成性校验
 
-[all_upstream_blocks_completed](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1273-L1291) 实现细粒度检查：
+`all_upstream_blocks_completed`（`block/__init__.py:1273-1291`）实现细粒度检查：
 
 ```python
 def all_upstream_blocks_completed(
@@ -460,11 +462,11 @@ def all_upstream_blocks_completed(
 | 边界类型 | 约束规则 | 影响范围 |
 |----------|----------|----------|
 | **拓扑边界** | 块必须在所有上游块完成后才能执行 | 所有块 |
-| **类型边界** | `CHART`、`MARKDOWN`、`SCRATCHPAD` 类型不参与 Pipeline 执行 | 特定块类型 |
+| **类型边界** | `CHART`、`MARKDOWN`、`SCRATCHPAD` 类型不参与 Pipeline 执行（`constants.py:157-161`） | 特定块类型 |
 | **条件边界** | 条件块失败时，下游块跳过执行 | 条件块下游 |
 | **失败边界** | 上游失败时（非 `allow_blocks_to_fail` 模式），下游不执行 | 失败块下游 |
 | **动态边界** | 动态块的子实例需全部完成后，下游才能执行 | 动态块下游 |
-| **集成边界** | 数据集成块的 controller/child 有特殊的执行顺序约束 | 集成块内部 |
+| **集成边界** | 数据集成块的 controller/child 有特殊的执行顺序约束（`schedules.py:1046-1074`） | 集成块内部 |
 
 ---
 
@@ -472,7 +474,7 @@ def all_upstream_blocks_completed(
 
 ### 7.1 核心执行流程
 
-[execute_sync](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1436-L1691) 是 Block 执行的核心入口：
+`execute_sync`（`block/__init__.py:1436-1691`）是 Block 执行的核心入口：
 
 ```
 execute_sync()
@@ -497,7 +499,7 @@ execute_sync()
 
 ### 7.2 执行参数校验
 
-[_validate_execution](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1733-L1795) 实现严格的参数匹配检查：
+`_validate_execution`（`block/__init__.py:1733-1795`）实现严格的参数匹配检查：
 
 ```python
 def _validate_execution(self, decorated_functions, input_vars):
@@ -527,15 +529,15 @@ def _validate_execution(self, decorated_functions, input_vars):
 
 | 变量 | 用途 | 设置位置 |
 |------|------|----------|
-| `logger` | 执行日志记录器 | [execute_sync#L197-L203](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L197-L203) |
+| `logger` | 执行日志记录器 | `block/__init__.py:197-203` |
 | `spark` | Spark 会话 | SparkBlock Mixin |
-| `env` | 运行环境（dev/test/prod） | [table_name#L993](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L993) |
-| `retry` | 重试元数据 | [BlockExecutor#L619](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/block_executor.py#L619) |
-| `part_index` | 追加模式分区索引 | [execute_block_function#L2150](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L2150) |
+| `env` | 运行环境（dev/test/prod） | `block/__init__.py:993` |
+| `retry` | 重试元数据 | `block_executor.py:619` |
+| `part_index` | 追加模式分区索引 | `block/__init__.py:2150` |
 
 ### 7.4 输出重定向
 
-[_redirect_streams](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1933-L1964) 实现执行隔离：
+`_redirect_streams`（`block/__init__.py:1933-1964`）实现执行隔离：
 
 ```python
 @contextmanager
@@ -561,47 +563,47 @@ Mage AI 采用**内存执行状态**与**持久化运行记录状态**分离的�
 
 #### 8.1.1 BlockStatus（内存执行状态）
 
-定义于 [mage_ai/data_preparation/models/constants.py#L48-L52](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/constants.py#L48-L52)：
+定义于 `mage_ai/data_preparation/models/constants.py:48-52`：
 
 ```python
 class BlockStatus(StrEnum):
-    EXECUTED = 'executed'      # 执行成功
-    FAILED = 'failed'          # 执行失败
+    EXECUTED = 'executed'          # 执行成功
+    FAILED = 'failed'              # 执行失败
     NOT_EXECUTED = 'not_executed'  # 未执行
-    UPDATED = 'updated'        # 内容已更新（需重新执行）
+    UPDATED = 'updated'            # 内容已更新（需重新执行）
 ```
 
 **特性**：
 - 生命周期：仅存在于内存中的 Block 对象实例
-- 更新位置：`Block.execute_sync()` 内部 [L1660-L1668](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1660-L1668)
+- 更新位置：`Block.execute_sync()` 内部 `block/__init__.py:1660-1668`
 - 用途：快速执行路径（如 Notebook 内执行、单元测试）
 
 #### 8.1.2 BlockRunStatus（持久化运行记录状态）
 
-定义于 [mage_ai/orchestration/db/models/schedules.py#L1664-L1672](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/orchestration/db/models/schedules.py#L1664-L1672)：
+定义于 `mage_ai/orchestration/db/models/schedules.py:1664-1672`：
 
 ```python
 class BlockRunStatus(StrEnum):
-    INITIAL = 'initial'              # 初始状态，已创建但未调度
-    QUEUED = 'queued'                # 已入队列，等待执行
-    RUNNING = 'running'              # 正在执行
-    COMPLETED = 'completed'          # 执行成功
-    FAILED = 'failed'                # 执行失败
-    CANCELLED = 'cancelled'          # 被取消
+    INITIAL = 'initial'                  # 初始状态，已创建但未调度
+    QUEUED = 'queued'                    # 已入队列，等待执行
+    RUNNING = 'running'                  # 正在执行
+    COMPLETED = 'completed'              # 执行成功
+    FAILED = 'failed'                    # 执行失败
+    CANCELLED = 'cancelled'              # 被取消
     UPSTREAM_FAILED = 'upstream_failed'  # 上游失败导致跳过
     CONDITION_FAILED = 'condition_failed' # 条件不满足导致跳过
 ```
 
 **特性**：
 - 生命周期：持久化到数据库，跨进程可见
-- 更新位置：`BlockExecutor.__update_block_run_status()` [L1369-L1420](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/block_executor.py#L1369-L1420)
+- 更新位置：`BlockExecutor.__update_block_run_status()` `block_executor.py:1369-1420`
 - 用途：调度器触发的 Pipeline 运行，支持状态回溯
 
 ### 8.2 异常捕获层次
 
 #### 8.2.1 Block 内部错误处理（BlockStatus 更新）
 
-[execute_sync](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1660-L1672) 中的核心错误处理：
+`execute_sync`（`block/__init__.py:1660-1672`）中的核心错误处理：
 
 ```python
 try:
@@ -619,7 +621,7 @@ finally:
 
 #### 8.2.2 回调错误处理
 
-[execute_block_with_callbacks](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1403-L1422) 实现失败回调：
+`execute_block_with_callbacks`（`block/__init__.py:1403-1422`）实现失败回调：
 
 ```python
 try:
@@ -636,7 +638,7 @@ except Exception as error:
 
 #### 8.2.3 执行器层错误处理（BlockRunStatus 更新）
 
-[BlockExecutor.execute](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/block_executor.py#L648-L700) 实现完整的错误生命周期：
+`BlockExecutor.execute`（`block_executor.py:648-700`）实现完整的错误生命周期：
 
 ```python
 except Exception as error:
@@ -661,7 +663,7 @@ except Exception as error:
 
 ### 8.3 上游失败传播（UPSTREAM_FAILED）
 
-[update_block_run_statuses](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/orchestration/db/models/schedules.py#L1223-L1301) 实现递归式失败传播：
+`update_block_run_statuses`（`schedules.py:1223-1301`）实现递归式失败传播：
 
 #### 8.3.1 传播算法
 
@@ -669,29 +671,29 @@ except Exception as error:
 输入：待检查的 block_runs 列表
 输出：无（副作用：更新数据库状态）
 
-算法：
-1. 构建失败块集合：
+算法：                                           schedules.py:1246-1301
+1. 构建失败块集合：                               schedules.py:1246-1267
    failed_block_uuids = {b.block_uuid | b.status in [UPSTREAM_FAILED, FAILED]}
    condition_failed_block_uuids = {b.block_uuid | b.status == CONDITION_FAILED}
 
-2. 对每个 block_run：
+2. 对每个 block_run：                             schedules.py:1269-1296
    a. 获取上游依赖块 UUID 列表（支持 dynamic_upstream 覆盖）
    b. 若任一上游在 failed_block_uuids 中 → 设置为 UPSTREAM_FAILED
    c. 若任一上游在 condition_failed_block_uuids 中 → 设置为 CONDITION_FAILED
    d. 未被更新的加入 not_updated 列表
 
-3. 递归调用：若本次有更新（len(block_runs) != len(not_updated)），
+3. 递归调用：若本次有更新（len(block_runs) != len(not_updated)），   schedules.py:1298-1301
    则对 not_updated 列表再次调用 update_block_run_statuses
 ```
 
 #### 8.3.2 关键实现细节
 
 ```python
-# 递归终止条件：本轮没有任何更新
+# 递归终止条件：本轮没有任何更新                       schedules.py:1300-1301
 if len(block_runs) != len(not_updated_block_runs):
     self.update_block_run_statuses(not_updated_block_runs)
 
-# 上游依赖优先级：dynamic_upstream > 静态 upstream_block_uuids
+# 上游依赖优先级：dynamic_upstream > 静态 upstream_block_uuids  schedules.py:1277-1282
 if dynamic_upstream_block_uuids:
     upstream_block_uuids = dynamic_upstream_block_uuids
 else:
@@ -706,12 +708,12 @@ else:
 
 #### 8.4.1 层次一：BlockExecutor 即时传播（执行时）
 
-当条件块执行返回 False 时，[BlockExecutor._execute](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/block_executor.py#L397-L467) 立即处理：
+当条件块执行返回 False 时，`BlockExecutor._execute`（`block_executor.py:397-467`）立即处理：
 
 ```python
 if not conditional_result:
     if is_data_integration:
-        # 数据集成块：递归更新所有下游（包括子块）
+        # 数据集成块：递归更新所有下游（包括子块）    block_executor.py:412-458
         def __update_condition_failed(block_run_id_init, ...):
             self.__update_block_run_status(
                 BlockRun.BlockRunStatus.CONDITION_FAILED,
@@ -726,7 +728,7 @@ if not conditional_result:
 
         __update_condition_failed(block_run_id, self.block_uuid, self.block)
     else:
-        # 普通块：仅更新当前块
+        # 普通块：仅更新当前块                     block_executor.py:460-465
         self.__update_block_run_status(
             BlockRun.BlockRunStatus.CONDITION_FAILED,
             block_run_id=block_run_id,
@@ -736,7 +738,7 @@ if not conditional_result:
 
 #### 8.4.2 层次二：PipelineRun 批量传播（调度循环中）
 
-在 PipelineExecutor 的主循环中，每次迭代都会调用 `update_block_run_statuses` 进行批量状态更新，确保所有下游被正确标记。
+在 `PipelineExecutor.__run_blocks` 的主循环中（`pipeline_executor.py:157-158`），每次迭代都会调用 `update_block_run_statuses` 进行批量状态更新，确保所有下游被正确标记。
 
 #### 8.4.3 与运行顺序的交叉影响
 
@@ -744,15 +746,15 @@ if not conditional_result:
 
 | 场景 | 行为 | 源码位置 |
 |------|------|----------|
-| **条件块执行时机** | 条件块在实际代码执行前执行，失败则跳过代码 | [block_executor.py#L387-L395](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/block_executor.py#L387-L395) |
-| **动态块子节点** | 动态块的子实例不执行条件检查（`should_run_conditional=False`） | [block_executor.py#L376-L384](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/block_executor.py#L376-L384) |
-| **已完成块不受影响** | 仅 `INITIAL` 状态的块会被更新为失败状态 | `update_block_run_statuses` 隐式保证 |
-| **递归传播终止** | 当状态已是非 INITIAL 时，递归不会覆盖已有状态 | 同上 |
-| **失败优先级** | CONDITION_FAILED > UPSTREAM_FAILED（先检查条件失败集合） | [schedules.py#L1275-L1292](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/orchestration/db/models/schedules.py#L1275-L1292) |
+| **条件块执行时机** | 条件块在实际代码执行前执行，失败则跳过代码 | `block_executor.py:387-395` |
+| **动态块子节点** | 动态块的子实例不执行条件检查（`should_run_conditional=False`） | `block_executor.py:376-384` |
+| **已完成块不受影响** | 仅 `INITIAL` 状态的块会被更新为失败状态 | `schedules.py:1269-1296`（update_block_run_statuses 遍历 initial_block_runs） |
+| **递归传播终止** | 当本轮无新状态更新时递归终止 | `schedules.py:1300-1301` |
+| **失败优先级** | CONDITION_FAILED 先于 UPSTREAM_FAILED 检查（先检查条件失败集合） | `schedules.py:1275-1292` |
 
 ### 8.5 重试机制
 
-[BlockExecutor](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/block_executor.py#L593-L647) 集成重试装饰器：
+`BlockExecutor`（`block_executor.py:593-647`）集成重试装饰器：
 
 ```python
 @retry(
@@ -776,14 +778,14 @@ def __execute_with_retry():
 ### 9.1 完整调度与状态更新循环
 
 ```
-PipelineExecutor.__run_blocks()
+PipelineExecutor.__run_blocks()                  pipeline_executor.py:94-171
 └── WHILE not all_blocks_completed():
-    ├── [1] update_block_run_statuses()
+    ├── [1] update_block_run_statuses()          schedules.py:1223-1301
     │   ├── 传播 FAILED → UPSTREAM_FAILED
     │   ├── 传播 CONDITION_FAILED → CONDITION_FAILED
     │   └── 递归直到无更新
     │
-    ├── [2] executable_block_runs()
+    ├── [2] executable_block_runs()              schedules.py:978-1221
     │   ├── 构建 completed/finished UUID 集合
     │   ├── 遍历 initial_block_runs
     │   ├── 跳过已完成/失败/条件失败的块
@@ -791,7 +793,7 @@ PipelineExecutor.__run_blocks()
     │   └── 返回可执行列表
     │
     └── [3] 并行执行 executable_block_runs
-        ├── 每个 BlockExecutor._execute()
+        ├── 每个 BlockExecutor._execute()        block_executor.py:330-700
         │   ├── _execute_conditional() → False 则直接 CONDITION_FAILED
         │   ├── execute_sync() → 更新 BlockStatus
         │   └── __update_block_run_status() → 更新 BlockRunStatus
@@ -804,13 +806,13 @@ PipelineExecutor.__run_blocks()
 |------|------------------|------------------|------------------|
 | **上游 FAILED** | 下游被排除出 executable（非 allow_fail 模式） | 下游不会被调度 | 触发 UPSTREAM_FAILED 递归传播 |
 | **条件块返回 False** | 当前块及其下游被排除 | 下游调度顺序不变但不会实际执行 | 触发 CONDITION_FAILED 递归传播 |
-| **allow_blocks_to_fail=True** | 允许上游 FAILED 的块进入 executable | 失败块的下游仍会被调度 | UPSTREAM_FAILED 仅用于标记，不阻止执行 |
-| **动态块生成** | 动态子块的 UUID 动态加入 completed 集合 | 下游需等待所有动态子块完成 | 动态子块的失败会传播给下游 |
+| **allow_blocks_to_fail=True** | 允许上游 FAILED 的块进入 executable（`schedules.py:1124-1125`） | 失败块的下游仍会被调度 | UPSTREAM_FAILED 仅用于标记，不阻止执行 |
+| **动态块生成** | 动态子块的 UUID 动态加入 completed 集合（`schedules.py:1184-1207`） | 下游需等待所有动态子块完成 | 动态子块的失败会传播给下游 |
 | **依赖关系变更** | 需要重建 executable 筛选逻辑 | 拓扑顺序需重新计算 | 可能导致循环，需重新 validate |
 
 ### 9.3 Pipeline 完成判定
 
-[all_blocks_completed](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/orchestration/db/models/schedules.py#L1522-L1532) 定义了调度循环的终止条件：
+`all_blocks_completed`（`schedules.py:1522-1532`）定义了调度循环的终止条件：
 
 ```python
 def all_blocks_completed(self, include_failed_blocks: bool = False) -> bool:
@@ -835,8 +837,8 @@ def all_blocks_completed(self, include_failed_blocks: bool = False) -> bool:
 | **Block** | 业务逻辑容器、输入输出处理、内存状态管理 | `execute_sync`, `fetch_input_variables`, `store_variables`, `all_upstream_blocks_completed` |
 | **Pipeline** | DAG 管理、依赖编排、循环检测（DFS） | `add_block`, `update_block`, `validate`, `execute`, `execute_sync` |
 | **BlockExecutor** | 运行时控制、重试、条件检查、BlockRunStatus 持久化 | `execute`, `_execute_conditional`, `__update_block_run_status`, `execute_callback` |
-| **PipelineExecutor** | 并行调度、可执行块筛选、状态传播 | `execute`, `__run_blocks`, `executable_block_runs` |
-| **PipelineRun** | 批量状态传播、完成判定 | `update_block_run_statuses`, `executable_block_runs`, `all_blocks_completed` |
+| **PipelineExecutor** | 并行调度、可执行块筛选、状态传播 | `execute`, `__run_blocks` |
+| **PipelineRun** | 批量状态传播、可执行性判定、完成判定 | `update_block_run_statuses`, `executable_block_runs`, `all_blocks_completed` |
 | **VariableManager** | 变量持久化与检索 | `get_variable`, `set_variable` |
 | **DynamicChildController** | 动态块子实例管理 | `execute_sync` |
 | **OutputFormatter** | 输出数据格式化 | `format_output_data`, `get_outputs_for_display_sync` |
@@ -849,11 +851,11 @@ def all_blocks_completed(self, include_failed_blocks: bool = False) -> bool:
 
 | 风险点 | 描述 | 影响范围 | 严重程度 |
 |--------|------|----------|----------|
-| **双向引用一致性** | `upstream_blocks` 和 `downstream_blocks` 需同时维护，更新时易出现不一致 | 依赖关系、执行顺序 | 高 |
+| **双向引用一致性** | `upstream_blocks` 和 `downstream_blocks` 需同时维护，`update_block` 只更新一侧的反向引用 | 依赖关系、执行顺序 | 高 |
 | **重试次数硬编码** | `run_blocks` 中队列重试阈值为 1000 次，无循环检测 | 死循环风险 | 高 |
 | **内存缓存未失效** | 依赖变更后 `_outputs` 缓存未自动清理 | 数据一致性 | 中 |
 | **全局变量可变共享** | `global_vars` 字典以引用传递，块间可互相修改 | 执行隔离性 | 中 |
-| **双状态同步风险** | BlockStatus 与 BlockRunStatus 可能不一致（如更新失败时） | 状态准确性 | 中 |
+| **双状态同步风险** | BlockStatus 与 BlockRunStatus 可能不一致（如数据库更新失败时 BlockStatus 已变更） | 状态准确性 | 中 |
 
 ### 11.2 并发风险
 
@@ -862,7 +864,7 @@ def all_blocks_completed(self, include_failed_blocks: bool = False) -> bool:
 | **异步调度忙等** | 上游未就绪时块被反复入队，CPU 空转 | 大规模并行场景 | 高 |
 | **变量读取原子性** | 并行写入时 `get_block_variable` 可能读取部分数据 | 数据完整性 | 中 |
 | **状态更新竞态** | 多线程环境下 `status` 属性无同步保护 | 状态准确性 | 中 |
-| **递归传播竞态** | 多实例并发更新 BlockRun 状态可能导致不一致 | 调度准确性 | 中 |
+| **递归传播竞态** | 多实例并发更新 BlockRun 状态可能导致不一致（`update_block_run_statuses` 无锁） | 调度准确性 | 中 |
 
 ### 11.3 维护性风险
 
@@ -930,28 +932,42 @@ def all_blocks_completed(self, include_failed_blocks: bool = False) -> bool:
 
 ## 13. 关键代码索引
 
-| 功能模块 | 核心文件 | 关键行号 |
-|----------|----------|----------|
-| Block 基类定义 | [mage_ai/data_preparation/models/block/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py) | L349-L450 |
-| BlockStatus 定义 | [mage_ai/data_preparation/models/constants.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/constants.py) | L48-L52 |
-| BlockRunStatus 定义 | [mage_ai/orchestration/db/models/schedules.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/orchestration/db/models/schedules.py) | L1664-L1672 |
-| 同步执行入口 | [mage_ai/data_preparation/models/block/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py) | L1436-L1691 |
-| 并行调度算法 | [mage_ai/data_preparation/models/block/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py) | L170-L264 |
-| 输入变量获取 | [mage_ai/data_preparation/models/block/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py) | L2286-L2366 |
-| 上游完成性校验 | [mage_ai/data_preparation/models/block/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/__init__.py) | L1273-L1291 |
-| 依赖更新逻辑 | [mage_ai/data_preparation/models/pipeline.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/pipeline.py) | L2008-L2145 |
-| 添加块与连接 | [mage_ai/data_preparation/models/pipeline.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/pipeline.py) | L1806-L1880 |
-| DFS 循环检测 | [mage_ai/data_preparation/models/pipeline.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/pipeline.py) | L2497-L2548 |
-| Pipeline 调度主循环 | [mage_ai/data_preparation/executors/pipeline_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/pipeline_executor.py) | L94-L171 |
-| 可执行块筛选 | [mage_ai/orchestration/db/models/schedules.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/orchestration/db/models/schedules.py) | L978-L1221 |
-| 批量状态传播 | [mage_ai/orchestration/db/models/schedules.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/orchestration/db/models/schedules.py) | L1223-L1301 |
-| 完成判定 | [mage_ai/orchestration/db/models/schedules.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/orchestration/db/models/schedules.py) | L1522-L1532 |
-| 执行器错误处理 | [mage_ai/data_preparation/executors/block_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/block_executor.py) | L648-L700 |
-| 条件执行检查 | [mage_ai/data_preparation/executors/block_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/block_executor.py) | L1200-L1254 |
-| 条件失败即时传播 | [mage_ai/data_preparation/executors/block_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/block_executor.py) | L410-L467 |
-| BlockRun 状态更新 | [mage_ai/data_preparation/executors/block_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/executors/block_executor.py) | L1369-L1420 |
-| 输出格式化 | [mage_ai/data_preparation/models/block/outputs.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/outputs.py) | L49-L447 |
-| 变量工具函数 | [mage_ai/data_preparation/models/block/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/309-mage-ai/mage_ai/data_preparation/models/block/utils.py) | L336-L600 |
+下表列出所有引用的仓库相对路径（从仓库根目录起算）：
+
+| 功能模块 | 文件路径 | 行号 |
+|----------|----------|------|
+| Block 基类定义 | `mage_ai/data_preparation/models/block/__init__.py` | L349-L450 |
+| BlockStatus 定义 | `mage_ai/data_preparation/models/constants.py` | L48-L52 |
+| BlockType 枚举 | `mage_ai/data_preparation/models/constants.py` | L55-L72 |
+| NON_PIPELINE_EXECUTABLE_BLOCK_TYPES | `mage_ai/data_preparation/models/constants.py` | L157-L161 |
+| BlockRunStatus 定义 | `mage_ai/orchestration/db/models/schedules.py` | L1664-L1672 |
+| 同步执行入口 | `mage_ai/data_preparation/models/block/__init__.py` | L1436-L1691 |
+| 并行调度算法 | `mage_ai/data_preparation/models/block/__init__.py` | L170-L264 |
+| 串行调度算法 | `mage_ai/data_preparation/models/block/__init__.py` | L267-L346 |
+| 输入变量获取 | `mage_ai/data_preparation/models/block/__init__.py` | L2286-L2366 |
+| 上游完成性校验 | `mage_ai/data_preparation/models/block/__init__.py` | L1273-L1291 |
+| 更新上游块引用 | `mage_ai/data_preparation/models/block/__init__.py` | L3169-L3170 |
+| 回调执行入口 | `mage_ai/data_preparation/models/block/__init__.py` | L1403-L1422 |
+| 依赖更新逻辑 | `mage_ai/data_preparation/models/pipeline.py` | L2008-L2145 |
+| 添加块与连接 | `mage_ai/data_preparation/models/pipeline.py` | L1806-L1880 |
+| 异步执行入口 | `mage_ai/data_preparation/models/pipeline.py` | L755-L787 |
+| 同步执行入口 | `mage_ai/data_preparation/models/pipeline.py` | L789-L834 |
+| DFS 循环检测 | `mage_ai/data_preparation/models/pipeline.py` | L2497-L2548 |
+| StackFrame 辅助类 | `mage_ai/data_preparation/models/pipeline.py` | L2560-L2564 |
+| Pipeline 调度主循环 | `mage_ai/data_preparation/executors/pipeline_executor.py` | L94-L171 |
+| 可执行块筛选 | `mage_ai/orchestration/db/models/schedules.py` | L978-L1221 |
+| 批量状态传播 | `mage_ai/orchestration/db/models/schedules.py` | L1223-L1301 |
+| 完成判定 | `mage_ai/orchestration/db/models/schedules.py` | L1522-L1532 |
+| 执行器错误处理 | `mage_ai/data_preparation/executors/block_executor.py` | L648-L700 |
+| 条件执行检查 | `mage_ai/data_preparation/executors/block_executor.py` | L1200-L1254 |
+| 条件失败即时传播 | `mage_ai/data_preparation/executors/block_executor.py` | L410-L467 |
+| 动态块条件跳过 | `mage_ai/data_preparation/executors/block_executor.py` | L376-L384 |
+| 重试装饰器 | `mage_ai/data_preparation/executors/block_executor.py` | L593-L647 |
+| BlockRun 状态更新 | `mage_ai/data_preparation/executors/block_executor.py` | L1369-L1420 |
+| 输出格式化 | `mage_ai/data_preparation/models/block/outputs.py` | L49-L447 |
+| 变量工具函数 | `mage_ai/data_preparation/models/block/utils.py` | L289-L304, L336-L600 |
+
+> **短路径约定**：正文中 `block/__init__.py` = `mage_ai/data_preparation/models/block/__init__.py`，`pipeline.py` = `mage_ai/data_preparation/models/pipeline.py`，`schedules.py` = `mage_ai/orchestration/db/models/schedules.py`，`block_executor.py` = `mage_ai/data_preparation/executors/block_executor.py`，`constants.py` = `mage_ai/data_preparation/models/constants.py`，`pipeline_executor.py` = `mage_ai/data_preparation/executors/pipeline_executor.py`。
 
 ---
 
