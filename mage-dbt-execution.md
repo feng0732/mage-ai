@@ -121,7 +121,7 @@ res = dbt.invoke(cli_args)
 `DBTBlockSQL._execute_block()` 的完整执行流程：
 
 ```
-1. __create_upstream_tables()     ← 物化上游 block 输出为 dbt seed
+1. __create_upstream_tables()     ← 无条件进入检查，被 source 引用且输出非空的上游才会物化为 dbt seed
 2. __task()                       ← 决定执行哪个 dbt 任务
 3. 构建 CLI参数
    ├── --project-dir
@@ -181,7 +181,7 @@ run_settings_json = json.dumps(run_settings or {})
 | 后台调度 (PipelineRun) | False | 任意 | True | run / snapshot |
 
 **关键洞察**：
-- `Preview` 按钮 → `run_settings={}` → `show` 命令（**当前模型不物化**，但上游 DataFrame 会通过 seed 写入数据库）
+- `Preview` 按钮 → `run_settings={}` → `show` 命令（**当前模型不物化**，**无条件进入上游检查**，但只有被 `{{ source() }}` 引用且输出非空的上游才会通过 seed 写入数据库）
 - `Run/Test/Build` 按钮 → 对应 `run_model/test_model/build_model` → 对应 dbt 命令
 - `snapshot` 模型节点自动将 `run` 替换为 `snapshot` 命令
 - 后台调度默认使用 `build`（内含 run + test），若配置了 `disable_tests` 则降级为 `run`
@@ -261,7 +261,7 @@ cli.invoke(['deps'] + args)   # 始终执行，无前置判断
 ```
 
 **重要注意**：
-- `task == 'show'` 时不执行主任务，**当前模型不物化**（不修改目标表），但上游 DataFrame 会通过 seed 写入 mage_sources 表
+- `task == 'show'` 时不执行主任务，**当前模型不物化**（不修改目标表），但**无条件进入上游检查**，只有被 `{{ source() }}` 引用且输出非空的上游才会通过 seed 写入 mage_sources 表
 - `task == 'run'/'build'` 时，若需要预览/下游数据，会**额外再执行一次** `dbt show`
 - `task == 'test'` 时不执行 show，因为测试没有数据输出
 
@@ -461,7 +461,7 @@ return [df]
 | 后台调度 | ✅ build/run | ❌ 否（无下游非 dbt block 时） | None | output_0 |
 
 **关键洞察**：
-- `task == 'show'` 时，**不执行主任务**，**当前模型不物化**，只执行 show 查询上游 seed 物化后的数据
+- `task == 'show'` 时，**不执行主任务**，**当前模型不物化**，**无条件进入上游检查**，只有被 `{{ source() }}` 引用且输出非空的上游才会被物化，show 只查询这些上游 seed 物化后的数据
 - 后台调度时，`needs_downstream_df` 由**下游 block 的类型**决定——只有当下游存在非 dbt block 时，才会执行 show 获取 DataFrame
 - 若 dbt pipeline 中所有下游都是 dbt block，则**不执行 show、不生成 DataFrame**，节省资源
 - `limit = -1` 表示不限制行数（给下游的完整数据），预览模式默认 1000 行
@@ -725,11 +725,11 @@ while True:
 | dbt 主任务 | 无（跳过） | run / snapshot | test | build |
 | dbt show | ✅ 执行 | ✅ 执行 | ❌ 不执行 | ✅ 执行 |
 | **当前模型物化** | ❌ 不物化 | ✅ 物化 | -（测试） | ✅ 物化 |
-| **上游 seed 写库** | ✅ 有（无条件执行） | ✅ 有 | ✅ 有 | ✅ 有 |
+| **上游 seed 写库** | ⚠️ 有条件（被 source 引用 + 输出非空时） | ⚠️ 有条件 | ⚠️ 有条件 | ⚠️ 有条件 |
 | df 输出 | ✅ 有 | ✅ 有 | ❌ 无 | ✅ 有 |
 | 存储键 | `df` | `df` | `df` (None) | `df` |
-| **对数据库影响** | show 只读 + seed 写库 | 读写 | 只读（测试断言） | 读写 |
-| **典型耗时** | 中（seed + show） | 中（seed + run + show） | 短（seed + test） | 长（seed + build + show） |
+| **对数据库影响** | show 只读 + seed 有条件写库 | 读写 + seed 有条件写库 | 只读（测试断言） + seed 有条件写库 | 读写 + seed 有条件写库 |
+| **典型耗时** | 中（检查 + show，满足条件时加 seed） | 中（检查 + run + show，满足条件时加 seed） | 短（检查 + test，满足条件时加 seed） | 长（检查 + build + show，满足条件时加 seed） |
 
 ---
 
@@ -742,7 +742,7 @@ Pipeline Scheduler
   └─ BlockExecutor.execute_block(block_uuid)
        ├─ logger_manager 初始化
        ├─ block._execute_block()
-       │    ├─ __create_upstream_tables()  ← ⚠️ 物化上游：dbt seed 写库（无条件执行）
+       │    ├─ __create_upstream_tables()  ← ⚠️ 无条件进入检查，被 source 引用且输出非空的上游才会 dbt seed 写库
        │    │    ├─ __upstream_blocks_from_sources()      # 从 SQL 中的 {{ source() }} 提取上游
        │    │    ├─ 获取上游 block 输出 (DataFrame)
        │    │    └─ DBTBlock.materialize_df()             # CSV → dbt seed → 物化表
@@ -782,7 +782,7 @@ Pipeline Scheduler
   └─ WebSocket 消息（无 run_settings 字段）
        └─ output_display.py: run_settings or {} → {}
             └─ _execute_block(from_notebook=True, run_settings={})
-                 ├─ __create_upstream_tables()  ← ⚠️ 物化上游（如有）：dbt seed 写库
+                 ├─ __create_upstream_tables()  ← ⚠️ 无条件进入检查，被 source 引用且输出非空的上游才会 dbt seed 写库
                  ├─ __task() → 'show'            ← run_settings={} → else 分支
                  ├─ 构建 CLI 参数
                  ├─ Profiles().__enter__()
@@ -796,7 +796,7 @@ Pipeline Scheduler
                  └─ return [df]
 ```
 
-**特点**：**当前模型不物化**，但上游非 dbt block 输出会通过 `dbt seed` 写入数据库；show 查询只读；用于验证 SQL 逻辑
+**特点**：**当前模型不物化**，**无条件进入上游检查**，只有被 `{{ source() }}` 引用且输出非空的上游非 dbt block 输出才会通过 `dbt seed` 写入数据库；show 查询只读；用于验证 SQL 逻辑
 
 ---
 
@@ -810,7 +810,7 @@ Pipeline Scheduler
 用户点击 Run
   └─ WebSocket 消息 { run_settings: { run_model: true } }
        └─ _execute_block(from_notebook=True, run_settings={run_model:true})
-            ├─ __create_upstream_tables()  ← ⚠️ 物化上游（如有）：dbt seed 写库
+            ├─ __create_upstream_tables()  ← ⚠️ 无条件进入检查，被 source 引用且输出非空的上游才会 dbt seed 写库
             ├─ __task() → 'run' (或 'snapshot')    ← run_model=true
             ├─ 构建 CLI 参数
             ├─ Profiles().__enter__()
@@ -839,7 +839,7 @@ Pipeline Scheduler
 用户点击 Test
   └─ WebSocket 消息 { run_settings: { test_model: true } }
        └─ _execute_block(from_notebook=True, run_settings={test_model:true})
-            ├─ __create_upstream_tables()  ← ⚠️ 物化上游（如有）：dbt seed 写库
+            ├─ __create_upstream_tables()  ← ⚠️ 无条件进入检查，被 source 引用且输出非空的上游才会 dbt seed 写库
             ├─ __task() → 'test'                    ← test_model=true
             ├─ 构建 CLI 参数
             ├─ Profiles().__enter__()
@@ -868,7 +868,7 @@ Pipeline Scheduler
 用户点击 Build
   └─ WebSocket 消息 { run_settings: { build_model: true } }
        └─ _execute_block(from_notebook=True, run_settings={build_model:true})
-            ├─ __create_upstream_tables()  ← ⚠️ 物化上游（如有）：dbt seed 写库
+            ├─ __create_upstream_tables()  ← ⚠️ 无条件进入检查，被 source 引用且输出非空的上游才会 dbt seed 写库
             ├─ __task() → 'build'                    ← build_model=true
             ├─ 构建 CLI 参数
             ├─ Profiles().__enter__()
@@ -914,13 +914,123 @@ Preview 路径的代码执行涉及三个独立操作空间，它们的副作用
 
 | 操作 | 执行阶段 | 对数据库的影响 | 对本地文件的影响 | 代码位置 |
 |------|---------|--------------|----------------|----------|
-| **① 上游 DataFrame seed 写库** | `_execute_block` 开头，`dbt deps` **之前** | ✅ **写入数据库**（创建/覆盖表） | ✅ 临时写 CSV → seed → 删除 | [block_sql.py#L332-L338](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L332-L338) |
+| **① 上游 DataFrame seed 写库** | `_execute_block` 开头，`dbt deps` **之前** | ⚠️ **有条件写库**（被 `{{ source() }}` 引用且输出非空时） | ✅ 临时写 CSV → seed → 删除 | [block_sql.py#L332-L338](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L332-L338) |
 | **② 当前模型是否物化** | 主任务阶段 | ❌ **不物化**（task='show' 跳过主任务） | - | [block_sql.py#L414-L418](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L414-L418) |
 | **③ show 查询预览** | 最后阶段 | ❌ **只读查询**（`SELECT * FROM (compiled_sql) LIMIT n`） | - | [block_sql.py#L423-L430](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L423-L430) |
 
-### 4.2 副作用一：上游 DataFrame seed 写库（Preview 也触发）
+### 4.1.1 `__create_upstream_tables()` 的三层精确触发逻辑
 
-**关键结论：即使是 Preview，上游非 dbt block 的输出也会被写入数据库。**
+> **关键修正**：之前的"无条件写库"是过度概括。实际是 **无条件进入检查，但只有被 `{{ source() }}` 引用且输出非空的上游才会真正写库**。
+
+完整的三层过滤逻辑如下：
+
+```
+__create_upstream_tables()  ← 第一层：无条件进入（无任何 if 判断）
+    │
+    ├─ __upstream_blocks_from_sources()  ← 第二层：只筛选被 source 引用的上游块
+    │    ├─ __extract_sources() 用正则解析 SQL 中的 {{ source('src', 'tbl') }}
+    │    ├─ 遍历 self.upstream_blocks（Mage pipeline 中的所有上游）
+    │    └─ 仅返回那些被 source 引用匹配到的上游块
+    │         └─ 如果 SQL 中没有 {{ source() }}，返回空列表 → 跳过所有物化
+    │
+    └─ for ublock in 筛选后的上游块:
+         ├─ 获取上游输出 → 标准化为 DataFrame
+         └─ if df.empty:  ← 第三层：输出为空时跳过物化
+              │   logger.info('No data for dbt to materialize.')
+              └─ 跳过 materialize_df() → 不写库
+            else:
+              └─ DBTBlock.materialize_df()  ← 真正写入数据库
+```
+
+**第一层：无条件进入检查**（[block_sql.py#L332-L338](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L332-L338)）
+
+```python
+# _execute_block() 第 332 行，没有任何 if 判断
+self.__create_upstream_tables(
+    execution_partition=execution_partition,
+    global_vars=global_vars,
+    logger=logger,
+    outputs_from_input_vars=outputs_from_input_vars,
+    runtime_arguments=runtime_arguments,
+)
+```
+
+> 无论 `task` 是 'show'/'run'/'test'/'build'，无论 `from_notebook` 是 True/False，都一定会进入这个方法。
+
+**第二层：只筛选被 `{{ source() }}` 引用的上游块**（[block_sql.py#L588-L605](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L588-L605)）
+
+```python
+def __upstream_blocks_from_sources(self, global_vars: Dict = None) -> List[Block]:
+    mapping = {}
+    sources = self.__extract_sources()  # 正则解析 SQL 中的 {{ source('src', 'tbl') }}
+    for tup in sources:
+        source_name, table_name = tup
+        if source_name not in mapping:
+            mapping[source_name] = {}
+        mapping[source_name][table_name] = True  # 构建被引用表的白名单
+
+    source_name = get_source_name(Path(self.project_path).stem)
+    arr = []
+    for b in self.upstream_blocks:  # Mage pipeline 中的所有上游块
+        table_name = get_source_table_name_for_block(b)
+        # 只有在上游块的表名出现在白名单中时，才返回该块
+        if mapping.get(source_name, {}).get(table_name):
+            arr.append(b)
+    return arr
+```
+
+**正则提取规则**（[block_sql.py#L526-L533](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L526-L533)）：
+
+```python
+def __extract_sources(self) -> List[Tuple[str, str]]:
+    return re.findall(
+        r"{}[ ]*source\(['\"]+([\w]+)['\"]+[,]+[ ]*['\"]+([\w]+)['\"]+\)[ ]*{}".format(
+            r'\{\{', r'\}\}',
+        ),
+        self.content,
+    )
+```
+
+> 只匹配严格格式的 `{{ source('source_name', 'table_name') }}`，不匹配注释中的、参数格式不对的、或使用变量的 source 调用。
+
+**第三层：输出为空时跳过物化**（[block_sql.py#L512-L524](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L512-L524)）
+
+```python
+if df.empty:
+    if logger:
+        logger.info('No data for dbt to materialize.')  # 仅打日志
+else:
+    DBTBlock.materialize_df(  # 只有非空才真正写库
+        df=df,
+        pipeline_uuid=self.pipeline.uuid,
+        block_uuid=ublock.uuid,
+        targets=[(self.project_path, self.target(variables=global_vars))],
+        logger=logger,
+        global_vars=global_vars,
+        runtime_arguments=runtime_arguments,
+    )
+```
+
+**完整触发条件布尔表达式**：
+```
+真正写库 = (无条件进入检查) 
+        AND (上游块被 {{ source() }} 引用) 
+        AND (上游输出非空)
+```
+
+**三种不写库的场景**：
+
+| 场景 | 过滤层级 | 不写库原因 |
+|------|---------|-----------|
+| **场景 1** | 第二层 | dbt 模型 SQL 中没有 `{{ source() }}` 调用，或没有引用该上游块 |
+| **场景 2** | 第三层 | 上游块执行成功但输出为空 DataFrame（如 `pd.DataFrame()`） |
+| **场景 3** | 第二层 | 上游块是 dbt block（不是 Python/R/SQL block），不在 `upstream_blocks` 中 |
+
+---
+
+### 4.2 副作用一：上游 DataFrame seed 写库（Preview 也进入检查，但需满足两层过滤才写库）
+
+**关键结论：即使是 Preview，也会**无条件进入** `__create_upstream_tables()` 检查，但只有**被 `{{ source() }}` 引用且输出非空**的上游非 dbt block 输出才会真正写入数据库。**
 
 #### 执行链路：
 
@@ -966,11 +1076,11 @@ DBTCli(logger=logger).invoke(args)   # ← 注意：此处也不检查 success�
 seed_path.unlink()                   # ← 即使 seed 失败也会尝试删除 CSV
 ```
 
-**副作用影响链**：
+**副作用影响链**（仅当满足两层过滤条件时发生）：
 1. **数据库中会持久存在** `mage_{pipeline}_{block}` 表
 2. 表数据是当前 Preview 时刻上游 block 的输出快照
 3. **--full-refresh** 意味着每次 Preview 都会 **先删除再重建** 该表（不是追加）
-4. 若有多个用户/进程同时 Preview，存在 **seed 竞争写库** 风险
+4. 若有多个用户/进程同时 Preview，存在 **seed 竞争写库** 风险（仅当同一上游被同时物化时）
 
 #### seed 失败的异常行为：
 
@@ -1051,10 +1161,16 @@ if from_notebook and task != 'test':   # Preview: from_notebook=True, task='show
 ```
 时间轴 →
 │
-├─ __create_upstream_tables()
-│    ├─ [副作用] 上游 N 个 block → dbt seed --full-refresh
-│    │    └─ 数据库：创建/覆盖 mage_{pipeline}_{block} 表  ← ✅ 写库！
-│    └─ [副作用] 临时 CSV 文件（写→删）
+├─ __create_upstream_tables()  ← ⚠️ 无条件进入检查
+│    ├─ [过滤层 1] __upstream_blocks_from_sources() → 仅保留被 {{ source() }} 引用的上游
+│    ├─ [过滤层 2] 对每个筛选后的上游 → 检查输出是否为空
+│    │
+│    ├─ 仅对"被引用 + 非空"的上游执行：
+│    │    ├─ [副作用] 生成 CSV → dbt seed --full-refresh
+│    │    │    └─ 数据库：创建/覆盖 mage_{pipeline}_{block} 表  ← ✅ 真正写库！
+│    │    └─ [副作用] 临时 CSV 文件（写→删）
+│    │
+│    └─ 未被引用或输出为空的上游 → 仅打日志，不写库
 │
 ├─ with Profiles():
 │    ├─ [副作用] 创建临时 .profiles_interpolated_temp_xxx/ 目录
@@ -1077,13 +1193,13 @@ if from_notebook and task != 'test':   # Preview: from_notebook=True, task='show
 
 ### 4.6 三件事的副作用隔离总结
 
-| 操作 | Preview 是否触发 | 写库？ | 影响对象 | 失败时是否中断整体？ |
-|------|----------------|-------|---------|-------------------|
-| **上游 seed 写库** | ✅ 是 | ✅ 是 | 上游 source 表 | seed 返回失败不中断；抛异常才中断 |
-| **当前模型物化** | ❌ 否（task='show'） | - | 模型目标表 | - |
-| **show 查询预览** | ✅ 是 | ❌ 只读 | 无（查询结果仅在内存） | ✅ show 失败 → raise → 中断 |
+| 操作 | Preview 是否**进入检查** | 是否**真正写库** | 触发条件 | 影响对象 | 失败时是否中断整体？ |
+|------|----------------------|----------------|---------|---------|-------------------|
+| **上游 seed 写库** | ✅ 是（无条件进入） | ⚠️ 有条件（被 source 引用 + 输出非空） | 满足两层过滤时 | 上游 source 表 | seed 返回失败不中断；抛异常才中断 |
+| **当前模型物化** | ✅ 进入后被跳过 | ❌ 否 | `task != 'show'` 为 false | 模型目标表 | - |
+| **show 查询预览** | ✅ 是 | ❌ 只读 | `needs_preview_df=True`（必然满足） | 无（查询结果仅在内存） | ✅ show 失败 → raise → 中断 |
 
-> **重要警示**：用户点击 Preview 期望"只看看不修改"，但 **上游 block 的 seed 实际上正在写入数据库**。这是一个可能造成用户误解的副作用边界。
+> **重要警示**：用户点击 Preview 期望"只看看不修改"，但 **如果 dbt 模型 SQL 中引用了上游非 dbt block 作为 source，且上游输出非空，那么这些上游数据会通过 seed 写入数据库**。这是一个可能造成用户误解的副作用边界。
 
 ---
 
@@ -1391,14 +1507,15 @@ Mage AI 与 dbt 的集成实现了一条 **"配置插值 → 进程内命令执�
 - **deps 无条件执行**：每次 block 执行必先跑 `dbt deps`，但 **不检查 `success`**（仅模式 A 静默继续，模式 B 抛异常中断）
 - **show 双触发条件**：`needs_preview_df`（Notebook 预览）和 `needs_downstream_df`（下游非 dbt block），任一满足即执行 show
 - **输出键名分化**：Notebook 模式存 `df`，后台调度存 `output_0`，适配不同消费场景
-- **上游 seed 无条件执行**：所有路径（包括 Preview）的 `__create_upstream_tables()` 在 `_execute_block` 开头无条件执行，上游非 dbt block 输出始终会被 `dbt seed --full-refresh` 写入数据库
+- **上游 seed 三层过滤**：所有路径（包括 Preview）都**无条件进入** `__create_upstream_tables()` 检查，但只有**被 `{{ source() }}` 引用且输出非空**的上游非 dbt block 输出才会被 `dbt seed --full-refresh` 写入数据库
+- **正则提取限制**：`__extract_sources()` 用正则匹配 `{{ source('src', 'tbl') }}`，不匹配注释中的、参数格式不对的、或使用变量的 source 调用
 
 ### Preview 副作用边界核心发现
 
-- **① 上游 seed 写库：Preview 也触发** → `__create_upstream_tables()` 在 `_execute_block` 开头无条件执行，即使 Preview 也会用 `dbt seed --full-refresh` 将上游 DataFrame 写入数据库
+- **① 上游 seed 写库：Preview 也进入检查，但两层过滤后才写库** → `__create_upstream_tables()` 在 `_execute_block` 开头无条件进入，但只有**被 `{{ source() }}` 引用且输出非空**的上游才会用 `dbt seed --full-refresh` 写入数据库
 - **② 当前模型物化：Preview 不触发** → `if task != 'show'` 判断跳过主任务分支，当前模型不会被 CREATE/ALTER
 - **③ show 查询预览：纯只读** → `SELECT * FROM (compiled_sql) LIMIT n` 包装查询，不写任何数据库对象
-- **⚠️ 用户预期偏差**：用户以为 Preview"只看看"，但上游表的 seed 副作用实际上正在修改数据库
+- **⚠️ 用户预期偏差**：用户以为 Preview"只看看不修改"，但**如果 dbt 模型 SQL 中引用了上游非 dbt block 作为 source，且上游输出非空，那么这些上游数据会通过 seed 写入数据库**。这是一个可能造成用户误解的副作用边界。
 
 ### deps 失败影响与错误处理核心发现
 
