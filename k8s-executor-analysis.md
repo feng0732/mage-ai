@@ -271,8 +271,11 @@ INITIAL → QUEUED → RUNNING → COMPLETED
 def run_job(self, command, k8s_config=None):
     if not self.job_exists():
         job = self.create_job_object(command, k8s_config=k8s_config)
+        # ★ ttl_seconds_after_finished 在 Job 创建时就写入 K8s API（V1JobSpec 字段）
+        #   由 K8s 控制器独立执行，不依赖 Mage Worker 是否存活
         self.create_job(job)       # 提交到 K8s API Server
 
+    api_response = None
     job_completed = False
     while not job_completed:
         # 每 5 秒轮询一次 K8s Job 状态（同步阻塞）
@@ -284,12 +287,15 @@ def run_job(self, command, k8s_config=None):
             job_completed = True
         time.sleep(5)
 
-    self.delete_job()              # ★ 正常完成路径下主动删除 K8s Job
+    self.delete_job()              # ★ Worker 正常跑完：主动立即删除 K8s Job
+    self._print(f'Job {self.job_name} status={api_response.status}')
     if api_response.status.succeeded is None:
         raise Exception(f'Failed to execute k8s job {self.job_name}')
 ```
 
 `run_job()` 是**同步阻塞**的：调用方线程（Mage Worker 进程）会一直卡在 while 循环中，直到 K8s Job 完成（成功或失败）。
+
+> **TTL 边界要点**：`ttl_seconds_after_finished` 是**K8s 控制器层面的异步清理机制**，在 Job 创建时就写入 `V1JobSpec`（`mage_ai/services/k8s/config.py` L143-L148）。K8s 控制器会在 Job 进入 Completed/Failed 状态后独立倒计时，**不依赖 Mage Worker 是否正常跑完**。
 
 ### 3.3 Pod 内部执行与状态回写（Pod 内部，CLI 侧）
 
@@ -716,11 +722,34 @@ def kill_job(self, job_id: str):
     self.__unset_kill_job(job_id)
 ```
 
-> **边界要点 6**：`kill_block_run_job` 最终调用 `os.kill(pid, signal.SIGKILL)`。SIGKILL 不能被捕获、阻塞或忽略，目标进程（Mage Worker）立即终止，**没有任何机会执行清理逻辑**（包括 `K8sJobManager.run_job()` 末尾的 `delete_job()`）。
+> **边界要点 6**：`kill_block_run_job` 最终调用 `os.kill(pid, signal.SIGKILL)`。SIGKILL 不能被捕获、阻塞或忽略，目标进程（Mage Worker）立即终止，**没有任何机会执行清理逻辑**（包括 `K8sJobManager.run_job()` 末尾的 `delete_job()` 主动删除路径）。
+>
+> **TTL 边界澄清**：Worker 被强杀影响的只是 **Mage 主动删除路径**（L290 `self.delete_job()`），不会影响 **K8s 控制器层面的 TTL 清理**。TTL 是 Job 创建时就写入 `V1JobSpec` 的 K8s 原生机制，由 K8s Controller Manager 独立执行，与 Mage Worker 进程是否存活完全无关。
 
-### 4.4 按 Block 调度的 K8s Job/Pod 实际删除时机
+### 4.4 按 Block 调度的 K8s Job/Pod 实际删除时机（统一清理路径）
 
 ```
+                     ┌─────────────────────────────────────────────────────────────────┐
+                     │               K8s Job 的两条独立清理路径                          │
+                     │                                                                 │
+                     │  【路径 A：Mage 主动删除】                                         │
+                     │  触发条件：Worker 正常跑完 run_job() 全流程                          │
+                     │  执行位置：mage_ai/services/k8s/job_manager.py L290                │
+                     │  执行方式：self.delete_job() → K8s API DELETE                      │
+                     │  副作用：propagation_policy=Foreground 级联删除 Pod                │
+                     │  即时性：Job 完成后立即删除（5s 轮询间隔内）                          │
+                     │                                                                 │
+                     │  【路径 B：K8s 控制器 TTL 清理】                                    │
+                     │  触发条件：Job 配置了 ttl_seconds_after_finished 且 Job 已结束       │
+                     │  执行位置：K8s Controller Manager（Mage 外部，K8s 自身组件）         │
+                     │  执行方式：K8s 控制器倒计时结束后自动调用 DELETE API                 │
+                     │  副作用：级联删除 Pod（取决于 K8s 默认删除策略）                      │
+                     │  即时性：Job 结束后 ttl_seconds_after_finished 秒后自动删除          │
+                     │  依赖条件：不依赖 Mage Worker 是否存活，完全独立运行                  │
+                     │                                                                 │
+                     │  两条路径独立触发、互为补充：路径 A 失效时路径 B 仍可能生效          │
+                     └─────────────────────────────────────────────────────────────────┘
+
 按 Block 调度取消触发
         │
         ▼
@@ -741,31 +770,36 @@ cancel_block_runs_and_jobs()
                    │  │  while not job_completed:                    │
                    │  │      read_namespaced_job()   ← 被 SIGKILL 中断
                    │  │      time.sleep(5)
-                   │  │  self.delete_job()              ← 永远不会执行
+                   │  │  self.delete_job()   ← ★ Mage 主动删除路径（路径 A）永远不会执行
                    │  └─────────────────────────────────────────────┘
                    │
                    ▼
-         ┌───────────────────────────────────────────┐
-         │  K8s Job 和 Pod 的实际命运                  │
-         │                                             │
-         │  1. 如果配置了 ttl_seconds_after_finished    │
-         │     → 等待 TTL 到期后 K8s 自动清理 Job       │
-         │     （Pod 随之被级联删除）                    │
-         │                                             │
-         │  2. 如果配置了 active_deadline_seconds       │
-         │     → Job 超时被 K8s 标记为 Failed           │
-         │     → 但 Job/Pod 仍不自动删除（除非有 TTL）   │
-         │                                             │
-         │  3. Pod 内部业务逻辑自然跑完                  │
-         │     → Job succeeded=1 但 delete_job 未执行   │
-         │     → Job/Pod 残留，直到 TTL 或手动清理       │
-         │                                             │
-         │  4. 无 TTL、业务不跑完、无 active_deadline    │
-         │     → Job 和 Pod 永久残留，需人工 kubectl delete │
-         └───────────────────────────────────────────┘
+         ┌─────────────────────────────────────────────────────────────┐
+         │  K8s Job 和 Pod 的最终命运（取决于路径 B 是否可用）             │
+         │                                                               │
+         │  1. ✅ 配置了 ttl_seconds_after_finished                       │
+         │     → K8s 控制器独立倒计时（路径 B）                            │
+         │     → TTL 到期后 K8s 自动删除 Job，Pod 随之级联删除              │
+         │     → 与 Worker 进程是否存活无关                                │
+         │                                                               │
+         │  2. ✅ 配置了 active_deadline_seconds + ttl                     │
+         │     → active_deadline 到期时 K8s 标记 Job 为 Failed            │
+         │     → 进入 Completed/Failed 状态后 TTL 开始倒计时               │
+         │     → TTL 到期后自动清理                                       │
+         │                                                               │
+         │  3. ⚠️  配置了 active_deadline_seconds 但未配置 ttl             │
+         │     → Job 被标记为 Failed 但不自动删除                          │
+         │     → Job 和 Pod 永久残留，需人工 kubectl delete                │
+         │                                                               │
+         │  4. ❌ 无 ttl_seconds_after_finished + 无 active_deadline       │
+         │     → Pod 内部业务逻辑可能继续跑完（SIGKILL 的是 Worker 不是 Pod）│
+         │     → 即使业务跑完，Job/Pod 永久残留，需人工 kubectl delete      │
+         └─────────────────────────────────────────────────────────────┘
 ```
 
-> **边界要点 7**：按 Block 调度的 K8s 取消是「**异步尽力清理**」模型。同步路径只保证 DB 状态正确和 Mage Worker 进程终止；K8s Job/Pod 的删除依赖 TTL、超时配置或外部人工干预，**不在取消的同步必然路径上**。
+> **边界要点 7**：按 Block 调度的 K8s 取消是「**同步状态更新 + 异步尽力清理**」模型。同步路径只保证 DB 状态正确和 Mage Worker 进程终止；Mage 主动删除路径（路径 A）被 SIGKILL 切断；K8s Job/Pod 的最终删除依赖 K8s 控制器 TTL 清理（路径 B）或外部人工干预，**不在取消的同步必然路径上**。
+>
+> **边界要点 7.1**：Worker 被 SIGKILL ≠ Pod 被终止。Mage Worker 是运行在 Mage Server 上的子进程，K8s Pod 是运行在 K8s 集群中的独立资源。`os.kill(worker_pid, SIGKILL)` 只终止 Mage Server 上的本地 Worker 进程，对 K8s Pod 本身没有任何直接影响。Pod 的终止只能通过 K8s API（路径 A 或路径 B）触发。
 
 ### 4.5 整 Pipeline K8s 执行的取消（有显式清理）
 
@@ -814,14 +848,20 @@ def on_pipeline_run_failure(self, error_msg, status=FAILED):
     cancel_block_runs_and_jobs(self.pipeline_run, self.pipeline)
 ```
 
-### 4.7 Job 自动清理的两道防线（仅正常完成路径）
+### 4.7 Job 自动清理的两道独立防线（统一清理边界）
 
-1. **主动删除**：`JobManager.run_job()` 在轮询检测到 Job 结束后，无论成功失败都会立即调用 `delete_job()`（`mage_ai/services/k8s/job_manager.py` L95）
-2. **被动过期**：K8s Job 配置了 `ttl_seconds_after_finished`（可通过 `job_config` 设置），K8s Controller 会在 Job 完成后指定秒数自动清理
+> 两道防线**独立运行**，互不依赖。
 
-> 这两道防线仅在 Worker 进程正常跑完 `run_job()` 全流程时生效。如果 Worker 被 SIGKILL 中断，两道防线均不触发。
+| 防线 | 类型 | 触发条件 | 执行主体 | 对 Worker 存活的依赖 |
+|------|------|---------|---------|-------------------|
+| **1. 主动删除（路径 A）** | 同步删除 | Worker 正常跑完 `run_job()` 全流程 | Mage Worker 进程（`mage_ai/services/k8s/job_manager.py` L290 `self.delete_job()`） | ✅ 依赖 — Worker 必须存活到 `run_job()` 末尾 |
+| **2. TTL 过期清理（路径 B）** | 异步清理 | Job 配置了 `ttl_seconds_after_finished` 且 Job 已结束 | K8s Controller Manager（K8s 集群自身组件） | ❌ 不依赖 — 完全在 Mage 外部独立运行 |
 
-**【取消收尾阶段结束】**：DB 中 PipelineRun/BlockRun 已处于最终状态（COMPLETED / FAILED / CANCELLED），Mage Worker 进程已被终止；但 K8s Job/Pod 可能仍存在，取决于 TTL 等配置。
+> **修正之前的错误结论**：TTL 清理**不依赖** Worker 完整执行 `run_job()`。TTL 是 K8s 原生机制，在 Job 创建时就写入 `V1JobSpec`（`mage_ai/services/k8s/config.py` L143-L148），K8s 控制器独立倒计时执行。即使 Worker 被 SIGKILL，只要配置了 TTL，K8s 仍会在 Job 结束后自动清理。
+>
+> 唯一受 Worker 强杀影响的是防线 1（主动删除）。
+
+**【取消收尾阶段结束】**：DB 中 PipelineRun/BlockRun 已处于最终状态（COMPLETED / FAILED / CANCELLED），Mage Worker 进程已被终止；但 K8s Job/Pod 的清理时机取决于两条清理路径是否可用：配置了 TTL 则由 K8s 自动异步清理，否则需人工干预。
 
 ---
 
@@ -844,15 +884,18 @@ def on_pipeline_run_failure(self, error_msg, status=FAILED):
      │                     │                │              │  │    while not completed:     │    │             │
      │                     │                │              │  │        read_job()  ←──被 SIGKILL 中断        │
      │                     │                │              │  │        sleep(5)             │    │             │
-     │                     │                │              │  │    delete_job()  ←── ★ 永远不执行          │
+     │                     │                │              │  │    delete_job()  ←── ★ Mage 主动删除路径失效 │
      │                     │                │              │  └────────────────────────────┘    │             │
      │                     │                │              │                  │              │             │
-     │                     │                │              │                  │  ┌── K8s Job/Pod 命运 ──┐        │
-     │                     │                │              │                  │  │ 1. ttl 到期自动清理    │        │
-     │                     │                │              │                  │  │ 2. active_deadline 超时│        │
-     │                     │                │              │                  │  │ 3. 业务跑完后残留      │        │
-     │                     │                │              │                  │  │ 4. 永久残留直到手动删  │        │
-     │                     │                │              │                  │  └───────────────────────┘        │
+     │                     │                │              │                  │  ┌── 两条独立清理路径 ──┐        │
+     │                     │                │              │                  │  │ 【路径 A：Mage 主动删除】× 失效│
+     │                     │                │              │                  │  │ 【路径 B：K8s 控制器 TTL】     │
+     │                     │                │              │                  │  │   · 配置了 ttl → K8s 独立倒计时  │
+     │                     │                │              │                  │  │   · TTL 到期自动清理 Job/Pod     │
+     │                     │                │              │                  │  │   · 不依赖 Mage Worker 存活      │
+     │                     │                │              │                  │  │                               │
+     │                     │                │              │                  │  │ 无 ttl → 永久残留，需人工删除    │
+     │                     │                │              │                  │  └─────────────────────────────┘        │
 ```
 
 ---
@@ -890,16 +933,20 @@ def on_pipeline_run_failure(self, error_msg, status=FAILED):
 
 | 阶段 | 起点 | 终点 | 必然完成的操作 | 可能异步/缺失的操作 |
 |------|------|------|--------------|-------------------|
-| **入口协作** | PipelineRun.status = RUNNING | K8s Job 成功提交到 API Server | DB 状态更新、Mage Job 入队、K8s Job 创建 | — |
+| **入口协作** | PipelineRun.status = RUNNING | K8s Job 成功提交到 API Server | DB 状态更新、Mage Job 入队、K8s Job 创建（含 `ttl_seconds_after_finished` 写入 `V1JobSpec`） | — |
 | **状态推进** | Pod 开始执行业务逻辑 | 调度器完成 PipelineRun 聚合 + 下一轮 Block 调度决策 | Pod 内尝试 DB 直写、Pod 外回调尝试 DB 补写并调度 | 双端写入可能各自失败，依赖至少一端成功 |
-| **取消收尾** | 取消/超时/失败信号产生 | DB 状态最终化 + Mage Worker 进程终止 | BlockRun/PipelineRun 状态更新、Mage Worker SIGKILL | 按 Block 调度的 K8s Job/Pod **不保证同步删除**，依赖 TTL/超时/手动 |
+| **取消收尾** | 取消/超时/失败信号产生 | DB 状态最终化 + Mage Worker 进程终止 | BlockRun/PipelineRun 状态更新、Mage Worker SIGKILL | 按 Block 调度的 K8s Job/Pod **不保证同步删除**：Mage 主动删除路径失效，K8s 控制器 TTL 清理可能异步触发（不依赖 Worker），无 TTL 则永久残留 |
 
-### 6.3 按 Block 调度取消的核心边界
+### 6.3 按 Block 调度取消的核心边界（统一清理路径）
 
 - `cancel_block_runs_and_jobs()` 对按 Block 调度模式**仅 kill Mage 内部进程级 Job**，不调用 K8s API
-- Worker 被 SIGKILL 强杀后，`K8sJobManager.run_job()` 末尾的 `delete_job()` 永远不执行
-- K8s Job/Pod 的删除是**异步非必然**的，取决于 `ttl_seconds_after_finished`、`active_deadline_seconds` 或外部干预
-- 对比：整 Pipeline K8s 执行模式有显式 `K8sPipelineExecutor.cancel()` → `delete_job()`，可同步清理
+- Worker 被 SIGKILL 强杀后，**Mage 主动删除路径（路径 A）**（`K8sJobManager.run_job()` L290 `delete_job()`）永远不执行
+- **K8s 控制器 TTL 清理路径（路径 B）** 与 Worker 存活完全独立：Job 创建时 `ttl_seconds_after_finished` 就写入 `V1JobSpec`，K8s 控制器独立倒计时执行，Worker 被强杀不影响 TTL 触发
+- K8s Job/Pod 的最终清理命运：
+  - ✅ 配置了 TTL → K8s 控制器异步自动清理（不依赖 Worker）
+  - ⚠️  配置了 `active_deadline_seconds` 但无 TTL → Job 超时标记 Failed 但永久残留
+  - ❌ 无 TTL 且无 `active_deadline_seconds` → Job/Pod 永久残留，需人工 `kubectl delete`
+- 对比：整 Pipeline K8s 执行模式有显式 `K8sPipelineExecutor.cancel()` → `delete_job()`，可同步清理（路径 A 在取消时主动触发）
 
 ### 6.4 双端状态写入的兜底限制
 
