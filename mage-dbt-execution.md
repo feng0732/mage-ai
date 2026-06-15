@@ -136,29 +136,140 @@ res = dbt.invoke(cli_args)
 7. store_variables()              ← 存储输出
 ```
 
-#### 2.2.3 任务选择逻辑
+#### 2.2.3 任务选择逻辑（__task 方法）
 
 **关键文件**: [block_sql.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L536-L586)
 
-任务选择遵循以下矩阵：
+`__task(from_notebook, run_settings)` 方法根据两个输入参数决定执行哪个 dbt 命令。
 
-| from_notebook | run_settings           | disable_tests | 任务          |
-|---------------|------------------------|---------------|---------------|
-| True          | {}                     | False/None    | build         |
-| True          | {}                     | True          | run/snapshot  |
-| True          | {run_model:True}       | any           | run/snapshot  |
-| True          | {test_model:True}      | any           | test          |
-| True          | {build_model:True}     | any           | build         |
-| True          | None                   | any           | run/snapshot  |
-| False         | any                    | False/None    | build         |
-| False         | any                    | True          | run/snapshot  |
+**核心代码逻辑**：
+```python
+if from_notebook:
+    if run_settings is not None:
+        if run_settings.get('run_model'):
+            return 'snapshot' if __node_type == 'snapshot' else 'run'
+        elif run_settings.get('test_model'):
+            return 'test'
+        elif run_settings.get('build_model'):
+            return 'build'
+        else:
+            return 'show'   # run_settings 为空字典时走这里
+elif disable_tests:
+    return 'snapshot' if __node_type == 'snapshot' else 'run'
+return 'build'  # 后台调度默认 build
+```
+
+**run_settings 的重要转换（从 None 到 {}）**：
+
+前端 Websocket 消息中 `run_settings` 字段可选（不传则为 `None`），但在生成内核执行代码时，[output_display.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/server/utils/output_display.py#L235) 中：
+```python
+run_settings_json = json.dumps(run_settings or {})
+```
+`run_settings or {}` 将 `None` 转换为空字典 `{}`，再经 `json.loads()` 解析后传递给 `_execute_block`。
+
+**因此，所有来自 Notebook 前端的调用，`run_settings` 均不为 `None`**——要么是空字典 `{}`，要么是包含具体选项的字典。
+
+**任务选择矩阵（实际行为）**：
+
+| 触发源 | from_notebook | run_settings | disable_tests | dbt 任务 |
+|-------|---------------|--------------|---------------|----------|
+| Preview 按钮 (Cmd+Enter) | True | {} | any | show |
+| Run 按钮 | True | {run_model:True} | any | run / snapshot |
+| Test 按钮 | True | {test_model:True} | any | test |
+| Build 按钮 | True | {build_model:True} | any | build |
+| 后台调度 (PipelineRun) | False | 任意 | False/None | build |
+| 后台调度 (PipelineRun) | False | 任意 | True | run / snapshot |
 
 **关键洞察**：
-- `run_settings=None` 且 `from_notebook=True`（即"运行/执行 Pipeline"按钮触发时）执行 `run/snapshot`
-- `run_settings={}` 且 `from_notebook=True`（即"编译 & 预览"按钮触发时）执行 `show`
-- 后台调度执行默认使用 `build`（包含 run + test）
+- `Preview` 按钮 → `run_settings={}` → `show` 命令（仅查询不物化）
+- `Run/Test/Build` 按钮 → 对应 `run_model/test_model/build_model` → 对应 dbt 命令
+- `snapshot` 模型节点自动将 `run` 替换为 `snapshot` 命令
+- 后台调度默认使用 `build`（内含 run + test），若配置了 `disable_tests` 则降级为 `run`
 
-#### 2.2.4 YAML Block 执行流程
+#### 2.2.4 前端触发路径与参数传递
+
+**关键文件**: [useCodeBlockProps.tsx](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/frontend/components/CodeBlockV2/dbt/useCodeBlockProps.tsx#L149-L264)
+
+dbt SQL Block 在 Notebook 界面提供 **4 个执行按钮**：
+
+| 按钮 | 快捷键 | run_settings | 描述 |
+|------|--------|--------------|------|
+| Preview | Cmd/Ctrl + Enter | 无（→ {}) | 编译 SQL 并查询样本数据 |
+| Run | - | {run_model: true} | 运行模型（物化表） |
+| Test | - | {test_model: true} | 测试模型（执行 schema 测试） |
+| Build | - | {build_model: true} | 构建模型（run + test） |
+
+**完整调用链路**：
+```
+前端按钮点击
+  └─ runBlockAndTrack(block, run_settings)
+       └─ WebSocket 消息 { type, uuid, run_settings }
+            └─ websocket_server.__execute_block()
+                 └─ add_execution_code() 生成内核代码
+                      ├─ run_settings or {}  → JSON 序列化
+                      └─ IPython 内核执行 execute_custom_code()
+                           └─ block.execute_with_callback(run_settings=...)
+                                └─ block._execute_block(run_settings=...)
+                                     └─ __task(from_notebook=True, run_settings=...)
+```
+
+#### 2.2.5 deps 触发条件
+
+**关键文件**: [block_sql.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L411)
+
+`dbt deps` 的触发是 **无条件的**——每次执行 dbt block 都会先执行 `dbt deps` 安装依赖包。
+
+```python
+cli.invoke(['deps'] + args)   # 始终执行，无前置判断
+```
+
+**两种 Block 类型的一致性**：
+- ✅ `DBTBlockSQL`：每次执行前都跑 `dbt deps`
+- ✅ `DBTBlockYAML`：每次执行前都跑 `dbt deps`
+
+**潜在影响**：
+- 每次执行都触发包下载，可能拖慢执行速度
+- 网络不稳定时 `deps` 失败会导致整个 block 失败
+- 无缓存机制，重复下载相同的包
+
+#### 2.2.6 show 触发条件与数据获取
+
+**关键文件**: [block_sql.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L382-L430)
+
+`dbt show` 用于获取模型输出的 DataFrame，供预览或下游 block 消费。由两个独立的布尔变量控制：
+
+| 变量 | 条件 | limit | 用途 |
+|------|------|-------|------|
+| `needs_preview_df` | `from_notebook=True` 且 `task != 'test'` | `configuration.get('limit', 1000)` | Notebook 内数据预览 |
+| `needs_downstream_df` | `from_notebook=False` 且存在下游非 dbt block (Python/R/SQL) | -1（不限行数） | 下游 block 数据输入 |
+
+**show 与主任务的执行顺序**：
+
+```
+情况 1：task == 'show'（Preview 按钮）
+  └─ 跳过主任务（if task != 'show' 不满足）
+  └─ 执行 dbt show → 获取 df
+
+情况 2：task == 'run' / 'build' / 'snapshot'（Run/Build 按钮 + 非 test）
+  ├─ 执行主任务（dbt run / build / snapshot）
+  └─ needs_preview_df 或 needs_downstream_df 为 True → 再执行 dbt show → 获取 df
+
+情况 3：task == 'test'（Test 按钮）
+  ├─ 执行主任务（dbt test）
+  └─ needs_preview_df = False（因为 task == 'test'）且 needs_downstream_df 通常为 False
+  └─ 不执行 show → df = None
+```
+
+**重要注意**：
+- `task == 'show'` 时只执行 `dbt show`，不物化模型（不修改数据库中的表）
+- `task == 'run'/'build'` 时，若需要预览/下游数据，会**额外再执行一次** `dbt show`
+- `task == 'test'` 时不执行 show，因为测试没有数据输出
+
+**YAML Block 的差异**：
+- ❌ `DBTBlockYAML`：**不执行** `dbt show`，不生成 DataFrame 输出
+- 仅执行用户指定的 dbt 命令（默认 `run`），成功即返回
+
+#### 2.2.7 YAML Block 执行流程（补充）
 
 **关键文件**: [block_yaml.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_yaml.py#L92-L195)
 
@@ -167,13 +278,21 @@ res = dbt.invoke(cli_args)
 ```
 1. 从配置获取 command (默认 'run')
 2. Jinja2 插值 block 内容
-3. shlex.split(content) 解析参数
-4. 合并 --project-dir, flags, --vars, --target, --profiles-dir
-5. dbt deps
-6. dbt {task}
+3. shlex.split(content) 解析参数（支持引号处理）
+4. 合并系统参数：--project-dir, flags, --vars, --target, --profiles-dir
+5. dbt deps                          ← 始终执行
+6. dbt {task} {user_args + sys_args}  ← 执行用户命令
 ```
 
-**区别**：YAML Block 不自动执行 `dbt show`，不处理上游 DataFrame 物化，主要面向高级用户自由编排。
+**与 SQL Block 的核心差异**：
+| 特性 | DBTBlockSQL | DBTBlockYAML |
+|------|-------------|--------------|
+| 上游 DataFrame 物化 | ✅ 自动处理 | ❌ 不处理 |
+| dbt show 获取数据 | ✅ 自动执行 | ❌ 不执行 |
+| 输出 DataFrame | ✅ df / output_0 | ❌ 无数据输出 |
+| 依赖图解析 | ✅ 自动构建 | ❌ 不构建 |
+| 命令灵活性 | 固定（run/test/build/show/snapshot） | 自由（任意 dbt 命令） |
+| 适用场景 | 单模型精确控制 | 高级用户自由编排 |
 
 ---
 
@@ -279,41 +398,108 @@ self.__info(message, tags)
 
 **关键文件**: [block_sql.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L414-L431)
 
+SQL Block 中有 **两处** 执行状态判断：
+
+1. **主任务执行后**（第 414-418 行）：
 ```python
-res = cli.invoke([task] + args)
-success = res.success
-if not success:
-    raise Exception(str(res.exception))
+if task != 'show':
+    res = cli.invoke([task] + args)
+    success = res.success
+    if not success:
+        raise Exception(str(res.exception))
 ```
 
-- `dbtRunnerResult.success` 为 `True` 表示执行成功
-- 失败时抛出 `Exception(str(res.exception))`，异常信息直接来自 dbt 的异常对象
-- 异常向上传播至 `BlockExecutor`，由其记录失败状态
-
-#### 2.5.2 数据输出
-
-**关键文件**: [block_sql.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L422-L440)
-
+2. **show 任务执行后**（第 426-430 行）：
 ```python
 if needs_downstream_df or needs_preview_df:
-    args += (["--limit", str(limit)])
     res = cli.invoke(['show'] + args)
     if res.success:
         df = cli.to_pandas(res)
+    else:
+        raise Exception(str(res.exception))
+```
 
+**错误处理行为**：
+- `dbtRunnerResult.success` 为 `True` 表示执行成功
+- 失败时抛出 `Exception(str(res.exception))`，异常信息直接来自 dbt 的异常对象
+- **任何一步失败都会立即中断**，异常向上传播至 `BlockExecutor`
+- `dbt deps` 执行后**不检查 success**——即使 deps 失败，也会继续执行主任务（潜在 bug）
+
+**YAML Block 的一致性**：
+- ✅ 同样使用 `raise Exception(str(res.exception))` 模式
+- ✅ 失败时立即中断
+- ❌ `dbt deps` 同样不检查 success
+
+#### 2.5.2 数据输出与存储
+
+**关键文件**: [block_sql.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L433-L440)
+
+```python
 self.store_variables(
     {'df' if from_notebook else 'output_0': df},
     execution_partition=execution_partition,
     override_outputs=True,
 )
+return [df]
 ```
 
-**数据流向**：
-- Notebook 执行时存储为 `df` 变量（直接预览）
-- 后台执行时存储为 `output_0`（供下游 block 消费）
-- `dbt show` 命令的 agate_table → `pd.DataFrame` 转换
+**存储变量的键名差异**：
+| 执行模式 | 存储键 | 用途 | 消费者 |
+|---------|--------|------|--------|
+| Notebook (from_notebook=True) | `df` | 前端数据预览 | UI 展示层 |
+| 后台调度 (from_notebook=False) | `output_0` | 下游 block 输入 | 后续 block |
 
-#### 2.5.3 上游 DataFrame 物化
+**各执行路径的输出情况**：
+
+| 执行路径 | 主任务 | show 执行 | df 结果 | 存储键 |
+|---------|--------|-----------|---------|--------|
+| Preview (show) | 无 | ✅ 是 | 预览数据（limit 行） | df |
+| Run | ✅ run | ✅ 是（notebook 模式） | 完整结果预览（limit 行） | df |
+| Test | ✅ test | ❌ 否 | None | df |
+| Build | ✅ build | ✅ 是（notebook 模式） | 完整结果预览（limit 行） | df |
+| 后台调度 | ✅ build/run | ✅ 是（有下游非 dbt block 时） | 完整数据（无行数限制） | output_0 |
+| 后台调度 | ✅ build/run | ❌ 否（无下游非 dbt block 时） | None | output_0 |
+
+**关键洞察**：
+- `task == 'show'` 时，**不执行主任务**，只执行 show 进行数据预览（不物化模型）
+- 后台调度时，`needs_downstream_df` 由**下游 block 的类型**决定——只有当下游存在非 dbt block 时，才会执行 show 获取 DataFrame
+- 若 dbt pipeline 中所有下游都是 dbt block，则**不执行 show、不生成 DataFrame**，节省资源
+- `limit = -1` 表示不限制行数（给下游的完整数据），预览模式默认 1000 行
+
+#### 2.5.3 结果写回下游的完整链路
+
+**dbt → 非 dbt 下游的数据流向**：
+
+```
+上游 dbt block (后台调度)
+  └─ needs_downstream_df = True (检测到下游非 dbt block)
+       └─ 执行 dbt show --limit -1
+            └─ cli.to_pandas(res) → DataFrame
+                 └─ store_variables({'output_0': df})
+                      └─ VariableManager 存储到磁盘/内存
+                           └─ 下游非 dbt block 读取 output_0
+                                └─ 作为 DataFrame 输入继续执行
+```
+
+**上游非 dbt → dbt 的数据流向**（通过 source 桥接）：
+
+```
+上游非 dbt block
+  └─ 输出 DataFrame
+       └─ Sources.add_blocks() → 写入 mage_sources.yml
+            └─ __create_upstream_tables()
+                 └─ DBTBlock.materialize_df()
+                      ├─ 写 CSV 到 seed-paths
+                      ├─ dbt seed --full-refresh → 物化表
+                      └─ 删除 CSV
+                           └─ dbt 模型通过 {{ source() }} 引用该表
+```
+
+**双向数据流总结**：
+- **入站**（非 dbt → dbt）：DataFrame → CSV → dbt seed → 数据库表 → dbt source 引用
+- **出站**（dbt → 非 dbt）：dbt 模型 → dbt show → agate_table → DataFrame → output_0 变量
+
+#### 2.5.4 上游 DataFrame 物化
 
 **关键文件**: [block.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block.py#L149-L203)
 
@@ -460,6 +646,90 @@ while True:
 
 ---
 
+### 2.8 命令编排与结果反馈一致性核对
+
+#### 2.8.1 SQL Block 命令编排全景
+
+**完整命令序列**（按执行顺序）：
+
+```
+步骤 0：__create_upstream_tables()
+  └─ 对每个上游非 dbt block
+       └─ DBTBlock.materialize_df()
+            └─ dbt seed --select mage_xxx --full-refresh  ← 每上游 block 一次
+
+步骤 1：dbt deps  ← 始终执行，不检查结果
+
+步骤 2：主任务（条件执行）
+  ├─ task == 'show' → 跳过
+  ├─ task == 'run' → dbt run --select ...
+  ├─ task == 'test' → dbt test --select ...
+  ├─ task == 'build' → dbt build --select ...
+  └─ task == 'snapshot' → dbt snapshot --select ...
+
+步骤 3：dbt show（条件执行）
+  └─ needs_preview_df 或 needs_downstream_df 为 True → 执行
+```
+
+**命令数统计**：
+- 最少：2 条命令（deps + 主任务，无 show）
+- 最多：N + 3 条命令（N 个上游 seed + deps + 主任务 + show）
+
+#### 2.8.2 结果反馈一致性分析
+
+| 检查点 | DBTBlockSQL | DBTBlockYAML | 一致? |
+|--------|-------------|--------------|-------|
+| dbt deps 执行 | ✅ 始终执行 | ✅ 始终执行 | ✅ 一致 |
+| dbt deps 结果检查 | ❌ 不检查 success | ❌ 不检查 success | ✅ 一致（都不检查）|
+| 主任务成功判断 | `res.success` | `res.success` | ✅ 一致 |
+| 主任务失败处理 | `raise Exception(str(res.exception))` | `raise Exception(str(res.exception))` | ✅ 一致 |
+| show 任务 | ✅ 条件执行 | ❌ 不执行 | ❌ 不一致 |
+| DataFrame 输出 | ✅ df / output_0 | ❌ 无输出 | ❌ 不一致 |
+| store_variables | ✅ 存储输出 | ❌ 不存储 | ❌ 不一致 |
+| 返回值格式 | `[df]` (List) | None | ❌ 不一致 |
+
+**一致性结论**：
+- **错误处理模式一致**：两者都使用 `res.success` 判断 + `Exception(str(res.exception))` 抛出
+- **deps 行为一致**：都不检查 deps 成功与否（可能是故意设计，也可能是 bug）
+- **数据输出不一致**：SQL Block 有完整的 show + DataFrame 输出链路，YAML Block 没有
+
+#### 2.8.3 潜在不一致风险
+
+1. **deps 失败静默继续**
+   - 位置：[block_sql.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L411)
+   - 风险：`dbt deps` 失败时，依赖包未安装，但主任务继续执行，可能导致更隐蔽的错误
+   - 建议：增加 deps 成功检查，或至少输出警告日志
+
+2. **YAML Block 无输出变量**
+   - 位置：[block_yaml.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_yaml.py#L92-L195)
+   - 风险：YAML Block 执行后不存储任何输出变量，下游 block 无法消费其结果
+   - 影响：dbt YAML Block 只能作为终端节点，不能作为数据流的中间节点
+
+3. **show 命令与主任务共享 args**
+   - 位置：[block_sql.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L424-L425)
+   - 风险：show 命令复用了主任务的 args（包括 `--select`、`--vars` 等），并追加了 `--limit`
+   - 注意：某些 dbt 命令的参数对 show 可能无效或有不同含义
+
+4. **`--limit -1` 的语义**
+   - 位置：[block_sql.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L402)
+   - 待确认：dbt show 的 `--limit -1` 是否真的表示"不限行数"，还是会报错或有其他行为
+
+#### 2.8.4 四条 Notebook 执行路径对比表
+
+| 维度 | Preview (show) | Run | Test | Build |
+|------|----------------|-----|------|-------|
+| 触发按钮 | Preview (▶️) | Run | Test | Build |
+| run_settings | `{}` | `{run_model:true}` | `{test_model:true}` | `{build_model:true}` |
+| dbt 主任务 | 无（跳过） | run / snapshot | test | build |
+| dbt show | ✅ 执行 | ✅ 执行 | ❌ 不执行 | ✅ 执行 |
+| 模型物化 | ❌ 不物化 | ✅ 物化 | -（测试） | ✅ 物化 |
+| df 输出 | ✅ 有 | ✅ 有 | ❌ 无 | ✅ 有 |
+| 存储键 | `df` | `df` | `df` (None) | `df` |
+| 数据库写入 | 只读 | 读写 | 只读（测试结果） | 读写 |
+| 典型耗时 | 短（只查询） | 中 | 短 | 长 |
+
+---
+
 ## 三、完整执行流程拆解
 
 ### 3.1 SQL Block 典型执行流（后台调度）
@@ -496,18 +766,121 @@ Pipeline Scheduler
        └─ block.run_tests() → no-op                      # dbt 内部已处理测试
 ```
 
-### 3.2 SQL Block Notebook 交互执行流
+### 3.2 SQL Block Notebook 交互执行流（四条路径）
+
+#### 3.2.1 Preview 路径（dbt show，仅查询）
+
+**触发**：点击 Preview 按钮 或 Cmd/Ctrl + Enter
+**run_settings**：`{}`（空字典）
+**主任务**：show（不物化）
 
 ```
-用户点击 "运行" 按钮
-  └─ _execute_block(from_notebook=True, run_settings=None)
-       ├─ __task() → 'show'                              # 默认 notebook 模式执行 show
-       └─ 或 run_settings 有值时 → run/test/build
-
-用户点击 "编译 & 预览" 按钮
-  └─ _execute_block(from_notebook=True, run_settings={})
-       └─ __task() → 'show'
+用户点击 Preview
+  └─ WebSocket 消息（无 run_settings 字段）
+       └─ output_display.py: run_settings or {} → {}
+            └─ _execute_block(from_notebook=True, run_settings={})
+                 ├─ __create_upstream_tables()  ← 物化上游（如有）
+                 ├─ __task() → 'show'            ← run_settings={} → else 分支
+                 ├─ 构建 CLI 参数
+                 ├─ Profiles().__enter__()
+                 ├─ dbt deps                       ← 始终执行
+                 ├─ 主任务：跳过（task == 'show'）
+                 ├─ needs_preview_df = True          ← from_notebook + task != 'test'
+                 ├─ dbt show --limit 1000           ← 执行 show 获取预览
+                 ├─ cli.to_pandas(res) → df
+                 ├─ Profiles.__exit__()
+                 ├─ store_variables({'df': df})   ← 存储为 df
+                 └─ return [df]
 ```
+
+**特点**：只查询不物化，速度快，用于验证 SQL 逻辑
+
+---
+
+#### 3.2.2 Run 路径（dbt run，物化模型）
+
+**触发**：点击 Run 按钮
+**run_settings**：`{run_model: true}`
+**主任务**：run / snapshot
+
+```
+用户点击 Run
+  └─ WebSocket 消息 { run_settings: { run_model: true } }
+       └─ _execute_block(from_notebook=True, run_settings={run_model:true})
+            ├─ __create_upstream_tables()
+            ├─ __task() → 'run' (或 'snapshot')    ← run_model=true
+            ├─ 构建 CLI 参数
+            ├─ Profiles().__enter__()
+            ├─ dbt deps
+            ├─ dbt run --select ...                   ← 执行主任务（物化表）
+            ├─ success? → 失败则抛出异常
+            ├─ needs_preview_df = True
+            ├─ dbt show --limit 1000                 ← 再执行 show 预览结果
+            ├─ cli.to_pandas(res) → df
+            ├─ Profiles.__exit__()
+            ├─ store_variables({'df': df})
+            └─ return [df]
+```
+
+**特点**：先物化模型 + 预览结果，执行两次 dbt 命令（run + show）
+
+---
+
+#### 3.2.3 Test 路径（dbt test，执行测试）
+
+**触发**：点击 Test 按钮
+**run_settings**：`{test_model: true}`
+**主任务**：test
+
+```
+用户点击 Test
+  └─ WebSocket 消息 { run_settings: { test_model: true } }
+       └─ _execute_block(from_notebook=True, run_settings={test_model:true})
+            ├─ __create_upstream_tables()
+            ├─ __task() → 'test'                    ← test_model=true
+            ├─ 构建 CLI 参数
+            ├─ Profiles().__enter__()
+            ├─ dbt deps
+            ├─ dbt test --select ...                  ← 执行测试
+            ├─ success? → 失败则抛出异常
+            ├─ needs_preview_df = False                  ← task == 'test'
+            ├─ 不执行 dbt show
+            ├─ df = None
+            ├─ Profiles.__exit__()
+            ├─ store_variables({'df': None})          ← 存储 None
+            └─ return [None]
+```
+
+**特点**：只执行测试，无数据输出，df 为 None
+
+---
+
+#### 3.2.4 Build 路径（dbt build，run + test）
+
+**触发**：点击 Build 按钮
+**run_settings**：`{build_model: true}`
+**主任务**：build
+
+```
+用户点击 Build
+  └─ WebSocket 消息 { run_settings: { build_model: true } }
+       └─ _execute_block(from_notebook=True, run_settings={build_model:true})
+            ├─ __create_upstream_tables()
+            ├─ __task() → 'build'                    ← build_model=true
+            ├─ 构建 CLI 参数
+            ├─ Profiles().__enter__()
+            ├─ dbt deps
+            ├─ dbt build --select ...                 ← 执行 build (run + test)
+            ├─ success? → 失败则抛出异常
+            ├─ needs_preview_df = True
+            ├─ dbt show --limit 1000                   ← 再执行 show 预览
+            ├─ cli.to_pandas(res) → df
+            ├─ Profiles.__exit__()
+            ├─ store_variables({'df': df})
+            └─ return [df]
+```
+
+**特点**：最完整的执行路径，build + show，三次 dbt 命令（deps + build + show）
 
 ### 3.3 YAML Block 执行流
 
@@ -550,9 +923,11 @@ BlockExecutor.execute_block()
 | 风险项 | 详情 |
 |--------|------|
 | **异常信息丢失** | `raise Exception(str(res.exception))` 将 dbt 异常转为字符串，丢失原始堆栈跟踪 |
+| **deps 失败静默继续** | `cli.invoke(['deps'] + args)` 执行后**不检查 success**，依赖安装失败时主任务仍继续执行，可能导致更隐蔽的错误 |
 | **静默失败** | `DBTAdapter.open()` 中异常被 `print()` 吞掉（非 debug 模式），返回 `None` 而非抛出异常 |
 | **dbt list 失败降级** | `upstream_dbt_blocks()` 中 `dbt list` 失败时降级为只返回自身 block，可能导致依赖图不完整 |
 | **Profiles 异步兼容** | `Profiles.profiles` 属性通过 `ThreadPoolExecutor` 处理异步上下文，但异常传播可能不完整 |
+| **show 失败即整体失败** | 主任务成功但 show 失败时，整个 block 判定为失败——预览失败不应该影响核心任务的成功状态 |
 
 ### 4.4 安全风险（中危）
 
@@ -591,43 +966,57 @@ BlockExecutor.execute_block()
 7. **`materialize_df()` 的 `--full-refresh` 策略**，在大数据量场景下是否会成为性能瓶颈？是否有增量物化方案？
 8. **`dbt show --limit` 的实际 SQL 生成**，不同适配器（如 BigQuery、Snowflake）对 `LIMIT` 子句的支持是否存在差异？
 9. **`to_pandas()` 方法** 对 `agate_table` 的转换，在 NULL 值、日期类型、嵌套结构等边界场景下是否正确？
+10. **`--limit -1` 的语义**，dbt show 是否支持 -1 表示"不限行数"？还是会报错或有其他行为？
 
 ### 5.4 错误恢复
 
-10. **dbt 执行超时机制**，`DBTCli.invoke()` 无超时参数，长时间运行的 dbt 模型是否会阻塞 Mage 进程？
-11. **`dbt build` 部分失败时的行为**，当 build 中某个模型失败时，`dbtRunnerResult.success` 为 False，但已成功的模型如何回滚？
-12. **`Profiles.clean()` 失败的影响**，临时目录清理失败是否会影响后续执行？
+11. **dbt 执行超时机制**，`DBTCli.invoke()` 无超时参数，长时间运行的 dbt 模型是否会阻塞 Mage 进程？
+12. **`dbt build` 部分失败时的行为**，当 build 中某个模型失败时，`dbtRunnerResult.success` 为 False，但已成功的模型如何回滚？
+13. **`Profiles.clean()` 失败的影响**，临时目录清理失败是否会影响后续执行？
+14. **deps 失败的设计意图**，`dbt deps` 不检查 success 是故意设计（容忍部分失败）还是遗漏？需要确认。
+15. **show 失败的错误等级**，主任务成功但 show 失败时，是否应该判定为整个 block 失败？还是只记录警告？
 
 ### 5.5 调度集成
 
-13. **`upstream_dbt_blocks()` 依赖图解析** 在 dbt 项目结构变更（添加/删除模型）后，Mage pipeline 是否自动更新依赖图？
-14. **`mage_sources.yml` 的合并冲突**，多个 pipeline 共享同一 dbt 项目时，sources 文件是否会出现并发写入冲突？
-15. **Pipeline 删除时的 source 清理**，删除 pipeline 后 `mage_sources.yml` 中的对应 source 是否被正确清理？
+16. **`upstream_dbt_blocks()` 依赖图解析** 在 dbt 项目结构变更（添加/删除模型）后，Mage pipeline 是否自动更新依赖图？
+17. **`mage_sources.yml` 的合并冲突**，多个 pipeline 共享同一 dbt 项目时，sources 文件是否会出现并发写入冲突？
+18. **Pipeline 删除时的 source 清理**，删除 pipeline 后 `mage_sources.yml` 中的对应 source 是否被正确清理？
+
+### 5.6 功能一致性
+
+19. **YAML Block 是否应该支持 show 输出**，YAML Block 无 DataFrame 输出的设计是故意限制还是功能缺失？
+20. **YAML Block 的返回值规范**，`_execute_block` 标注返回 `None`，但基类要求返回 `List`，是否违反接口契约？
+21. **dbt deps 的缓存机制**，每次执行都跑 deps 是否必要？是否可以基于 `packages.yml` 变更做增量检测？
+22. **disable_tests 配置的作用范围**，`disable_tests` 是仅影响后台调度，还是也影响 notebook 中的 Build 按钮？
 
 ---
 
 ## 六、核心文件索引
 
-| 文件路径 | 职责 |
-|----------|------|
-| [dbt_cli.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/dbt_cli.py) | dbt 命令封装，dbtRunner 调用，日志回调 |
-| [dbt_adapter.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/dbt_adapter.py) | dbt 适配器连接管理，SQL 执行，Macro 执行 |
-| [block.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block.py) | DBTBlock 基类，DataFrame 物化，Sources 更新 |
-| [block_sql.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py) | SQL Block 执行逻辑，依赖图解析，任务选择 |
-| [block_yaml.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_yaml.py) | YAML Block 执行逻辑，自由命令解析 |
-| [profiles.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/profiles.py) | profiles.yml 插值与临时文件管理 |
-| [project.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/project.py) | dbt_project.yml 读取 |
-| [sources.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/sources.py) | mage_sources.yml 自动管理 |
-| [constants.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/constants.py) | dbt block 常量定义 |
-| [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/utils.py) | source 命名工具函数 |
-| [cache.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/cache/dbt/cache.py) | dbt 项目缓存管理 |
-| [cache/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/cache/dbt/utils.py) | 缓存构建与文件扫描 |
-| [dbt.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/services/dbt/dbt.py) | dbt Cloud API 客户端 |
-| [config.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/services/dbt/config.py) | dbt Cloud 配置 |
-| [services/constants.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/services/dbt/constants.py) | dbt Cloud 常量与状态枚举 |
-| [block_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/block_factory.py) | Block 类型工厂，DBT → DBTBlockSQL/DBTBlockYAML |
-| [block_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/executors/block_executor.py) | Block 执行器，dbt 特殊处理逻辑 |
-| [configuration_option.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/settings/models/configuration_option.py) | 全局配置选项，dbt 项目/profile/target 发现 |
+| 模块 | 文件路径 | 职责 |
+|------|----------|------|
+| **核心执行** | [dbt_cli.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/dbt_cli.py) | dbt 命令封装，dbtRunner 调用，日志回调 |
+| | [dbt_adapter.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/dbt_adapter.py) | dbt 适配器连接管理，SQL 执行，Macro 执行 |
+| | [block.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block.py) | DBTBlock 基类，DataFrame 物化，Sources 更新 |
+| | [block_sql.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py) | SQL Block 执行逻辑，任务选择，依赖图解析 |
+| | [block_yaml.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_yaml.py) | YAML Block 执行逻辑，自由命令解析 |
+| **配置管理** | [profiles.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/profiles.py) | profiles.yml 插值与临时文件管理 |
+| | [project.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/project.py) | dbt_project.yml 读取 |
+| | [sources.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/sources.py) | mage_sources.yml 自动管理 |
+| | [constants.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/constants.py) | dbt block 常量定义 |
+| | [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/utils.py) | source 命名工具函数 |
+| **缓存** | [cache.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/cache/dbt/cache.py) | dbt 项目缓存管理 |
+| | [cache/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/cache/dbt/utils.py) | 缓存构建与文件扫描 |
+| **dbt Cloud** | [dbt.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/services/dbt/dbt.py) | dbt Cloud API 客户端 |
+| | [config.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/services/dbt/config.py) | dbt Cloud 配置 |
+| | [services/constants.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/services/dbt/constants.py) | dbt Cloud 常量与状态枚举 |
+| **调度集成** | [block_factory.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/block_factory.py) | Block 类型工厂，DBT → DBTBlockSQL/DBTBlockYAML |
+| | [block_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/executors/block_executor.py) | Block 执行器，dbt 特殊处理逻辑 |
+| | [configuration_option.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/settings/models/configuration_option.py) | 全局配置选项，dbt 项目/profile/target 发现 |
+| **前端 & 通信** | [useCodeBlockProps.tsx](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/frontend/components/CodeBlockV2/dbt/useCodeBlockProps.tsx) | 前端 dbt block 按钮定义，run_settings 构造 |
+| | [websocket_server.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/server/websocket_server.py) | WebSocket 服务器，接收执行请求 |
+| | [output_display.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/server/utils/output_display.py) | 生成内核执行代码，run_settings or {} 转换 |
+| | [execute_custom_code.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/server/utils/execute_custom_code.py) | 内核侧执行入口，调用 block.execute_with_callback |
 
 ---
 
@@ -637,8 +1026,22 @@ Mage AI 与 dbt 的集成实现了一条 **"配置插值 → 进程内命令执�
 
 1. **双 Block 类型**：`DBTBlockSQL`（单模型精确控制）和 `DBTBlockYAML`（自由命令编排），覆盖不同使用场景
 2. **Profiles 插值隔离**：通过临时目录 + Jinja2 渲染实现变量注入与环境隔离，但清理机制存在可靠性风险
-3. **DataFrame → dbt Source 桥接**：`materialize_df()` + `mage_sources.yml` 自动管理，实现了 Mage 上游 block 到 dbt 模型的数据传递
+3. **DataFrame ↔ dbt 双向桥接**：入站通过 `materialize_df()` + seed 物化，出站通过 `dbt show` + DataFrame 输出
 4. **依赖图双向映射**：`upstream_dbt_blocks()` 将 dbt DAG 映射为 Mage pipeline DAG，但仅在 block 创建时执行
 5. **无进程级隔离**：所有 dbt 执行在 Mage 主进程内完成，简化部署但牺牲了隔离性和稳定性
 
-最主要的改进方向在于：**环境隔离**（进程/容器级隔离）、**并发安全**（全局状态保护）、**错误恢复**（超时与部分失败处理）和**安全加固**（凭据保护）。
+### 执行路径核心发现
+
+- **四条 Notebook 路径**：Preview(show) / Run / Test / Build，由 `run_settings` 控制，经 `run_settings or {}` 转换后进入 `__task()` 方法
+- **deps 无条件执行**：每次 block 执行必先跑 `dbt deps`，但不检查成功与否（潜在设计问题）
+- **show 双触发条件**：`needs_preview_df`（Notebook 预览）和 `needs_downstream_df`（下游非 dbt block），任一满足即执行 show
+- **输出键名分化**：Notebook 模式存 `df`，后台调度存 `output_0`，适配不同消费场景
+
+### 一致性结论
+
+- ✅ **错误处理一致**：SQL Block 和 YAML Block 都使用 `res.success` 判断 + `Exception(str(res.exception))` 抛出
+- ✅ **deps 行为一致**：两者都不检查 deps 成功与否
+- ❌ **数据输出不一致**：SQL Block 有完整的 show + DataFrame 输出链路，YAML Block 没有，导致 YAML Block 只能作为终端节点
+- ❌ **返回值规范不一致**：YAML Block 的 `_execute_block` 标注返回 `None`，与基类 `List` 返回类型不符
+
+最主要的改进方向在于：**环境隔离**（进程/容器级隔离）、**并发安全**（全局状态保护）、**错误恢复**（超时与部分失败处理）、**一致性补齐**（YAML Block 输出能力）和**安全加固**（凭据保护）。
