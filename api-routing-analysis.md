@@ -398,42 +398,87 @@ __create_or_index() 执行顺序（逐行核准）：
 
 ---
 
-### 5.4 授权的完整生命周期（三重漏斗 + 前后双段）
+### 5.4 授权的完整生命周期（双路径 + 三重漏斗 + 前后双段）
+
+> **重要**：授权层级（动作级 → 查询/字段级 → 字段级读过滤）是一致的，但
+> **Resource 加载/调用与 authorize_action() 的先后顺序在两条路径上相反**。
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     业务操作前（第 5 步内部）                          │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│   authorize_action()  ── 漏斗 1：动作级                               │
-│   │   能否执行 CREATE/LIST/DETAIL/UPDATE/DELETE？                    │
-│   │                                                                 │
-│   ├─ 写操作（CREATE/UPDATE）：                                       │
-│   │      authorize_attributes(WRITE)  ── 漏斗 2：字段级写授权         │
-│   │                                                                 │
-│   └─ 读操作（LIST/DETAIL）+ UPDATE：                                 │
-│          authorize_query()  ── 漏斗 2：查询参数级授权                 │
-│                                                                     │
-│                      ↓  通过全部校验才执行业务                          │
-│                                                                     │
-│   Resource.process_member / create / collection / delete / update   │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                     业务操作后（第 9、10 步）                          │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│   Presenter.present_resource() → 把 Resource 对象转成 dict           │
-│                                                                     │
-│   遍历每条结果：                                                     │
-│   │                                                                 │
-│   └─ authorize_attributes(READ)  ── 漏斗 3：字段级读授权             │
-│      └─ 对 presented dict 的每个 key 检查 READ 权限                 │
-│                                                                     │
-│   Parser（存在时）：                                                 │
-│      └─ parse_read_attributes_and_authorize()  → 再过滤 + 再授权    │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           业务操作前（第 5 步 __executed_result() 内部）              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│   ┌──────────────────────── 路径 A：DELETE / DETAIL / UPDATE ──────────────────────┐│
+│   │                                                                                ││
+│   │  ① Resource.process_member(pk)  ← 先加载对象                                    ││
+│   │     （已拿到 res，Policy 条件可依赖对象属性）                                     ││
+│   │                                                                                ││
+│   │  ② __run_hooks_before()  ← BEFORE Hooks                                        ││
+│   │                                                                                ││
+│   │  ③ policy.authorize_action(ACTION)  ← 漏斗 1：动作级授权（后做）                 ││
+│   │     └─ Policy 实例化时传入 resource=res                                          ││
+│   │                                                                                ││
+│   │  ④ Parser 解析 + 授权（漏斗 2）：                                               ││
+│   │     ├─ DELETE: 无 Parser                                                        ││
+│   │     ├─ DETAIL: parse_query_and_authorize()                                      ││
+│   │     │          → authorize_query()  ← 查询级                                     ││
+│   │     └─ UPDATE: ① parse_write_attributes_and_authorize()                         ││
+│   │                  → authorize_attributes(WRITE)  ← 字段级写                       ││
+│   │               ② parse_query_and_authorize()                                     ││
+│   │                  → authorize_query()  ← 查询级                                   ││
+│   │                                                                                ││
+│   │  ⑤ 执行业务：                                                                   ││
+│   │     ├─ DELETE: res.process_delete()                                             ││
+│   │     ├─ UPDATE: res.process_update(payload)                                      ││
+│   │     └─ DETAIL: （已在第 ① 步加载完成）                                           ││
+│   │                                                                                ││
+│   └─────────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                     │
+│   ┌──────────────────────── 路径 B：CREATE / LIST ────────────────────────────────┐ │
+│   │                                                                                │ │
+│   │  ① __run_hooks_before()  ← BEFORE Hooks（先跑）                                 │ │
+│   │                                                                                │ │
+│   │  ② policy.authorize_action(ACTION)  ← 漏斗 1：动作级授权（先做）                 │ │
+│   │     └─ Policy 实例化时传入 resource=None                                         │ │
+│   │                                                                                │ │
+│   │  ③ Parser 解析 + 授权（漏斗 2）：                                               │ │
+│   │     ├─ CREATE: parse_write_attributes_and_authorize()                           │ │
+│   │     │          → authorize_attributes(WRITE)  ← 字段级写                         │ │
+│   │     └─ LIST:   parse_query_and_authorize()                                      │ │
+│   │                → authorize_query()  ← 查询级                                     │ │
+│   │                                                                                │ │
+│   │  ④ Resource 业务调用  ← 最后才调用                                               │ │
+│   │     ├─ CREATE: XxxResource.process_create(payload)                               │ │
+│   │     └─ LIST:   XxxResource.process_collection(query, meta)                       │ │
+│   │                                                                                │ │
+│   └─────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                     │
+│   共同点：漏斗 1（动作级）→ 漏斗 2（查询/字段级写）→ Resource 业务操作                │
+│   差异点：漏斗 1 之前，路径 A 先加载 Resource，路径 B 先跑 Hooks                     │
+│                                                                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                         业务操作后（execute() 第 9、10 步，所有 action 一致）          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ① Presenter.present_resource()  → Resource 对象转成 dict（可能含嵌套资源）          │
+│                                                                                     │
+│  ② __run_hooks_after(SUCCESS)  ← AFTER Hooks                                       │
+│     可修改 presented 结果 / metadata / 注入 error                                   │
+│                                                                                     │
+│  ③ 遍历每条结果，漏斗 3：字段级读授权                                                │
+│     ├─ policy.authorize_attributes(READ, presented.keys())                          │
+│     │    ← 对 presented dict 的每个 key 检查 READ 权限                               │
+│     │                                                                               │
+│     └─ Parser（存在时）：                                                            │
+│        parse_read_attributes_and_authorize()  → 输出字段再过滤 + 再授权             │
+│                                                                                     │
+│  ④ 组装最终响应：{ "resource": {...}, "metadata": {...}, "debug": {...} }           │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+> 总结一句：**成员资源（DELETE/DETAIL/UPDATE）先加载对象再授权，集合创建（CREATE/LIST）先授权后调用 Resource。**
+> 授权的"三层漏斗"概念是一致的——动作级最粗、查询/字段级居中、读过滤最细——但 Resource 调用与第一层授权的先后顺序因路径而异。
 
 ---
 
@@ -462,21 +507,28 @@ __create_or_index() 执行顺序（逐行核准）：
 
 ### 6.1 权限三重漏斗模型
 
-Policy 授权采用从粗到细的三层校验：
+Policy 授权按**粒度从粗到细**分为三层校验（注意：这是层级概念，不是严格的调用顺序）：
 
 ```
-1. authorize_action() ── 动作级
+1. authorize_action() ── 漏斗 1：动作级（最粗）
    能否对该资源执行 CREATE/LIST/DETAIL/UPDATE/DELETE？
    规则来源: Policy.allow_actions()
 
-   ├─ 2. authorize_query() ── 查询参数级
+   ├─ 2. authorize_query() ── 漏斗 2a：查询参数级
    │      能否按该条件过滤？(如 ?status=active&type=python)
    │      规则来源: Policy.allow_query()
 
-   └─ 3. authorize_attributes() ── 字段级
+   └─ 3. authorize_attributes() ── 漏斗 2b/3：字段级（最细）
           能否读/写该字段？(如读取 password_hash、修改 user.role)
           规则来源: Policy.allow_read() / allow_write()
 ```
+
+**调用顺序与 Resource 加载的关系**（重要，不要与"粒度从粗到细"混淆）：
+
+- **成员资源路径（DELETE/DETAIL/UPDATE）**：先 `process_member()` 加载 Resource → 再 `authorize_action()` 做第一层授权
+- **集合创建路径（CREATE/LIST）**：先 `authorize_action()` 做第一层授权 → 再 `process_create/collection()` 调用 Resource
+
+两条路径都经过相同的三层漏斗粒度，但 **Resource 调用与漏斗 1 的先后顺序相反**。详见 5.4 节的双路径生命周期图。
 
 每条规则的三要素：
 - **Scope**：`CLIENT_PUBLIC` / `CLIENT_PRIVATE` / `CLIENT_ALL`
