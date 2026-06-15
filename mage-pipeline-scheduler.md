@@ -394,48 +394,44 @@ def update_status(metrics=metrics):
 - DI 场景：递归调用 `__update_condition_failed()` 将当前块及所有下游块都标记为 CONDITION_FAILED
 - CONDITION_FAILED 状态的 BlockRun 不再被 `executable_block_runs()` 返回，但也**不算作 FAILED**，因此 `any_blocks_failed()` 返回 False，Pipeline 仍可正常完成
 
-### 4.5 失败传播链
+### 4.5 失败传播与 allow_blocks_to_fail 的三层影响
 
-失败从 BlockRun 向 PipelineRun 的传播分为三层：
+`allow_blocks_to_fail` 配置从三个层面影响调度行为：入口终止、失败传播、可执行判断。三者相互关联但作用点不同，必须分开理解。
 
-#### 4.5.1 Block 级失败写回
+#### 4.5.1 第一层：入口终止（PipelineScheduler.schedule）
 
-`on_block_failure()`（`mage_ai/orchestration/pipeline_scheduler_original.py` L443–L488）：
+`PipelineScheduler.schedule()`（L213–L338）的入口判断：
 
-```python
-@retry(retries=2, delay=5)
-def update_status():
-    block_run.update(
-        metrics=metrics,             # 含 error: {error, errors, message}
-        status=BlockRun.BlockRunStatus.FAILED,
-    )
+```
+if all_blocks_completed(self.allow_blocks_to_fail):
+    if any_blocks_failed():
+        PipelineRun → FAILED
+    else:
+        PipelineRun → COMPLETED
+elif any_blocks_failed() and not self.allow_blocks_to_fail:
+    PipelineRun → FAILED          ← 立即终止
+else:
+    继续调度
 ```
 
-额外动作（`allow_blocks_to_fail=False` 时）：
-- DI Pipeline：`job_manager.kill_pipeline_run_job()` + 杀掉所有 stream job
-- 触发 `calculate_pipeline_run_metrics()` 计算源/目标指标
+- `all_blocks_completed(include_failed_blocks)`（L1522–L1532）：当 `include_failed_blocks=False` 时，仅 COMPLETED + CONDITION_FAILED 算完成；当 `True` 时，FAILED + UPSTREAM_FAILED 也算完成
+- `any_blocks_failed()`（L1519–L1520）：检查是否有 `status == FAILED` 的 BlockRun
 
-#### 4.5.2 状态传播到 PipelineRun
-
-`PipelineScheduler.schedule()`（L213–L338）在每次调度入口检测：
-
-| 条件 | PipelineRun 结果 |
+| allow_blocks_to_fail | any_blocks_failed()=True 时的行为 |
 |---|---|
-| `all_blocks_completed(allow_blocks_to_fail)` 且 `any_blocks_failed()` | **FAILED** — 有 Block 失败 |
-| `all_blocks_completed(allow_blocks_to_fail)` 且无失败 | **COMPLETED** — 全部成功 |
-| `any_blocks_failed()` 且 `allow_blocks_to_fail=False` | **FAILED** — 立即终止 |
-| `any_blocks_failed()` 且 `allow_blocks_to_fail=True` | 继续调度（失败 Block 的下游标记 UPSTREAM_FAILED） |
+| **False** | 在入口处立即将 PipelineRun 标记 FAILED，取消所有 Block 和 Job |
+| **True** | 不在入口终止，继续调度后续 Block |
 
-#### 4.5.3 失败向下游 Block 传播
+#### 4.5.2 第二层：失败传播（update_block_run_statuses）
 
-`PipelineRun.update_block_run_statuses()`（`mage_ai/orchestration/db/models/schedules.py` L1223–L1301）在 `__schedule_blocks()` 入口调用，递归传播：
+`PipelineRun.update_block_run_statuses()`（`mage_ai/orchestration/db/models/schedules.py` L1223–L1301）在 `__schedule_blocks()` 入口调用，**不受 `allow_blocks_to_fail` 影响**，始终执行：
 
 ```
 Block A FAILED
     ↓ update_block_run_statuses()
-Block B（A 的下游）→ UPSTREAM_FAILED
+Block B（A 的下游，INITIAL 状态）→ UPSTREAM_FAILED
     ↓ 递归（因 BlockRun 集合变化，not_updated 列表缩短）
-Block C（B 的下游）→ UPSTREAM_FAILED
+Block C（B 的下游，INITIAL 状态）→ UPSTREAM_FAILED
 ```
 
 传播逻辑：
@@ -445,26 +441,50 @@ Block C（B 的下游）→ UPSTREAM_FAILED
 4. 有交集则更新为对应状态，无变化则加入 `not_updated_block_runs`
 5. 如果本轮有更新，递归调用自身直到无新变化
 
-**关键区别**：UPSTREAM_FAILED 会被 `executable_block_runs()` 排除，但**不会触发** `on_block_failure()` 回调——它仅是状态标记，不执行回调逻辑。
+**关键**：无论 `allow_blocks_to_fail` 如何配置，失败传播始终发生。区别在于：
+- `allow_blocks_to_fail=False`：传播结果无实际意义——PipelineRun 已在入口处标记 FAILED，不会再调度
+- `allow_blocks_to_fail=True`：传播后的 UPSTREAM_FAILED BlockRun 不再是 INITIAL，不会进入 `executable_block_runs()` 的候选列表
 
-#### 4.5.4 allow_blocks_to_fail 下普通上游与动态上游的传播差异
+#### 4.5.3 第三层：可执行判断（executable_block_runs）
 
-`allow_blocks_to_fail` 配置对普通上游和动态上游的失败传播有不同的处理逻辑，核心差异体现在 `executable_block_runs()` 的判断方式：
+`PipelineRun.executable_block_runs()`（L978–L1221）判断哪些 BlockRun 可以被调度。**此处的关键前提**是正确理解 `completed_block_uuids` 和 `finished_block_uuids` 的含义：
+
+**`completed_block_runs` 属性**（L849–L850）**仅包含 `status == COMPLETED` 的 BlockRun**：
+
+```python
+@property
+def completed_block_runs(self) -> List['BlockRun']:
+    return [b for b in self.block_runs if b.status == BlockRun.BlockRunStatus.COMPLETED]
+```
+
+**`_build_block_uuids()` 辅助函数**（L1003–L1021）过滤 COMPLETED + UPSTREAM_FAILED + FAILED：
+
+```python
+def _build_block_uuids(block_runs: List[BlockRun]) -> List[str]:
+    arr = set()
+    for block_run in block_runs:
+        if block_run.status in [
+            BlockRun.BlockRunStatus.COMPLETED,
+            BlockRun.BlockRunStatus.UPSTREAM_FAILED,
+            BlockRun.BlockRunStatus.FAILED,
+        ]:
+            arr.add(block_uuid)
+    return list(arr)
+```
+
+由此：
+- `completed_block_uuids = _build_block_uuids(self.completed_block_runs)` → 输入仅含 COMPLETED 的 BlockRun → `_build_block_uuids` 过滤后仍只含 COMPLETED → **`completed_block_uuids` 仅含 COMPLETED 的 block_uuid**
+- `finished_block_uuids = _build_block_uuids(self.block_runs)` → 输入含全部 BlockRun → 过滤后含 COMPLETED + UPSTREAM_FAILED + FAILED → **`finished_block_uuids` 含所有终态 block_uuid**
 
 **普通 Block（无 dynamic_upstream_block_uuids / dynamic_block_index）**：
 
-普通 Block 的可执行性判断走 `all_upstream_blocks_completed(completed_block_uuids, upstream_block_uuids_override)` 路径（L1209–L1216），**该函数只检查 `completed_block_uuids`**。`completed_block_uuids` 来自 `_build_block_uuids(self.completed_block_runs)`，而 `_build_block_uuids` 仅收集状态为 COMPLETED / UPSTREAM_FAILED / FAILED 的 BlockRun。
+普通 Block 的可执行性判断走 `all_upstream_blocks_completed(completed_block_uuids, upstream_block_uuids_override)` 路径（L1209–L1216），只检查 `completed_block_uuids`。由于 `completed_block_uuids` **仅含 COMPLETED**，普通 Block 的上游必须全部 COMPLETED 才可执行。
 
-| allow_blocks_to_fail | completed_block_uuids 包含 | 上游 FAILED 的 Block 可执行？ |
-|---|---|---|
-| False | COMPLETED + UPSTREAM_FAILED + FAILED | **是**（因为 FAILED 也在 `completed_block_uuids` 中） |
-| True | COMPLETED + UPSTREAM_FAILED + FAILED | **是**（同上） |
-
-**校正**：`allow_blocks_to_fail` 的开关**不通过** `all_upstream_blocks_completed()` 影响普通 Block 的判断——无论该配置如何，FAILED/UPSTREAM_FAILED 都在 `completed_block_uuids` 中。`allow_blocks_to_fail` 的真正作用在 `PipelineScheduler.schedule()` 的入口判断：当为 False 时，`any_blocks_failed()` 立即将 PipelineRun 标记 FAILED 并终止所有 Block；当为 True 时，允许调度继续，但失败 Block 的下游会被 `update_block_run_statuses()` 标记为 UPSTREAM_FAILED。
+**当 `allow_blocks_to_fail=True` 时**，失败上游的下游 Block 已被 `update_block_run_statuses()` 标记为 UPSTREAM_FAILED（不再是 INITIAL），因此不会出现在 `executable_block_runs()` 的候选列表中。**普通 Block 在 `allow_blocks_to_fail` 为 True 或 False 时的可执行判断逻辑完全相同**——区别仅在于 False 时 PipelineRun 已终止（不会进入调度），True 时下游被传播为 UPSTREAM_FAILED（跳过依赖判断）。
 
 **动态上游（有 dynamic_upstream_block_uuids + dynamic_block_index 的 BlockRun）**：
 
-这是 `allow_blocks_to_fail` **真正改变判断逻辑**的唯一分支（L1115–L1127）：
+这是 `allow_blocks_to_fail` **改变判断集合**的分支（L1115–L1127）：
 
 ```python
 if allow_blocks_to_fail:
@@ -473,13 +493,10 @@ else:
     completed = all(uuid in completed_block_uuids for uuid in uuids_to_check)
 ```
 
-- `completed_block_uuids`：仅含 COMPLETED + UPSTREAM_FAILED + FAILED（来自 `self.completed_block_runs`）
-- `finished_block_uuids`：含所有非 INITIAL/QUEUED/RUNNING 的 BlockRun 的 block_uuid（来自 `self.block_runs`），范围更广（还包括 CANCELLED 等）
-
 | allow_blocks_to_fail | 检查集合 | 含义 |
 |---|---|---|
-| False | `completed_block_uuids` | 动态上游必须 COMPLETED/FAILED/UPSTREAM_FAILED |
-| True | `finished_block_uuids` | 动态上游只需达到终态（含 CANCELLED 等） |
+| False | `completed_block_uuids`（仅 COMPLETED） | 动态上游必须 COMPLETED |
+| True | `finished_block_uuids`（COMPLETED + FAILED + UPSTREAM_FAILED） | 动态上游达到终态即可（含 FAILED） |
 
 **动态 Block 子节点（is_dynamic_block_child）**：
 
@@ -495,15 +512,17 @@ if len(list(selected)) < len(combos) + 1:
     return False
 ```
 
-**这意味着**：即使 `allow_blocks_to_fail=True`，动态 Block 子节点的上游如果状态为 FAILED/UPSTREAM_FAILED，该子节点也**不会被判定为可执行**——它必须等到上游全部 COMPLETED。这是动态 Block 与普通 Block 在失败传播上的核心差异。
+即使 `allow_blocks_to_fail=True`，动态 Block 子节点的上游若为 FAILED/UPSTREAM_FAILED，该子节点也**不可执行**——必须等上游全部 COMPLETED。
 
-**总结对比**：
+**三层影响总结**：
 
-| Block 类型 | allow_blocks_to_fail=False | allow_blocks_to_fail=True |
+| 影响层 | allow_blocks_to_fail=False | allow_blocks_to_fail=True |
 |---|---|---|
-| 普通 Block | 上游 FAILED → PipelineRun 立即 FAILED（不会到达依赖判断） | 上游 FAILED → 下游标记 UPSTREAM_FAILED，Pipeline 继续 |
-| 动态上游 BlockRun | 检查 `completed_block_uuids`（含 FAILED） | 检查 `finished_block_uuids`（含 CANCELLED，范围更广） |
-| 动态 Block 子节点 | 仅 COMPLETED 算完成（不受 allow_blocks_to_fail 影响） | 仅 COMPLETED 算完成（不受 allow_blocks_to_fail 影响） |
+| **入口终止** | 有 Block FAILED → PipelineRun 立即 FAILED | 有 Block FAILED → 不终止，继续调度 |
+| **失败传播** | 始终执行（但无实际意义，因已终止） | 始终执行，下游标记 UPSTREAM_FAILED |
+| **可执行判断（普通 Block）** | 不到达此步 | 上游必须 COMPLETED；下游已 UPSTREAM_FAILED 不在候选中 |
+| **可执行判断（动态上游 BlockRun）** | 检查 `completed_block_uuids`（仅 COMPLETED） | 检查 `finished_block_uuids`（含 FAILED/UPSTREAM_FAILED） |
+| **可执行判断（动态 Block 子节点）** | 仅 COMPLETED 算完成 | 仅 COMPLETED 算完成（不受配置影响） |
 
 ### 4.6 重试判断
 
@@ -531,7 +550,7 @@ def __execute_with_retry():
 
 #### 4.6.2 状态写回重试与崩溃恢复的边界
 
-`on_block_complete()` 和 `on_block_failure()` 中的 DB 写回操作自带 `@retry(retries=2, delay=5)`。这是 **DB 写入重试**，与 Block 业务逻辑重试无关。两者的边界如下：
+`on_block_complete()` 和 `on_block_failure()` 中的 DB 写回操作自带 `@retry(retries=2, delay=5)`。这是 **DB 写入重试**，与 Block 业务逻辑重试无关。
 
 **写回重试的职责范围**：
 - 保护目标：`BlockRun.update(status=..., metrics=..., completed_at=...)` 这一 DB 写操作
@@ -539,27 +558,71 @@ def __execute_with_retry():
 - 最多 2 次重试，间隔 5 秒，无指数退避
 - 重试耗尽后异常抛出，被 `@safe_db_query` 装饰器捕获（静默处理）
 
-**崩溃恢复的职责范围**：
-- 保护目标：BlockRun 状态因进程崩溃而停留在 RUNNING/QUEUED 的场景
-- 检测逻辑：`__fetch_crashed_block_runs()` 检查 RUNNING/QUEUED BlockRun 对应的 Job 是否仍存在
-- 恢复动作：将 BlockRun 重置为 INITIAL，使其在下一轮 `__schedule_blocks()` 中被重新调度
+#### 4.6.3 崩溃恢复路径（按调度模式分离）
 
-**边界场景**：
+`__fetch_crashed_block_runs()`（L871–L904）检测 RUNNING/QUEUED 状态但对应 Job 已不存在的 BlockRun，将其重置为 INITIAL 以便重跑。不同调度模式的崩溃恢复路径和覆盖范围各不相同：
 
-| 场景 | 写回重试是否覆盖 | 崩溃恢复是否覆盖 | BlockRun 最终状态 |
+**路径 A：标准 Batch Pipeline（`__schedule_blocks`）**
+
+触发位置：`__schedule_blocks()`（L624）将 `__fetch_crashed_block_runs()` 的结果拼接到待调度列表头部：
+
+```python
+block_runs_to_schedule = self.__fetch_crashed_block_runs() + block_runs_to_schedule
+```
+
+恢复条件：`job_manager.has_block_run_job(br.id)` 返回 False
+- 检查的是 BLOCK_RUN 类型的 Job（`block_run_{id}`）
+- BlockRun 停留在 RUNNING/QUEUED 但对应 Worker 进程已退出 → 重置 INITIAL → 被重新调度执行
+
+**路径 B：单进程 / STREAMING Pipeline（`__schedule_pipeline`）**
+
+触发位置：`__schedule_pipeline()`（L858–L860）在添加 PIPELINE_RUN Job 之前调用：
+
+```python
+if PipelineType.STREAMING != self.pipeline.type:
+    self.__fetch_crashed_block_runs()
+```
+
+恢复条件：同路径 A，检查 BLOCK_RUN 类型的 Job
+- STREAMING Pipeline 不调用崩溃恢复（L858 条件排除）
+- `run_pipeline_in_one_process=True` 的 Pipeline 走此路径，但崩溃恢复检查的是 BlockRun 级别的 Job，而单进程模式下 Block 在 Pipeline 进程内执行（不创建 BLOCK_RUN Job），因此 `has_block_run_job()` 始终返回 False → 所有 RUNNING/QUEUED 的 BlockRun 都会被重置 INITIAL
+- 重置后，`__schedule_pipeline()` 创建新的 PIPELINE_RUN Job 重新执行整 Pipeline
+
+**路径 C：Pipeline Job 崩溃（`has_pipeline_run_job` 守卫）**
+
+`__schedule_pipeline()` 入口检查（L848–L853）：
+
+```python
+if job_manager.has_pipeline_run_job(self.pipeline_run.id):
+    return    ← Pipeline Job 仍存在，不重新调度
+```
+
+- 检查的是 PIPELINE_RUN 类型的 Job（`pipeline_run_{id}`）
+- 若 Pipeline 进程仍在运行（`job_dict` 中有记录），则不会创建新 Job，也不会触发崩溃恢复
+- 若 Pipeline 进程已退出（`job_dict` 中无记录），则先执行 `__fetch_crashed_block_runs()` 重置残留的 BlockRun，再创建新 Job
+
+**路径对比**：
+
+| 维度 | 标准 Batch（路径 A） | 单进程 Pipeline（路径 B） | Pipeline Job（路径 C） |
 |---|---|---|---|
-| DB 临时不可用，1 秒后恢复 | 是（重试成功） | 不需要 | COMPLETED/FAILED（正确） |
-| DB 长时间不可用，写回重试耗尽 | 否（重试耗尽） | **部分覆盖** | 停留在 RUNNING → 下一轮 `__fetch_crashed_block_runs()` 重置为 INITIAL → **重跑** |
-| Worker 进程被 SIGKILL | 不适用（进程已死） | 是 | RUNNING → INITIAL → 重跑 |
-| DB 写回成功但 Job 仍被记录为活跃 | 不适用 | 否（Job 仍存在） | 正确（COMPLETED/FAILED），无异常 |
-| `@safe_db_query` 静默吞掉写回重试耗尽的异常 | 否（异常被吞） | **是**（如果 BlockRun 停留在 RUNNING 且 Job 不存在） | RUNNING → INITIAL → 重跑 |
+| 恢复触发 | `__schedule_blocks()` 每次调度时 | `__schedule_pipeline()` 入口 | `__schedule_pipeline()` 入口 |
+| 检查对象 | `has_block_run_job(br.id)` | `has_block_run_job(br.id)` | `has_pipeline_run_job(pipeline_run.id)` |
+| 修复粒度 | 单个 BlockRun → INITIAL | 全部残留 BlockRun → INITIAL | 整 Pipeline 重新执行 |
+| 恢复延迟 | 同轮 `schedule()` | 下一轮 `schedule_all()`（最多 10s） | 下一轮 `schedule_all()`（最多 10s） |
+| 脏 Job 风险 | Worker 进程残留 → `has_block_run_job` 返回 True → 不重置，需等 300s 心跳 TTL | 同路径 A | Pipeline 进程残留 → `has_pipeline_run_job` 返回 True → 不创建新 Job，需等 300s 心跳 TTL |
+| STREAMING | 不适用 | 不执行崩溃恢复（L858 排除） | 同路径 B |
 
-**关键边界**：
-1. **写回重试耗尽 + `@safe_db_query` 吞异常**：BlockRun 不会标记为 COMPLETED/FAILED，但调度器也不会崩溃。下一轮 `schedule()` 中 `__fetch_crashed_block_runs()` 检测到该 BlockRun 仍为 RUNNING 且 Job 已完成 → 重置 INITIAL → Block 被重跑。这是"最终一致"但代价是**重复执行**。
-2. **崩溃恢复不清理队列中的脏 Job**：`__fetch_crashed_block_runs()` 仅检查 `job_manager.has_block_run_job()`，若 Job 仍在 ProcessQueue 的 `job_dict` 中（进程未完全退出），则认为 Job 仍活跃，不会重置 BlockRun → 导致 BlockRun 长期停留在 RUNNING 直到 Job 心跳 TTL（300s）过期。
-3. **单进程模式的崩溃恢复路径不同**：`__fetch_crashed_block_runs()` 仅在 `__schedule_pipeline()` 中调用（L858–L860），而 `__schedule_pipeline()` 仅在 STREAMING 或 `run_pipeline_in_one_process=True` 时进入。标准 Batch Pipeline 的 `__schedule_blocks()` 路径**不调用** `__fetch_crashed_block_runs()`——这意味着标准模式下崩溃的 BlockRun 需等到 `schedule()` 入口的 `b.refresh()` 被执行，且 `__check_block_run_timeout()` 超时或 `schedule_all()` 下一轮重建 PipelineScheduler 时才可能恢复。
+**写回重试与崩溃恢复的边界场景**：
 
-#### 4.6.3 Pipeline 级重试
+| 场景 | 写回重试 | 崩溃恢复 | BlockRun 最终状态 |
+|---|---|---|---|
+| DB 临时不可用，1 秒后恢复 | 覆盖（重试成功） | 不需要 | COMPLETED/FAILED（正确） |
+| DB 长时间不可用，重试耗尽 | 不覆盖 | 部分覆盖 | RUNNING → INITIAL → 重跑 |
+| Worker 进程被 SIGKILL | 不适用 | 覆盖 | RUNNING → INITIAL → 重跑 |
+| `@safe_db_query` 吞掉重试耗尽的异常 | 不覆盖 | 覆盖（Job 已不存在时） | RUNNING → INITIAL → 重跑 |
+| Job 仍在 `job_dict` 中但实际已僵死 | 不适用 | **不覆盖**（has_job=True） | 停留 RUNNING，需等 300s 心跳 TTL |
+
+#### 4.6.4 Pipeline 级重试
 
 `mage_ai/orchestration/pipeline_scheduler_original.py` `retry_pipeline_run()`（L1398–L1423）创建**全新 PipelineRun**：
 - 复用原 `execution_date`、`variables`、`event_variables`、`backfill_id`
@@ -615,9 +678,9 @@ def __execute_with_retry():
 - 步骤 ② 失败 → BlockRun 标记 FAILED（非 COMPLETED），不会出现"变量丢失但状态为 COMPLETED"的情况
 - 步骤 ④ 的 `@retry` 保证 DB 写入的常见瞬时故障可恢复；耗尽后 `@safe_db_query` 吞异常，BlockRun 停留 RUNNING，由崩溃恢复兜底
 - 步骤 ⑥ 的 `refresh()` 保证读一致性，避免读到会话缓存中的过期状态
-- 步骤 ⑦ 的失败传播**不受 `allow_blocks_to_fail` 影响**——无论配置如何，上游 FAILED 的下游总是被标记 UPSTREAM_FAILED；`allow_blocks_to_fail` 只控制 PipelineRun 是否因此标记 FAILED
-- 步骤 ⑧ 的动态 Block 子节点依赖判断**不考虑 `allow_blocks_to_fail`**，只认 COMPLETED 状态
-- 步骤 ⑩ 的变量存储与 DB 状态解耦——步骤 ② 成功 + 步骤 ④ 成功时，变量与状态一致；步骤 ② 失败时步骤 ④ 走 FAILED 路径，两者仍一致
+- 步骤 ⑦ 的失败传播**不受 `allow_blocks_to_fail` 影响**——无论配置如何，上游 FAILED 的下游总是被标记 UPSTREAM_FAILED；`allow_blocks_to_fail` 只控制入口是否终止
+- 步骤 ⑧ 的 `completed_block_uuids` **仅含 COMPLETED**，普通 Block 的上游必须全部 COMPLETED 才可执行；动态上游 BlockRun 在 `allow_blocks_to_fail=True` 时改用 `finished_block_uuids`（含 FAILED/UPSTREAM_FAILED）；动态 Block 子节点始终只认 COMPLETED
+- 步骤 ⑩ 的变量存储与 DB 状态一致——步骤 ② 成功 + 步骤 ④ 成功时两者一致；步骤 ② 失败时步骤 ④ 走 FAILED 路径，两者仍一致
 
 ### 4.8 闭环中的潜在断裂点
 
@@ -628,7 +691,7 @@ def __execute_with_retry():
 | `PipelineExecutor` 内存缓存模式下 Block 异常 | `__run_blocks()` 退出，已执行 Block 的输出丢失 | 后续 Block 无法读取上游输出，PipelineRun 停留在 RUNNING，需等下一轮 `schedule()` 修复 |
 | CONDITION_FAILED 状态不被 `any_blocks_failed()` 统计 | Pipeline 标记 COMPLETED 但实际有 Block 被跳过 | 用户可能误认为所有 Block 均成功执行 |
 | 动态 Block 子节点不支持 `allow_blocks_to_fail` | 上游 FAILED 时动态子节点永远无法获得调度 | Pipeline 无法自动完成，需手动干预或超时终止 |
-| 标准 Batch 模式下 `__schedule_blocks()` 不调用 `__fetch_crashed_block_runs()` | 崩溃 BlockRun 只能通过超时检测或下一轮 `schedule_all()` 恢复 | 恢复延迟可能超过预期 |
+| 单进程模式下 `has_block_run_job` 始终返回 False | 无 BLOCK_RUN Job 存在，所有 RUNNING/QUEUED BlockRun 均被重置 INITIAL | 崩溃恢复过度重置，可能将本已成功但 DB 写回延迟的 BlockRun 也重置为 INITIAL |
 
 ---
 
