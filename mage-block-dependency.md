@@ -403,34 +403,79 @@ while not pipeline_run.all_blocks_completed(allow_blocks_to_fail):
 
 #### 6.1.2 第二层：可执行性判定
 
-`executable_block_runs`（`mage_ai/orchestration/db/models/schedules.py:978-1221`）实现多维度依赖筛选：
+`executable_block_runs`（`schedules.py:978-1221`）实现多维度依赖筛选。该方法按块类型和上游来源分为**三条独立分支**，每条分支的完成判定逻辑不同：
 
 **状态集合构建**（`schedules.py:1003-1024`）：
+
+`_build_block_uuids` 根据传入的 block_run 列表提取 UUID，筛选条件为 `status in [COMPLETED, UPSTREAM_FAILED, FAILED]`。两个集合的区别在于输入源：
+
+| 集合名 | 输入源 | 实际含义 |
+|--------|--------|----------|
+| `completed_block_uuids` | `self.completed_block_runs` | 仅 COMPLETED 状态的块 UUID |
+| `finished_block_uuids` | `self.block_runs` | COMPLETED + UPSTREAM_FAILED + FAILED 状态的块 UUID |
+
+> 注意：`_build_block_uuids` 函数本身的过滤条件是固定的（含三种状态），但 `completed_block_runs` 属性只返回 COMPLETED 状态的 block_run，因此 `completed_block_uuids` 实际仅含 COMPLETED 块。而 `self.block_runs` 包含所有状态，因此 `finished_block_uuids` 包含三种状态的块。
+
+**分支一：动态块子实例**（`schedules.py:1108-1114`）
+
 ```python
-# completed: COMPLETED 状态的块
-completed_block_uuids = _build_block_uuids(self.completed_block_runs)
-# finished: COMPLETED + UPSTREAM_FAILED + FAILED 状态的块
-finished_block_uuids = _build_block_uuids(self.block_runs)
+if block and is_dynamic_block_child(block):
+    if check_all_dynamic_upstreams_completed(
+        block, block_runs_all, execution_partition=self.execution_partition
+    ):
+        completed = True
+    else:
+        continue  # 跳过，不可执行
 ```
 
-**常规块筛选逻辑**（`schedules.py:1209-1216`）：
+- 使用独立的 `check_all_dynamic_upstreams_completed` 检查
+- **不涉及** `allow_blocks_to_fail` 参数
+- **不涉及** `completed_block_uuids` / `finished_block_uuids` 集合
+
+**分支二：带动态上游的块**（`schedules.py:1115-1127`）
+
+当 block_run 的 metrics 包含 `dynamic_upstream_block_uuids` 和 `dynamic_block_index` 时进入此分支：
+
 ```python
-if block and block.all_upstream_blocks_completed(
-    completed_block_uuids,       # 必须全部成功完成
-    upstream_block_uuids_override,
-):
-    executable_block_runs.append(block_run)
+elif dynamic_upstream_block_uuids is not None and dynamic_block_index is not None:
+    uuids_to_check = []
+    for upstream_block_uuid in dynamic_upstream_block_uuids:
+        upstream_block = pipeline.get_block(upstream_block_uuid)
+        if is_dynamic_block_child(upstream_block):
+            uuids_to_check.append(upstream_block_uuid)
+        else:
+            uuids_to_check.append(upstream_block_uuid)
+
+    if allow_blocks_to_fail:
+        completed = all(uuid in finished_block_uuids for uuid in uuids_to_check)
+    else:
+        completed = all(uuid in completed_block_uuids for uuid in uuids_to_check)
 ```
 
-**`allow_blocks_to_fail` 模式下的宽松筛选**（`schedules.py:1124-1127`）：
+- **唯一受** `allow_blocks_to_fail` 影响的分支
+- `allow_blocks_to_fail=True` 时使用 `finished_block_uuids`（允许上游 FAILED/UPSTREAM_FAILED）
+- `allow_blocks_to_fail=False` 时使用 `completed_block_uuids`（仅允许上游 COMPLETED）
+- 此分支的上游来源是 metrics 中的动态上游 UUID 列表，而非 Block 对象的 `upstream_blocks`
+
+**分支三：普通块**（`schedules.py:1128-1216`）
+
+其余所有块走此分支，通过 `block.all_upstream_blocks_completed` 检查：
+
 ```python
-if allow_blocks_to_fail:
-    # 允许上游失败，只要 finished（含 FAILED）即可
-    completed = all(uuid in finished_block_uuids for uuid in uuids_to_check)
-else:
-    # 严格模式，必须全部 completed
-    completed = all(uuid in completed_block_uuids for uuid in uuids_to_check)
+completed = (
+    not incomplete
+    and block is not None
+    and block.all_upstream_blocks_completed(
+        completed_block_uuids,         # 始终使用 completed_block_uuids
+        upstream_block_uuids_override,
+    )
+)
 ```
+
+- **始终使用** `completed_block_uuids`（仅含 COMPLETED）
+- **不受** `allow_blocks_to_fail` 参数影响
+- 即便 `allow_blocks_to_fail=True`，普通上游块 FAILED 时下游仍不可执行
+- 此分支内处理了数据集成子块、Hook 块、动态上游子块等特殊情况，通过 `upstream_block_uuids_override` 覆盖上游 UUID 列表
 
 #### 6.1.3 上游完成性校验
 
@@ -464,7 +509,7 @@ def all_upstream_blocks_completed(
 | **拓扑边界** | 块必须在所有上游块完成后才能执行 | 所有块 |
 | **类型边界** | `CHART`、`MARKDOWN`、`SCRATCHPAD` 类型不参与 Pipeline 执行（`constants.py:157-161`） | 特定块类型 |
 | **条件边界** | 条件块失败时，下游块跳过执行 | 条件块下游 |
-| **失败边界** | 上游失败时（非 `allow_blocks_to_fail` 模式），下游不执行 | 失败块下游 |
+| **失败边界** | 上游 FAILED 时：普通上游的下游始终不可执行；动态上游的下游仅在 `allow_blocks_to_fail=True` 时可执行 | 失败块下游 |
 | **动态边界** | 动态块的子实例需全部完成后，下游才能执行 | 动态块下游 |
 | **集成边界** | 数据集成块的 controller/child 有特殊的执行顺序约束（`schedules.py:1046-1074`） | 集成块内部 |
 
@@ -788,8 +833,9 @@ PipelineExecutor.__run_blocks()                  pipeline_executor.py:94-171
     ├── [2] executable_block_runs()              schedules.py:978-1221
     │   ├── 构建 completed/finished UUID 集合
     │   ├── 遍历 initial_block_runs
-    │   ├── 跳过已完成/失败/条件失败的块
-    │   ├── 检查 all_upstream_blocks_completed()
+    │   ├── 分支一：动态块子实例 → check_all_dynamic_upstreams_completed
+    │   ├── 分支二：带动态上游的块 → allow_blocks_to_fail 控制 finished/completed
+    │   ├── 分支三：普通块 → all_upstream_blocks_completed(completed_block_uuids)
     │   └── 返回可执行列表
     │
     └── [3] 并行执行 executable_block_runs
@@ -804,10 +850,11 @@ PipelineExecutor.__run_blocks()                  pipeline_executor.py:94-171
 
 | 事件 | 对依赖筛选的影响 | 对运行顺序的影响 | 对状态传播的影响 |
 |------|------------------|------------------|------------------|
-| **上游 FAILED** | 下游被排除出 executable（非 allow_fail 模式） | 下游不会被调度 | 触发 UPSTREAM_FAILED 递归传播 |
-| **条件块返回 False** | 当前块及其下游被排除 | 下游调度顺序不变但不会实际执行 | 触发 CONDITION_FAILED 递归传播 |
-| **allow_blocks_to_fail=True** | 允许上游 FAILED 的块进入 executable（`schedules.py:1124-1125`） | 失败块的下游仍会被调度 | UPSTREAM_FAILED 仅用于标记，不阻止执行 |
-| **动态块生成** | 动态子块的 UUID 动态加入 completed 集合（`schedules.py:1184-1207`） | 下游需等待所有动态子块完成 | 动态子块的失败会传播给下游 |
+| **上游 FAILED（普通上游）** | 下游被排除出 executable，**无论** `allow_blocks_to_fail` 取值如何（分支三始终用 `completed_block_uuids`） | 下游不会被调度 | 触发 `update_block_run_statuses` 将下游标记为 UPSTREAM_FAILED |
+| **上游 FAILED（动态上游）** | `allow_blocks_to_fail=True` 时使用 `finished_block_uuids`，下游可进入 executable；`allow_blocks_to_fail=False` 时使用 `completed_block_uuids`，下游不可执行（分支二 `schedules.py:1124-1127`） | `allow_blocks_to_fail=True` 时下游仍会被调度 | UPSTREAM_FAILED 仅在 `allow_blocks_to_fail=False` 时阻止下游执行 |
+| **条件块返回 False** | 当前块标记 CONDITION_FAILED，下游在 `update_block_run_statuses` 中被递归标记 | 下游不会被调度（CONDITION_FAILED 不在 completed 集合中） | 触发 CONDITION_FAILED 递归传播（`schedules.py:1275-1292`） |
+| **allow_blocks_to_fail=True** | **仅**影响动态上游分支（分支二）；普通上游分支（分支三）始终要求上游 COMPLETED | 动态上游失败时下游仍可执行；普通上游失败时下游仍不可执行 | Pipeline 完成判定 `all_blocks_completed(include_failed_blocks=True)` 将 FAILED/UPSTREAM_FAILED 视为"已完成" |
+| **动态块生成** | 动态子块通过 `check_all_dynamic_upstreams_completed` 独立检查（分支一），不涉及 `allow_blocks_to_fail`；动态子块的 UUID 可通过 `upstream_block_uuids_override` 加入普通块的检查集合 | 下游需等待所有动态子块完成 | 动态子块的失败会通过 `update_block_run_statuses` 传播给下游 |
 | **依赖关系变更** | 需要重建 executable 筛选逻辑 | 拓扑顺序需重新计算 | 可能导致循环，需重新 validate |
 
 ### 9.3 Pipeline 完成判定
@@ -903,7 +950,10 @@ def all_blocks_completed(self, include_failed_blocks: bool = False) -> bool:
   - [ ] 数据集成块条件失败时子块和下游递归标记
   - [ ] 动态块子实例不执行条件检查
 - [ ] **递归传播终止**：已完成块不会被错误覆盖为失败状态
-- [ ] **allow_blocks_to_fail 模式**：上游失败时下游仍可执行
+- [ ] **allow_blocks_to_fail 模式**：
+  - [ ] 动态上游失败时，`allow_blocks_to_fail=True` 下游可执行
+  - [ ] 普通上游失败时，`allow_blocks_to_fail=True` 下游仍不可执行（分支三不消费此参数）
+  - [ ] `all_blocks_completed(include_failed_blocks=True)` 正确将 FAILED/UPSTREAM_FAILED 视为完成
 
 ### 12.3 并发验证
 
