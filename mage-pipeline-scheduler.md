@@ -66,13 +66,13 @@ Mage AI 的 Pipeline 调度系统采用**定时轮询 + 事件驱动**的混合�
 
 `mage_ai/orchestration/db/models/schedules.py` `PipelineRun.executable_block_runs()`（L978–L1221）是依赖判断核心，处理以下场景：
 
-1. **普通 Block**：检查 `block.upstream_blocks` 是否均为 COMPLETED 状态
-2. **Dynamic Block 子节点**：调用 `check_all_dynamic_upstreams_completed()` 验证所有动态上游
-3. **动态块索引（metrics.dynamic_block_index）**：检查指定动态上游列表是否完成
+1. **普通 Block**：通过 `all_upstream_blocks_completed(completed_block_uuids)` 检查上游是否全部 COMPLETED（`completed_block_uuids` 仅含 COMPLETED 状态的 block_uuid）
+2. **Dynamic Block 子节点**：调用 `check_all_dynamic_upstreams_completed()` 验证所有动态上游（仅认 COMPLETED，不受 `allow_blocks_to_fail` 影响）
+3. **动态块索引（metrics.dynamic_block_index）**：根据 `allow_blocks_to_fail` 选择检查 `completed_block_uuids`（仅 COMPLETED）或 `finished_block_uuids`（含 COMPLETED/FAILED/UPSTREAM_FAILED）
 4. **数据集成子块**：
    - `original` 块需等待所有非 controller 子块完成
    - controller 子块且非并行时，需等待其配置的上游块
-5. **allow_blocks_to_fail 开关**：True 时将 FAILED/UPSTREAM_FAILED 也视为"已完成"，False 时仅 COMPLETED 有效
+5. **`allow_blocks_to_fail` 的作用点**：不在可执行判断层面改变普通 Block 的逻辑，而是通过入口终止控制和失败传播间接影响（详见 4.5 节三层影响分析）
 
 #### 2.2.2 失败状态传播
 
@@ -90,7 +90,7 @@ Mage AI 的 Pipeline 调度系统采用**定时轮询 + 事件驱动**的混合�
 | INITIAL | 已创建，待调度 |
 | RUNNING | 执行中 |
 | COMPLETED | 全部 Block 成功完成 |
-| FAILED | 有 Block 失败且 allow_blocks_to_fail=False |
+| FAILED | 有 Block 失败（`allow_blocks_to_fail=False` 时立即终止；`True` 时仅当 `all_blocks_completed` 后仍有失败 Block 才标记） |
 | CANCELLED | 用户取消或被跳过 |
 
 **BlockRun 状态**（`mage_ai/orchestration/db/models/schedules.py` L1664–L1672）：
@@ -320,7 +320,7 @@ execute_sync()
 | 场景 | BlockRun 状态 | 变量是否存在 | 下游 Block 行为 |
 |---|---|---|---|
 | 业务成功 + 变量写入成功 | COMPLETED | 是 | 正常读取上游输出 |
-| 业务成功 + 变量写入失败 | FAILED | 否/部分 | 不被 `executable_block_runs()` 选中（FAILED 不在 `completed_block_uuids` 中，除非 `allow_blocks_to_fail=True`） |
+| 业务成功 + 变量写入失败 | FAILED | 否/部分 | 不被 `executable_block_runs()` 选中（FAILED 不在 `completed_block_uuids` 中；若 `allow_blocks_to_fail=True`，则 FAILED 在 `finished_block_uuids` 中，但普通 Block 不使用 `finished_block_uuids`，且下游已被传播为 UPSTREAM_FAILED） |
 | 业务失败 + 变量未写入 | FAILED | 否 | 同上 |
 
 **校正之前的错误认知**：此前认为"store_variables 失败但 BlockRun 标记 COMPLETED"，这是不正确的。实际上 `store_variables()` 失败的异常会传播到 `BlockExecutor.execute()` 的 `except` 分支，触发 `on_failure` 回调，BlockRun 最终标记为 **FAILED**。
