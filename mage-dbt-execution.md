@@ -181,7 +181,7 @@ run_settings_json = json.dumps(run_settings or {})
 | 后台调度 (PipelineRun) | False | 任意 | True | run / snapshot |
 
 **关键洞察**：
-- `Preview` 按钮 → `run_settings={}` → `show` 命令（仅查询不物化）
+- `Preview` 按钮 → `run_settings={}` → `show` 命令（**当前模型不物化**，但上游 DataFrame 会通过 seed 写入数据库）
 - `Run/Test/Build` 按钮 → 对应 `run_model/test_model/build_model` → 对应 dbt 命令
 - `snapshot` 模型节点自动将 `run` 替换为 `snapshot` 命令
 - 后台调度默认使用 `build`（内含 run + test），若配置了 `disable_tests` 则降级为 `run`
@@ -229,7 +229,7 @@ cli.invoke(['deps'] + args)   # 始终执行，无前置判断
 
 **潜在影响**：
 - 每次执行都触发包下载，可能拖慢执行速度
-- 网络不稳定时 `deps` 失败会导致整个 block 失败
+- **deps 失败分两种模式**：业务失败（`success=False`）不中断、继续执行；运行时异常（抛 Python 异常）才会导致整个 block 失败
 - 无缓存机制，重复下载相同的包
 
 #### 2.2.6 show 触发条件与数据获取
@@ -261,7 +261,7 @@ cli.invoke(['deps'] + args)   # 始终执行，无前置判断
 ```
 
 **重要注意**：
-- `task == 'show'` 时只执行 `dbt show`，不物化模型（不修改数据库中的表）
+- `task == 'show'` 时不执行主任务，**当前模型不物化**（不修改目标表），但上游 DataFrame 会通过 seed 写入 mage_sources 表
 - `task == 'run'/'build'` 时，若需要预览/下游数据，会**额外再执行一次** `dbt show`
 - `task == 'test'` 时不执行 show，因为测试没有数据输出
 
@@ -422,8 +422,8 @@ if needs_downstream_df or needs_preview_df:
 **错误处理行为**：
 - `dbtRunnerResult.success` 为 `True` 表示执行成功
 - 失败时抛出 `Exception(str(res.exception))`，异常信息直接来自 dbt 的异常对象
-- **任何一步失败都会立即中断**，异常向上传播至 `BlockExecutor`
-- `dbt deps` 执行后**不检查 success**——即使 deps 失败，也会继续执行主任务（潜在 bug）
+- **主任务和 show 失败会立即中断**，异常向上传播至 `BlockExecutor`
+- **`dbt deps` 需区分两种失败模式**：业务失败（`success=False`）**不检查、不中断**，继续执行主任务；运行时异常（抛 Python 异常）才会立即中断（潜在 bug）
 
 **YAML Block 的一致性**：
 - ✅ 同样使用 `raise Exception(str(res.exception))` 模式
@@ -461,7 +461,7 @@ return [df]
 | 后台调度 | ✅ build/run | ❌ 否（无下游非 dbt block 时） | None | output_0 |
 
 **关键洞察**：
-- `task == 'show'` 时，**不执行主任务**，只执行 show 进行数据预览（不物化模型）
+- `task == 'show'` 时，**不执行主任务**，**当前模型不物化**，只执行 show 查询上游 seed 物化后的数据
 - 后台调度时，`needs_downstream_df` 由**下游 block 的类型**决定——只有当下游存在非 dbt block 时，才会执行 show 获取 DataFrame
 - 若 dbt pipeline 中所有下游都是 dbt block，则**不执行 show、不生成 DataFrame**，节省资源
 - `limit = -1` 表示不限制行数（给下游的完整数据），预览模式默认 1000 行
@@ -695,9 +695,11 @@ while True:
 
 #### 2.8.3 潜在不一致风险
 
-1. **deps 失败静默继续**
+1. **deps 失败分两种模式，模式 A 静默继续**
    - 位置：[block_sql.py](file:///d:/fz/0601/solo-dogfeeding/code/312-mage-ai/mage_ai/data_preparation/models/block/dbt/block_sql.py#L411)
-   - 风险：`dbt deps` 失败时，依赖包未安装，但主任务继续执行，可能导致更隐蔽的错误
+   - **模式 A（success=False）**：deps 业务失败（包下载失败、版本不存在）→ 不检查 success → 主任务继续 → 用到缺失宏时才报错（错误信息脱离上下文）
+   - **模式 B（抛异常）**：deps 运行时崩溃（YAML 格式错误、模块导入失败）→ 立即中断 → 但 `with Profiles()` 保证临时目录清理
+   - 风险：模式 A 最常见也最隐蔽，主任务在依赖缺失状态下继续执行，可能导致更难排查的错误
    - 建议：增加 deps 成功检查，或至少输出警告日志
 
 2. **YAML Block 无输出变量**
@@ -722,11 +724,12 @@ while True:
 | run_settings | `{}` | `{run_model:true}` | `{test_model:true}` | `{build_model:true}` |
 | dbt 主任务 | 无（跳过） | run / snapshot | test | build |
 | dbt show | ✅ 执行 | ✅ 执行 | ❌ 不执行 | ✅ 执行 |
-| 模型物化 | ❌ 不物化 | ✅ 物化 | -（测试） | ✅ 物化 |
+| **当前模型物化** | ❌ 不物化 | ✅ 物化 | -（测试） | ✅ 物化 |
+| **上游 seed 写库** | ✅ 有（无条件执行） | ✅ 有 | ✅ 有 | ✅ 有 |
 | df 输出 | ✅ 有 | ✅ 有 | ❌ 无 | ✅ 有 |
 | 存储键 | `df` | `df` | `df` (None) | `df` |
-| 数据库写入 | 只读 | 读写 | 只读（测试结果） | 读写 |
-| 典型耗时 | 短（只查询） | 中 | 短 | 长 |
+| **对数据库影响** | show 只读 + seed 写库 | 读写 | 只读（测试断言） | 读写 |
+| **典型耗时** | 中（seed + show） | 中（seed + run + show） | 短（seed + test） | 长（seed + build + show） |
 
 ---
 
@@ -739,7 +742,7 @@ Pipeline Scheduler
   └─ BlockExecutor.execute_block(block_uuid)
        ├─ logger_manager 初始化
        ├─ block._execute_block()
-       │    ├─ __create_upstream_tables()
+       │    ├─ __create_upstream_tables()  ← ⚠️ 物化上游：dbt seed 写库（无条件执行）
        │    │    ├─ __upstream_blocks_from_sources()      # 从 SQL 中的 {{ source() }} 提取上游
        │    │    ├─ 获取上游 block 输出 (DataFrame)
        │    │    └─ DBTBlock.materialize_df()             # CSV → dbt seed → 物化表
@@ -768,32 +771,32 @@ Pipeline Scheduler
 
 ### 3.2 SQL Block Notebook 交互执行流（四条路径）
 
-#### 3.2.1 Preview 路径（dbt show，仅查询）
+#### 3.2.1 Preview 路径（dbt show，当前模型不物化）
 
 **触发**：点击 Preview 按钮 或 Cmd/Ctrl + Enter
 **run_settings**：`{}`（空字典）
-**主任务**：show（不物化）
+**主任务**：show（当前模型不物化）
 
 ```
 用户点击 Preview
   └─ WebSocket 消息（无 run_settings 字段）
        └─ output_display.py: run_settings or {} → {}
             └─ _execute_block(from_notebook=True, run_settings={})
-                 ├─ __create_upstream_tables()  ← 物化上游（如有）
+                 ├─ __create_upstream_tables()  ← ⚠️ 物化上游（如有）：dbt seed 写库
                  ├─ __task() → 'show'            ← run_settings={} → else 分支
                  ├─ 构建 CLI 参数
                  ├─ Profiles().__enter__()
                  ├─ dbt deps                       ← 始终执行
                  ├─ 主任务：跳过（task == 'show'）
                  ├─ needs_preview_df = True          ← from_notebook + task != 'test'
-                 ├─ dbt show --limit 1000           ← 执行 show 获取预览
+                 ├─ dbt show --limit 1000           ← 执行 show 获取预览（只读）
                  ├─ cli.to_pandas(res) → df
                  ├─ Profiles.__exit__()
                  ├─ store_variables({'df': df})   ← 存储为 df
                  └─ return [df]
 ```
 
-**特点**：只查询不物化，速度快，用于验证 SQL 逻辑
+**特点**：**当前模型不物化**，但上游非 dbt block 输出会通过 `dbt seed` 写入数据库；show 查询只读；用于验证 SQL 逻辑
 
 ---
 
@@ -807,7 +810,7 @@ Pipeline Scheduler
 用户点击 Run
   └─ WebSocket 消息 { run_settings: { run_model: true } }
        └─ _execute_block(from_notebook=True, run_settings={run_model:true})
-            ├─ __create_upstream_tables()
+            ├─ __create_upstream_tables()  ← ⚠️ 物化上游（如有）：dbt seed 写库
             ├─ __task() → 'run' (或 'snapshot')    ← run_model=true
             ├─ 构建 CLI 参数
             ├─ Profiles().__enter__()
@@ -836,7 +839,7 @@ Pipeline Scheduler
 用户点击 Test
   └─ WebSocket 消息 { run_settings: { test_model: true } }
        └─ _execute_block(from_notebook=True, run_settings={test_model:true})
-            ├─ __create_upstream_tables()
+            ├─ __create_upstream_tables()  ← ⚠️ 物化上游（如有）：dbt seed 写库
             ├─ __task() → 'test'                    ← test_model=true
             ├─ 构建 CLI 参数
             ├─ Profiles().__enter__()
@@ -865,7 +868,7 @@ Pipeline Scheduler
 用户点击 Build
   └─ WebSocket 消息 { run_settings: { build_model: true } }
        └─ _execute_block(from_notebook=True, run_settings={build_model:true})
-            ├─ __create_upstream_tables()
+            ├─ __create_upstream_tables()  ← ⚠️ 物化上游（如有）：dbt seed 写库
             ├─ __task() → 'build'                    ← build_model=true
             ├─ 构建 CLI 参数
             ├─ Profiles().__enter__()
@@ -1275,7 +1278,7 @@ seed_path.unlink()                   # ← 上一行正常返回才执行
 | 风险项 | 详情 |
 |--------|------|
 | **异常信息丢失** | `raise Exception(str(res.exception))` 将 dbt 异常转为字符串，丢失原始堆栈跟踪 |
-| **deps 失败静默继续** | `cli.invoke(['deps'] + args)` 执行后**不检查 success**，依赖安装失败时主任务仍继续执行，可能导致更隐蔽的错误 |
+| **deps 失败分两种模式** | **模式 A（success=False）**：不检查 success → 静默继续执行主任务，可能导致更隐蔽的错误；**模式 B（抛异常）**：立即中断，但 `with Profiles()` 保证临时目录清理 |
 | **静默失败** | `DBTAdapter.open()` 中异常被 `print()` 吞掉（非 debug 模式），返回 `None` 而非抛出异常 |
 | **dbt list 失败降级** | `upstream_dbt_blocks()` 中 `dbt list` 失败时降级为只返回自身 block，可能导致依赖图不完整 |
 | **Profiles 异步兼容** | `Profiles.profiles` 属性通过 `ThreadPoolExecutor` 处理异步上下文，但异常传播可能不完整 |
@@ -1294,7 +1297,7 @@ seed_path.unlink()                   # ← 上一行正常返回才执行
 | 风险项 | 详情 |
 |--------|------|
 | **SKIP_LIMIT_ADAPTER_NAMES** | SQL Server/Synapse/Fabric 适配器不支持 `--limit` 参数，代码中有常量定义但未在 `_execute_block` 中实际使用 |
-| **dbt deps 无重试** | `cli.invoke(['deps'] + args)` 无重试机制，网络不稳定时可能导致整个 block 执行失败 |
+| **dbt deps 无重试** | `cli.invoke(['deps'] + args)` 无重试机制，网络不稳定时模式 A（success=False）不中断但可能导致后续失败，模式 B（抛异常）才会导致整个 block 失败 |
 | **上游 block 无输出时** | `__create_upstream_tables()` 在上游输出为空时仅打印日志继续执行，可能导致 dbt 模型引用不存在的 source |
 
 ---
@@ -1385,9 +1388,10 @@ Mage AI 与 dbt 的集成实现了一条 **"配置插值 → 进程内命令执�
 ### 执行路径核心发现
 
 - **四条 Notebook 路径**：Preview(show) / Run / Test / Build，由 `run_settings` 控制，经 `run_settings or {}` 转换后进入 `__task()` 方法
-- **deps 无条件执行**：每次 block 执行必先跑 `dbt deps`，但不检查成功与否（潜在设计问题）
+- **deps 无条件执行**：每次 block 执行必先跑 `dbt deps`，但 **不检查 `success`**（仅模式 A 静默继续，模式 B 抛异常中断）
 - **show 双触发条件**：`needs_preview_df`（Notebook 预览）和 `needs_downstream_df`（下游非 dbt block），任一满足即执行 show
 - **输出键名分化**：Notebook 模式存 `df`，后台调度存 `output_0`，适配不同消费场景
+- **上游 seed 无条件执行**：所有路径（包括 Preview）的 `__create_upstream_tables()` 在 `_execute_block` 开头无条件执行，上游非 dbt block 输出始终会被 `dbt seed --full-refresh` 写入数据库
 
 ### Preview 副作用边界核心发现
 
