@@ -12,6 +12,31 @@ Trigger（触发器）与 Schedule（调度）是 Mage AI 中管道执行的两�
 执行层: PipelineRun → BlockRun
 ```
 
+```
+                ┌─────────────────┐
+                │  triggers.yaml  │  (配置层: Trigger)
+                └────────┬────────┘
+                         │ sync_schedules()
+                         ▼
+                ┌─────────────────┐
+                │ PipelineSchedule│  (调度层: DB 模型)
+                └────────┬────────┘
+         ┌───────────────┼───────────────┐
+         ▼               ▼               ▼
+    TimeTrigger    EventTrigger   API 触发
+    (定时轮询)     (事件驱动)    (主动调用)
+         │               │               │
+         └───────────────┼───────────────┘
+                         ▼
+                ┌─────────────────┐
+                │   PipelineRun   │  (执行层: 运行实例)
+                └────────┬────────┘
+                         ▼
+                ┌─────────────────┐
+                │    BlockRun     │  (细粒度执行)
+                └─────────────────┘
+```
+
 | 层级 | 概念 | 存储 | 核心职责 |
 |------|------|------|----------|
 | 配置层 | **Trigger** | 每个管道目录下的 `triggers.yaml` | 定义"什么时候以什么方式触发管道执行" |
@@ -39,19 +64,46 @@ Trigger 是基于 dataclass 的配置对象，定义在 `triggers.yaml` 文件�
 | `Trigger` | [L61-L117](./mage_ai/data_preparation/models/triggers/__init__.py#L61-L117) | Trigger 配置主类 |
 
 **Trigger 核心字段**：
-- `name`：触发器名称，与 `pipeline_uuid` 联合唯一
-- `schedule_type` / `schedule_interval`：触发类型与间隔
-- `start_time` / `last_enabled_at`：时间边界
-- `status`：启用状态
-- `variables` / `settings` / `sla`：运行配置
 
-**SettingsConfig 字段**：
-- `skip_if_previous_running`：前次运行未完成时跳过
-- `allow_blocks_to_fail`：允许部分 Block 失败
-- `create_initial_pipeline_run`：启用时立即创建初始运行
-- `landing_time_enabled`：启用落地时间机制
-- `pipeline_run_limit`：单触发器并发运行数限制
-- `timeout` / `timeout_status`：超时配置
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `name` | str | 触发器名称，与 `pipeline_uuid` 联合唯一 |
+| `pipeline_uuid` | str | 关联的管道 UUID |
+| `schedule_type` | ScheduleType | 类型：`TIME` / `EVENT` / `API` |
+| `schedule_interval` | str | 调度间隔：`@once` / `@hourly` / `@daily` / `@weekly` / `@monthly` / `@always_on` 或 cron 表达式 |
+| `start_time` | datetime | 开始时间 |
+| `status` | ScheduleStatus | 状态：`ACTIVE` / `INACTIVE` |
+| `last_enabled_at` | datetime | 上次启用时间（关键边界字段） |
+| `variables` | Dict | 运行时变量 |
+| `settings` | Dict | 高级设置（并发控制、landing time 等） |
+| `sla` | int | SLA 时间（秒） |
+| `envs` | List | 环境过滤 |
+| `token` | str | API 触发的安全令牌 |
+
+**ScheduleType 枚举**：
+- `TIME`：时间调度（最常用）
+- `EVENT`：事件触发
+- `API`：API 调用触发
+
+**ScheduleInterval 枚举**：
+- `@once`：只执行一次
+- `@hourly`：每小时
+- `@daily`：每天
+- `@weekly`：每周
+- `@monthly`：每月
+- `@always_on`：常驻运行（用于流式管道）
+
+**SettingsConfig 高级设置**：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `skip_if_previous_running` | bool | False | 前一次运行未完成时跳过 |
+| `allow_blocks_to_fail` | bool | False | 允许部分 Block 失败 |
+| `create_initial_pipeline_run` | bool | False | 启用时立即创建初始运行 |
+| `landing_time_enabled` | bool | False | 启用落地时间机制 |
+| `pipeline_run_limit` | int | None | 单个触发器并发运行数限制 |
+| `timeout` | int | None | 管道运行超时时间（秒） |
+| `timeout_status` | str | None | 超时后的状态 |
 
 **主要工具函数**：
 
@@ -80,7 +132,7 @@ PipelineSchedule 是数据库模型，对应 `pipeline_schedule` 表，是 Trigg
 | `next_execution_date()` | [L510-L534](./mage_ai/orchestration/db/models/schedules.py#L510-L534) | 计算下次执行日期 |
 | `should_schedule()` | [L537-L679](./mage_ai/orchestration/db/models/schedules.py#L537-L679) | **核心决策方法**，判断是否应该调度新运行 |
 | `landing_time_enabled()` | [L681-L693](./mage_ai/orchestration/db/models/schedules.py#L681-L693) | 是否启用落地时间 |
-| `runtime_history()` | [L725-L750](./mage_ai/orchestration/db/models/schedules.py#L725-L750) | 获取历史运行时长 |
+| `runtime_history()` | [L725-L750](./mage_ai/orchestration/db/models/schedules.py#L725-L750) | 获取历史运行时长（用于 landing time 预测） |
 
 **`should_schedule()` 判断逻辑**：
 
@@ -112,6 +164,11 @@ start_time 检查（非 landing_time 模式下）
 - `COMPLETED`：已完成
 - `FAILED`：失败
 - `CANCELLED`：已取消
+
+**核心属性**：
+- `execution_date`：执行日期（调度的逻辑时间）
+- `pipeline_schedule_id`：关联的调度 ID
+- `passed_sla`：是否超过 SLA
 
 **核心方法**：
 
@@ -346,11 +403,34 @@ schedule_all() 被调用
 - `True`：启动后立即调用 `schedule()` 推进 Block 执行（时间触发使用）
 - `False`：仅更新状态为 RUNNING，不立即调度（特殊场景使用）
 
-### 4.3 事件触发：schedule_with_event()
+**状态流转**：
+
+```
+PipelineRun:
+  INITIAL → RUNNING → COMPLETED
+                      → FAILED (Block 失败 / 超时)
+                      → CANCELLED (手动取消)
+
+BlockRun:
+  INITIAL → QUEUED → RUNNING → COMPLETED
+                                  → FAILED
+                                  → UPSTREAM_FAILED (级联)
+                                  → CONDITION_FAILED
+```
+
+### 4.3 时间触发流程
+
+**入口**：[`mage_ai/orchestration/triggers/loop_time_trigger.py`](./mage_ai/orchestration/triggers/loop_time_trigger.py)
+
+由 `LoopTimeTrigger` 定时循环调用 `schedule_all()`，流程见 4.1 节。
+
+### 4.4 事件触发：schedule_with_event()
 
 **文件**：[`mage_ai/orchestration/pipeline_scheduler_original.py`](./mage_ai/orchestration/pipeline_scheduler_original.py)
 
 **函数起始行**：[L2067-L2108](./mage_ai/orchestration/pipeline_scheduler_original.py#L2067-L2108)
+
+**入口**：[`mage_ai/orchestration/triggers/event_trigger.py`](./mage_ai/orchestration/triggers/event_trigger.py)
 
 **流程**：
 1. 获取所有活跃 EventMatcher
@@ -358,7 +438,7 @@ schedule_all() 被调用
 3. 对匹配成功的调度，创建 PipelineRun
 4. 事件数据通过 `variables.event` 传递给管道
 
-### 4.4 配置同步：sync_schedules()
+### 4.5 配置同步：sync_schedules()
 
 **文件**：[`mage_ai/orchestration/pipeline_scheduler_original.py`](./mage_ai/orchestration/pipeline_scheduler_original.py)
 
@@ -369,7 +449,7 @@ schedule_all() 被调用
 2. 按环境过滤（`envs` 字段）
 3. 调用 `PipelineSchedule.create_or_update_batch()` 批量同步
 
-### 4.5 SLA 检查：check_sla()
+### 4.6 SLA 检查：check_sla()
 
 **函数起始行**：[L1606-L1654](./mage_ai/orchestration/pipeline_scheduler_original.py#L1606-L1654)
 
@@ -538,20 +618,46 @@ HTTP API 请求
 
 **代码位置**：[L614-L640](./mage_ai/orchestration/db/models/schedules.py#L614-L640)
 
-避免调度器启用时追溯历史执行日期。
+避免调度器启用时追溯历史执行日期：
+- 如果 `last_enabled_at` 存在且 `create_initial_pipeline_run` 为 False
+- 且 `current_execution_date < last_enabled_at`
+- 则不创建运行，等待下一个执行周期
 
-### 7.3 Landing Time 机制
+### 7.3 时区与时间计算
+
+**关键函数**：`current_execution_date()` [L438-L508](./mage_ai/orchestration/db/models/schedules.py#L438-L508) 和 `next_execution_date()` [L510-L534](./mage_ai/orchestration/db/models/schedules.py#L510-L534)
+
+**执行日期计算规则**：
+
+| 间隔类型 | 计算方式 |
+|----------|----------|
+| `@once` / `@always_on` | 当前时间 |
+| `@hourly` | 整点（分秒清零） |
+| `@daily` | 当天 0 点（时分秒清零） |
+| `@weekly` | 本周一 0 点 |
+| `@monthly` | 本月 1 号 0 点 |
+| cron 表达式 | 通过 croniter 计算上一个匹配时间 |
+
+**时区处理**：
+- 数据库存储带时区信息（`DateTime(timezone=True)`）
+- 比较时统一转换为 UTC（`pytz.UTC`）
+
+### 7.4 Landing Time 机制
 
 **代码位置**：[L660-L676](./mage_ai/orchestration/db/models/schedules.py#L660-L676)
 
-确保管道在指定时间点前完成：
+确保管道在指定时间点前完成（落地时间）：
 1. 收集最近 7 次历史运行时长
 2. 计算 `平均运行时间 + 标准差/2` 作为缓冲
 3. 当前时间 ≥ 预期执行时间 − (平均 + 缓冲) → 开始调度
 
+**特点**：
+- 仅对 TIME 类型且间隔为 HOURLY/DAILY/WEEKLY/MONTHLY 生效
+- `start_time` 被解释为"完成截止时间"而非"开始时间"
+
 **注意**：启用 Landing Time 后，`start_time` 的语义从"开始时间"变为"完成截止时间"。
 
-### 7.4 两级超时
+### 7.5 两级超时
 
 | 级别 | 配置位置 | 检查时机 |
 |------|----------|----------|
@@ -595,6 +701,8 @@ HTTP API 请求
 | `should_schedule()` | schedules.py | L537 | 单个调度是否需要执行 |
 | `PipelineRun.create()` | schedules.py | L1353 | 创建运行（含去重逻辑） |
 | `ApiTriggerPipelineHandler.post()` | server/api/triggers.py | L18 | API 触发入口 |
+| `current_execution_date()` | schedules.py | L438 | 计算当前执行日期 |
+| `EventMatcher.match()` | schedules.py | L2007 | 事件模式匹配 |
 
 ---
 
@@ -605,15 +713,17 @@ HTTP API 请求
 1. **统一调度入口**：所有触发方式（时间/事件/API）最终都通过 `schedule_all()` 的并发控制，行为一致
 2. **异步解耦**：API 触发只创建 `INITIAL` 记录，不立即执行，避免阻塞 API 请求
 3. **双层配置**：yaml 配置 + DB 持久化，兼顾代码化管理与运行时状态
-4. **细粒度并发**：三级并发限制，灵活控制不同层面的并行度
-5. **分布式锁**：原生支持多实例部署，避免重复调度
+4. **多触发模式**：支持时间、事件、API 三种触发方式
+5. **细粒度并发**：三级并发限制（触发器级、管道级、Block 级）
+6. **Landing Time**：智能预测启动时间，确保按时完成
+7. **分布式锁**：原生支持多实例部署，避免重复调度
 
 ### 复杂度来源
 
 1. **状态机组合**：PipelineRun 5 种状态 × BlockRun 8 种状态
 2. **边界条件交织**：`start_time`、`last_enabled_at`、`landing_time`、skip 策略等多个条件共同作用
 3. **两层触发体系**：Trigger（配置层）与 PipelineSchedule（运行层）的同步与映射
-4. **并发策略叠加**：三级限制 × 两种超限策略
+4. **并发策略叠加**：三级限制 × 两种超限策略，行为推理成本高
 
 ### 关键理解点
 
@@ -623,3 +733,4 @@ HTTP API 请求
 4. **INITIAL 状态是排队池**：所有触发方式创建的运行都先进入 `INITIAL`，由 `schedule_all()` 按优先级和配额启动
 5. **Landing Time 反转语义**：启用后 `start_time` 从"开始时间"变为"完成截止时间"
 6. **两级超限策略独立**：单触发器限制和管道全触发器限制分别计算，超限行为取决于 `on_pipeline_run_limit_reached`
+7. **`last_enabled_at` 边界**：避免调度器启用时追溯历史执行日期，确保只调度启用后的运行
