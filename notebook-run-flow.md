@@ -330,33 +330,177 @@ def execute_block_function(self, block_function, input_vars, **kwargs):
 
 ---
 
-## 三、变量持久化通道
+## 三、变量持久化通道 - 三种写入路径完整区分
 
-### 3.1 `store_variables()` - 写入磁盘
+`_store_variables_in_block_function` 是关键枢纽。它在 `execute_sync` 中被定义为闭包，绑定了执行上下文参数（`execution_partition`, `dynamic_block_index` 等），然后在三个不同路径下被调用。
+
+[block/__init__.py#L1524-L1550](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1524-L1550)
+
+```python
+# 在 execute_sync 内部定义的闭包
+def __store_variables(variable_mapping, ...):
+    return self.store_variables(
+        variable_mapping,
+        execution_partition=execution_partition,
+        dynamic_block_index=dynamic_block_index,
+        ...  # 绑定了上下文参数
+    )
+
+self._store_variables_in_block_function = __store_variables
+```
+
+---
+
+### 3.1 路径1：普通返回值写入（同步批量写入）
+
+**触发条件**：函数返回普通值（非生成器），且 `store_variables=True`
+
+**调用位置**：`execute_sync()` 内，`execute_block()` 返回之后 [block/__init__.py#L1590-L1640](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1590-L1640)
+
+**调用链**：
+```
+execute_sync()
+  └─ execute_block() → execute_block_function()
+        ├─ output = block_function(*input_vars)  # 函数返回普通值
+        └─ return output
+  ├─ block_output = self.post_process_output(output)
+  ├─ variable_mapping = dict(zip(['output_0', 'output_1'], block_output))
+  └─ self._store_variables_in_block_function(variable_mapping)  ← 这里调用
+        └─ self.store_variables(variable_mapping, ...)
+              └─ variable_manager.add_variable(...)  ← 写入磁盘
+```
+
+**变量名格式**：`output_0`, `output_1`, `output_2`...
+
+**关键代码**：
+```python
+# execute_sync L1612-L1633
+output_count = len(block_output)
+variable_keys = [f'output_{idx}' for idx in range(output_count)]
+variable_mapping = dict(zip(variable_keys, block_output))
+
+if store_variables and self.pipeline and self.pipeline.type != PipelineType.INTEGRATION:
+    if self._store_variables_in_block_function and isinstance(variable_mapping, dict):
+        self._store_variables_in_block_function(variable_mapping)
+```
+
+---
+
+### 3.2 路径2：生成器分批写入（流式逐批写入）
+
+**触发条件**：`MEMORY_MANAGER_V2=True` 且 `inspect.isgeneratorfunction(block_function_updated)` [block/__init__.py#L2173](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L2173)
+
+**调用位置**：`execute_block_function()` 内部，遍历生成器时 [block/__init__.py#L2193-L2242](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L2193-L2242)
+
+**调用链**：
+```
+execute_block_function()
+  ├─ output = block_function_updated(*input_vars)  # 返回生成器对象
+  └─ if MEMORY_MANAGER_V2 and inspect.isgeneratorfunction(...):
+        ├─ delete_variables(...)  ← 先清空旧数据
+        └─ for data in output:     ← 遍历生成器，逐批处理
+              ├─ __output_key(0, output_count)  ← 生成变量名
+              │     └─ os.path.join(f'output_0', str(output_count))
+              │        变量名格式：output_0/0, output_0/1, output_0/2...
+              ├─ variable_mapping = {'output_0/0': data_batch_0}
+              ├─ self._store_variables_in_block_function(
+                    variable_mapping,
+                    clean_variable_uuid=False,
+                    skip_delete=True,
+                    override_outputs=False if output_count >= 1 else True
+                 )
+              │     └─ variable_manager.add_variable(...)  ← 每批写入一次
+              └─ output_count += 1
+        
+        ├─ # 最后再存一次变量类型
+        ├─ self._store_variables_in_block_function(
+              {'output_0': variable_types},
+              save_variable_types_only=True
+           )
+        └─ self._store_variables_in_block_function = None  ← 重要！设为 None，阻止外层再次写入
+```
+
+**关键特征**：
+- 变量名用 `/` 分隔分批：`output_0/0`, `output_0/1`, `output_0/2`...
+- 每批数据独立写入磁盘，支持流式处理大数据
+- 遍历完成后 `_store_variables_in_block_function` 被设为 `None`，因此 `execute_sync` 外层的第二次写入不会执行（L1630 的 `if self._store_variables_in_block_function` 为 False）
+
+---
+
+### 3.3 路径3：PySpark 本地补写（远程执行后本地补写）
+
+**触发条件**：PySpark 内核 + Block 类型是 `DATA_LOADER` 或 `TRANSFORMER` [output_display.py#L303-L314](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/utils/output_display.py#L303-L314)
+
+**调用位置**：`get_block_output_process_code()` 返回的代码，通过第三次代码注入，在 Spark 执行完成后，用 `%%local` 在本地端执行
+
+**调用链**：
+```
+WebSocketServer.__execute_block()
+  ├─ code = add_execution_code(...)  ← 第1次注入，代码会在 Spark 端执行
+  ├─ code = add_internal_output_info(code, ...)  ← 第2次注入
+  ├─ client.execute(code)  ← 在 Spark 端执行，结果存在 Spark 集群
+  └─ block_output_process_code = get_block_output_process_code(...)  ← 第3次注入
+        └─ client.execute(block_output_process_code)  ← 在 %%local 本地端执行
+              └─ 执行的代码：
+                 %%local
+                 from mage_ai.data_preparation.models.pipeline import Pipeline
+                 block_uuid='load_data'
+                 pipeline = Pipeline(uuid='my_pipeline', repo_path='...')
+                 block = pipeline.get_block(block_uuid)
+                 variable_mapping = dict(df=df)  # df 是从 Spark 拉到本地的
+                 block.store_variables(variable_mapping)  ← 直接调用，不走闭包
+                 block.analyze_outputs(variable_mapping)
+                 block.update_status(BlockStatus.EXECUTED)
+```
+
+**关键特征**：
+- 直接调用 `block.store_variables()`，不走 `_store_variables_in_block_function` 闭包
+- 在 `%%local` 模式下执行，运行在本地 Python 进程，不是 Spark 集群
+- `df` 变量是通过 Spark magic 的 `-o df` 参数从 Spark 端自动拉取到本地的
+- 除了存储变量，还会调用 `analyze_outputs()` 和 `update_status()`
+
+---
+
+### 3.4 `store_variables()` - 统一写入入口
 
 [block/__init__.py#L3776-L3861](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L3776-L3861)
 
+三条路径最终都会调用这个方法：
+
 ```python
 def store_variables(self, variable_mapping, **kwargs):
-    # variable_mapping: {'output_0': data1, 'output_1': data2, ...}
+    block_uuid, changed = uuid_for_output_variables(...)
     
-    variables_data = self.__store_variables_prepare(...)
+    if save_variable_types_only:
+        # 生成器路径最后保存类型元信息
+        for variable_uuid, variable_types in variable_mapping.items():
+            self.variable_manager.add_variable_types(
+                self.pipeline_uuid, block_uuid, variable_uuid, variable_types, ...
+            )
+        return []
     
+    variables_data = self.__store_variables_prepare(variable_mapping, ...)
+    
+    variables = []
     for uuid, data in variables_data['variable_mapping'].items():
-        # 调用 VariableManager 写入磁盘
-        self.variable_manager.add_variable(
-            self.pipeline_uuid,
-            block_uuid,
-            uuid,           # 变量名，如 'output_0'
-            data,           # 实际数据
-            partition=execution_partition,
-            ...
+        # PySpark Pipeline 的 pandas DataFrame 自动转 Spark DataFrame
+        if spark is not None and self.pipeline.type == PipelineType.PYSPARK and isinstance(data, pd.DataFrame):
+            data = spark.createDataFrame(data)
+        
+        variables.append(
+            self.variable_manager.add_variable(
+                self.pipeline_uuid,
+                block_uuid,
+                uuid,
+                data,
+                ...
+            )
         )
     
     return variables
 ```
 
-### 3.2 `VariableManager.add_variable()` - 实际写入
+### 3.5 `VariableManager.add_variable()` - 实际写入磁盘
 
 [variable_manager.py#L61-L150](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/data_preparation/variable_manager.py#L61-L150)
 
@@ -381,37 +525,131 @@ def add_variable(self, pipeline_uuid, block_uuid, variable_uuid, data, ...):
     return variable
 ```
 
-### 3.3 `get_outputs()` - 读取并格式化输出
-
-[block/__init__.py#L2639-L2725](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L2639-L2725)
-
-在 `__custom_output()` 中被调用，用于前端显示：
-
-```python
-def get_outputs(self, ...):
-    # 从磁盘读取变量
-    return get_outputs_for_display_sync(
-        self,
-        sample=True,
-        sample_count=DATAFRAME_SAMPLE_COUNT_PREVIEW,  # 默认 100 行
-        ...
-    )
-```
-
-### 3.4 存储目录结构
+### 3.6 存储目录结构
 
 ```
 variables/
   └── {pipeline_uuid}/
       └── {block_uuid}/
-          ├── output_0/
-          │   ├── data.parquet      # 数据文件
-          │   └── metadata.json     # 元信息（类型、shape、sample 等）
+          ├── output_0/                    # 普通路径
+          │   ├── data.parquet
+          │   └── metadata.json
+          ├── output_0/                    # 生成器路径（分批）
+          │   └── 0/
+          │       ├── data.parquet
+          │       └── metadata.json
+          │   └── 1/
+          │       ├── data.parquet
+          │       └── metadata.json
           ├── output_1/
           │   └── ...
           └── {variable_uuid}/
               └── ...
 ```
+
+---
+
+### 3.7 输出展示读取的准确时机
+
+**不是一次读取，是两次读取，分别在不同位置**：
+
+#### 读取1：动态 child block - 在 `run_task()` 中
+
+[execute_custom_code.py#L62-L99](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/utils/execute_custom_code.py#L62-L99)
+
+```python
+def run_task(block, execute_kwargs, callback=None, custom_code=None, ...):
+    output_dict = block.execute_with_callback(**execute_kwargs)  # 先执行
+    
+    if callback:
+        callback(block)
+    
+    if run_tests:
+        block.run_tests(...)
+    
+    # 执行完成后，立即读取输出
+    outputs = block.get_outputs(dynamic_block_index=dynamic_block_index)
+    if outputs is not None and len(outputs) >= 1:
+        _json_string = simplejson.dumps(outputs, default=encode_complex, ignore_nan=True)
+        return print(render_output_tags(_json_string))  # 打印输出
+    
+    output = []
+    if output_dict and output_dict.get('output'):
+        output = output_dict.get('output')
+    
+    return output
+```
+
+**调用时机**：在 `execute_custom_code()` 内部，`execute_with_callback()` 完成后立即调用。
+
+**适用场景**：动态 child block（`is_dynamic_child=True`），在 `run_tasks()` 中被循环调用。
+
+#### 读取2：普通 block - 在 `__custom_output()` 中
+
+[custom_output.py#L46-L63](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/utils/custom_output.py#L46-L63)
+
+```python
+def __custom_output():
+    pipeline = Pipeline.get('{pipeline_uuid}', repo_path='{repo_path}')
+    block = pipeline.get_block('{block_uuid}', ...)
+    
+    if block.executable:
+        if is_dynamic_child:
+            # dynamic child 的输出已经在 run_task 中打印了，这里直接返回
+            return
+        
+        # 普通 block 走这里
+        outputs = block.get_outputs()  ← 从磁盘读取
+        
+        if outputs is not None and isinstance(outputs, list):
+            outputs = outputs[: int('{DATAFRAME_SAMPLE_COUNT_PREVIEW}')]
+        
+        if outputs is not None and len(outputs) >= 1:
+            _json_string = simplejson.dumps(outputs, default=encode_complex, ignore_nan=True)
+            return print(render_output_tags(_json_string))  # 打印输出
+    
+    # ... 后续处理最后一个表达式
+```
+
+**调用时机**：`execute_custom_code()` 返回后，第2次代码注入的 `__custom_output()` 被调用。
+
+**适用场景**：普通 block（非动态 child）。
+
+**完整执行顺序**：
+```
+exec(完整代码)
+  ├─ execute_custom_code()
+  │   ├─ block.execute_with_callback()
+  │   │   └─ execute_sync()
+  │   │       ├─ _store_variables_in_block_function = __store_variables  ← 闭包赋值
+  │   │       ├─ execute_block()
+  │   │       │   └─ execute_block_function()
+  │   │       │       ├─ output = block_function()  ← 执行用户函数
+  │   │       │       └─ 生成器路径：遍历并分批 store_variables
+  │   │       │          普通路径：只返回 output
+  │   │       └─ 普通路径：_store_variables_in_block_function(variable_mapping)  ← 写入磁盘
+  │   │          生成器路径：_store_variables_in_block_function 已设为 None，跳过
+  │   ├─ block.run_tests()
+  │   └─ return output
+  │
+  └─ __custom_output()  ← 第2次注入的代码，在 execute_custom_code() 之后执行
+      ├─ block.get_outputs()  ← 从磁盘读取刚才写入的数据
+      └─ print(render_output_tags(json))  ← 打印格式化输出
+```
+
+---
+
+### 3.8 三种写入路径对比表
+
+| 维度 | 路径1：普通返回值 | 路径2：生成器分批 | 路径3：PySpark 本地补写 |
+|------|-------------------|-------------------|-------------------------|
+| **触发条件** | 函数返回普通值 | `MEMORY_MANAGER_V2=True` + 生成器函数 | PySpark 内核 + DATA_LOADER/TRANSFORMER |
+| **调用位置** | `execute_sync` 外层 | `execute_block_function` 内部 | `%%local` 注入代码 |
+| **调用入口** | `_store_variables_in_block_function` | `_store_variables_in_block_function` | 直接 `block.store_variables()` |
+| **写入时机** | 函数返回后，一次写入 | 遍历生成器时，每批写入一次 | Spark 执行完后，本地端补写 |
+| **变量名格式** | `output_0`, `output_1` | `output_0/0`, `output_0/1`, `output_0/2` | `output_0`, `output_1` |
+| **后续外层写入** | 执行 | 不执行（设为 None） | 不涉及 |
+| **读取时机** | `__custom_output()` 中 | `__custom_output()` 中（dynamic child 走 `run_task()`） | `__custom_output()` 中 |
 
 ---
 
@@ -525,27 +763,36 @@ class ExecutionStatus(StrEnum):
    │  └─ execute_custom_code()
    │     ├─ block = pipeline.get_block()
    │     ├─ block.run_upstream_blocks() ← 可选，运行上游
-   │     ├─ block.execute_with_callback()
-   │     │  ├─ execute_sync()
-   │     │  │  └─ execute_block()
-   │     │  │     ├─ __get_outputs_from_input_vars()
-   │     │  │     │  └─ fetch_input_variables() ← 从磁盘读上游
-   │     │  │     └─ _execute_block()
-   │     │  │        ├─ exec(self.content, results)
-   │     │  │        └─ execute_block_function()
-   │     │  │           ├─ outputs = block_function(*input_vars)
-   │     │  │           └─ store_variables() ──────┐
-   │     │  │                                        ▼
-   │     │  │                                     写入磁盘
-   │     │  ├─ store_variables() ← 再次持久化（如有）
-   │     │  └─ analyze_outputs()
-   │     ├─ block.run_tests() ← 运行测试
+   │     ├─ is_dynamic_child 判断
+   │     │  ├─ 是 → run_tasks() → 循环调用 run_task()
+   │     │  │     ├─ block.execute_with_callback(**options)
+   │     │  │     ├─ block.run_tests(...)
+   │     │  │     └─ outputs = block.get_outputs() ← 读取1：动态 child 展示读
+   │     │  │        └─ print(render_output_tags(json))
+   │     │  └─ 否 → block.execute_with_callback(**options)
+   │     │        ├─ execute_sync()
+   │     │        │  ├─ _store_variables_in_block_function = __store_variables ← 闭包赋值
+   │     │        │  ├─ execute_block()
+   │     │        │  │  ├─ __get_outputs_from_input_vars()
+   │     │        │  │  │  └─ fetch_input_variables() ← 读取2：输入数据读（上游）
+   │     │        │  │  └─ _execute_block()
+   │     │        │  │     ├─ exec(self.content, results)
+   │     │        │  │     └─ execute_block_function()
+   │     │        │  │        ├─ output = block_function(*input_vars)
+   │     │        │  │        └─ 生成器路径：遍历 output，分批 store_variables()
+   │     │        │  │              变量名：output_0/0, output_0/1...
+   │     │        │  │              最后 _store_variables_in_block_function = None
+   │     │        │  └─ 普通路径：_store_variables_in_block_function(variable_mapping) ← 写入1
+   │     │        │     生成器路径：已设为 None，跳过
+   │     │        └─ analyze_outputs()
+   │     ├─ block.run_tests(...) ← 运行测试
    │     └─ return output
    │
    └─ __custom_output() ← 第2次注入的代码
-      ├─ block.get_outputs() ← 从磁盘读刚才存的
+      ├─ if is_dynamic_child: return ← 互斥：动态 child 已在 run_task 打印
+      ├─ block.get_outputs() ← 读取3：普通 block 展示读
       │  └─ VariableManager.get_variable()
-      ├─ format_output_data() ← 格式化（采样、类型转换）
+      ├─ 变量类型判断和格式化
       └─ print(render_output_tags(json))
          │
          ▼
@@ -571,33 +818,83 @@ class ExecutionStatus(StrEnum):
    └─ 渲染到 UI
 ```
 
-### 5.2 关键点：两次读取磁盘
+### 5.2 关键点：读取磁盘的三个时机
 
-注意这个容易混淆的细节：
+不是两次，是三次读取，分工明确：
 
-1. **第一次读磁盘**：`__get_outputs_from_input_vars()` → `fetch_input_variables()`
-   - 时机：Block 执行 **前**
-   - 目的：读取上游 Block 的输出，作为本 Block 的输入
+1. **第一次读磁盘（输入数据）**：`__get_outputs_from_input_vars()` → `fetch_input_variables()`
+   - 时机：Block 代码执行 **前**
+   - 目的：读取上游 Block 的输出，作为本 Block 的输入参数
    - 路径：上游 Block 的 variables 目录
+   - 代码位置：[block/__init__.py#L1855-L1860](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1855-L1860)
 
-2. **第二次读磁盘**：`__custom_output()` → `block.get_outputs()`
-   - 时机：Block 执行 **后**
-   - 目的：读取本 Block 刚写入的输出，格式化后显示给用户
+2. **第二次读磁盘（动态 child 输出展示）**：`run_task()` → `block.get_outputs()`
+   - 时机：`execute_with_callback()` 完成后，`execute_custom_code()` 内部
+   - 目的：读取本 Block 刚写入的输出，格式化后打印，供动态 child block 展示
    - 路径：本 Block 的 variables 目录
+   - 代码位置：[execute_custom_code.py#L86-L93](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/utils/execute_custom_code.py#L86-L93)
 
-### 5.3 关键点：两次写入磁盘
+3. **第三次读磁盘（普通 block 输出展示）**：`__custom_output()` → `block.get_outputs()`
+   - 时机：`execute_custom_code()` 返回后，第2次注入的 `__custom_output()` 中
+   - 目的：读取本 Block 刚写入的输出，格式化后打印，供普通 block 展示
+   - 路径：本 Block 的 variables 目录
+   - 代码位置：[custom_output.py#L51-L63](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/utils/custom_output.py#L51-L63)
 
-同样有两次写入：
+**关键互斥**：第二次和第三次读取是互斥的。`__custom_output()` 中会判断 `if is_dynamic_child: return`，所以动态 child block 走第二次读取，普通 block 走第三次读取。
 
-1. **第一次写入**：`execute_block_function()` 内部 → `store_variables()`
-   - 时机：主函数执行完成后立即
-   - 目的：持久化函数返回值，供下游 Block 使用
-   - 控制：`store_variables` 参数控制
+---
 
-2. **第二次写入**：`execute_sync()` → `store_variables()`
-   - 时机：整个 Block 执行完成后
-   - 目的：再次持久化（处理一些边缘情况）
-   - 控制：`store_variables` 参数控制
+### 5.3 关键点：写入磁盘的三种路径
+
+不是两次，是三条独立路径，互斥执行（每次 Block 运行只走其中一条）：
+
+| 路径 | 触发条件 | 写入位置 | 写入次数 |
+|------|----------|----------|----------|
+| **路径1：普通返回值** | 函数返回非生成器 | `execute_sync` 外层 | 1次 |
+| **路径2：生成器分批** | MEMORY_MANAGER_V2=True + 生成器函数 | `execute_block_function` 内部遍历生成器时 | N次（每批一次）+ 1次存类型 |
+| **路径3：PySpark 本地补写** | PySpark 内核 + DATA_LOADER/TRANSFORMER | `%%local` 注入代码 | 1次 |
+
+**关键互斥**：
+- 生成器路径下，`_store_variables_in_block_function` 最后被设为 `None`，因此 `execute_sync` 外层的写入不会执行
+- PySpark 路径下，`store_variables` 直接调用，不走 `_store_variables_in_block_function` 闭包
+- 普通路径下，只有 `execute_sync` 外层的一次写入
+
+**完整执行顺序对比**：
+
+```
+普通返回值路径：
+execute_sync()
+  ├─ _store_variables_in_block_function = __store_variables
+  ├─ execute_block()
+  │   └─ execute_block_function()
+  │       ├─ output = block_function()  ← 返回普通值
+  │       └─ return output  ← 不做任何写入
+  └─ _store_variables_in_block_function(variable_mapping)  ← 这里写入一次
+
+
+生成器分批路径：
+execute_sync()
+  ├─ _store_variables_in_block_function = __store_variables
+  ├─ execute_block()
+  │   └─ execute_block_function()
+  │       ├─ output = block_function()  ← 返回生成器对象
+  │       └─ for data in output:        ← 遍历生成器
+  │             └─ _store_variables_in_block_function(...)  ← 每批写入一次
+  │       ├─ _store_variables_in_block_function(...)  ← 最后存一次类型
+  │       └─ _store_variables_in_block_function = None  ← 设为 None
+  └─ if _store_variables_in_block_function:  ← 条件为 False，跳过
+         _store_variables_in_block_function(...)
+
+
+PySpark 本地补写路径：
+client.execute(code)  ← Spark 端执行 add_execution_code 注入的代码
+  └─ execute_custom_code()
+      └─ block.execute_with_callback()
+          └─ ...  ← Spark 端执行，数据在 Spark 集群
+
+client.execute(block_output_process_code)  ← 本地端执行 %%local 代码
+  └─ block.store_variables(variable_mapping)  ← 直接调用，写入本地磁盘
+```
 
 ---
 
@@ -626,10 +923,25 @@ class ExecutionStatus(StrEnum):
 - **SSE**：单向，后端推结果用（stdout、执行状态、输出数据）
 - WebSocket 也可以推结果，但 Magic Kernel 用 SSE 专门推执行结果，传统 Jupyter Kernel 用 WebSocket 推
 
-### Q2: `store_variables` 和 `get_outputs` 什么关系？
-- 时序：先 `store_variables` 写磁盘 → 再 `get_outputs` 读磁盘
-- 目的：`store_variables` 为了持久化（给下游 Block 用），`get_outputs` 为了显示（给前端看）
-- 位置：都在同一次内核执行中，`store_variables` 在 `execute_block_function` 内部，`get_outputs` 在 `__custom_output` 中
+### Q2: `store_variables` 有几条调用路径？`get_outputs` 在什么时候读？
+
+**写入有三条互斥路径**：
+1. **普通返回值**：`execute_sync` 外层调用 `_store_variables_in_block_function(variable_mapping)`，写入一次
+2. **生成器分批**：`execute_block_function` 内部遍历生成器，每批调用一次，最后存一次类型，然后设为 `None` 阻止外层写入
+3. **PySpark 本地补写**：`%%local` 注入代码直接调用 `block.store_variables(variable_mapping)`，不走闭包
+
+**读取有三次，分工不同**：
+1. **输入读**：`__get_outputs_from_input_vars()` → 执行前读上游数据
+2. **动态 child 展示读**：`run_task()` → `block.get_outputs()` → `execute_with_callback` 完成后立即读
+3. **普通 block 展示读**：`__custom_output()` → `block.get_outputs()` → `execute_custom_code()` 返回后读
+
+**时序关系**：每次都是先写（三条路径之一）→ 再读（第2或第3次读取）
+
+### Q6: 生成器路径下为什么 `_store_variables_in_block_function` 要设为 `None`？
+- 目的：阻止 `execute_sync` 外层的重复写入
+- 机制：生成器在 `execute_block_function` 内部已经分批写入完成了
+- 代码：[block/__init__.py#L2242](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L2242)
+- 外层判断：[block/__init__.py#L1630](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1630) 的 `if self._store_variables_in_block_function` 为 False，跳过
 
 ### Q3: 三次代码注入分别干什么？
 1. `add_execution_code`：包装成 `execute_custom_code()` 函数调用
