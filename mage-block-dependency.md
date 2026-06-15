@@ -477,6 +477,12 @@ completed = (
 - 即便 `allow_blocks_to_fail=True`，普通上游块 FAILED 时下游仍不可执行
 - 此分支内处理了数据集成子块、Hook 块、动态上游子块等特殊情况，通过 `upstream_block_uuids_override` 覆盖上游 UUID 列表
 
+**重要**：进入三条分支之前，调度主循环已先调用 `update_block_run_statuses`（`pipeline_executor.py:157-158`）对所有 `INITIAL` 状态块做了状态传播。因此：
+
+- 若某块的普通上游已 FAILED，该块已被标记为 `UPSTREAM_FAILED`，不会出现在 `initial_block_runs` 中，也就不会进入分支三的检查（`executable_block_runs` 只遍历 `self.initial_block_runs`，见 `schedules.py:1077`）
+- 动态上游场景下，`update_block_run_statuses` 同样会将下游 INITIAL 块标记为 `UPSTREAM_FAILED`；但 `allow_blocks_to_fail=True` 时，`executable_block_runs` 分支二使用 `finished_block_uuids` 做完成判定，此时 `UPSTREAM_FAILED` 属于 `finished`，下游块可进入 executable
+- 完成判定 `all_blocks_completed(allow_blocks_to_fail)` 在循环入口被调用（`pipeline_executor.py:156`），其逻辑与 `allow_blocks_to_fail` 联动：为 True 时 FAILED/UPSTREAM_FAILED 视为"已完成"，调度循环可正常退出
+
 #### 6.1.3 上游完成性校验
 
 `all_upstream_blocks_completed`（`block/__init__.py:1273-1291`）实现细粒度检查：
@@ -509,7 +515,7 @@ def all_upstream_blocks_completed(
 | **拓扑边界** | 块必须在所有上游块完成后才能执行 | 所有块 |
 | **类型边界** | `CHART`、`MARKDOWN`、`SCRATCHPAD` 类型不参与 Pipeline 执行（`constants.py:157-161`） | 特定块类型 |
 | **条件边界** | 条件块失败时，下游块跳过执行 | 条件块下游 |
-| **失败边界** | 上游 FAILED 时：普通上游的下游始终不可执行；动态上游的下游仅在 `allow_blocks_to_fail=True` 时可执行 | 失败块下游 |
+| **失败边界** | 上游 FAILED 时：状态传播先将下游 INITIAL 块标记为 UPSTREAM_FAILED，使其不再进入筛选范围；动态上游场景下 `allow_blocks_to_fail=True` 时分支二用 `finished_block_uuids` 判定，下游如仍为 INITIAL 可继续执行 | 失败块下游 |
 | **动态边界** | 动态块的子实例需全部完成后，下游才能执行 | 动态块下游 |
 | **集成边界** | 数据集成块的 controller/child 有特殊的执行顺序约束（`schedules.py:1046-1074`） | 集成块内部 |
 
@@ -822,40 +828,55 @@ def __execute_with_retry():
 
 ### 9.1 完整调度与状态更新循环
 
+调度主循环的每个迭代严格按 **完成判定 → 状态传播 → 可执行筛选 → 批量执行** 的顺序进行：
+
 ```
 PipelineExecutor.__run_blocks()                  pipeline_executor.py:94-171
-└── WHILE not all_blocks_completed():
-    ├── [1] update_block_run_statuses()          schedules.py:1223-1301
+└── WHILE not all_blocks_completed(allow_blocks_to_fail):   [阶段0] 循环入口完成判定
+    │                                                 pipeline_executor.py:156
+    │
+    ├── [阶段1] update_block_run_statuses()          schedules.py:1223-1301
+    │   │                                           pipeline_executor.py:157-158
+    │   ├── 遍历 initial_block_runs（仅 INITIAL 状态）
     │   ├── 传播 FAILED → UPSTREAM_FAILED
     │   ├── 传播 CONDITION_FAILED → CONDITION_FAILED
-    │   └── 递归直到无更新
+    │   └── 递归直到无更新（本轮无状态变化则停止）
     │
-    ├── [2] executable_block_runs()              schedules.py:978-1221
+    ├── [阶段2] executable_block_runs()              schedules.py:978-1221
+    │   │                                           pipeline_executor.py:159-161
     │   ├── 构建 completed/finished UUID 集合
-    │   ├── 遍历 initial_block_runs
+    │   ├── 遍历 initial_block_runs（阶段1后仍为 INITIAL 的块）
     │   ├── 分支一：动态块子实例 → check_all_dynamic_upstreams_completed
     │   ├── 分支二：带动态上游的块 → allow_blocks_to_fail 控制 finished/completed
-    │   ├── 分支三：普通块 → all_upstream_blocks_completed(completed_block_uuids)
-    │   └── 返回可执行列表
+    │   └── 分支三：普通块 → all_upstream_blocks_completed(completed_block_uuids)
     │
-    └── [3] 并行执行 executable_block_runs
-        ├── 每个 BlockExecutor._execute()        block_executor.py:330-700
+    ├── [阶段3] 无可执行块则提前 return               pipeline_executor.py:162-163
+    │
+    └── [阶段4] 并行执行 executable_block_runs        pipeline_executor.py:164-171
+        ├── 每个 BlockExecutor._execute()            block_executor.py:330-700
         │   ├── _execute_conditional() → False 则直接 CONDITION_FAILED
         │   ├── execute_sync() → 更新 BlockStatus
         │   └── __update_block_run_status() → 更新 BlockRunStatus
         └── 收集输出到缓存
 ```
 
+**关键顺序约束**：
+- 阶段1（状态传播）发生在阶段2（筛选）之前，因此被标记为 UPSTREAM_FAILED/CONDITION_FAILED 的块**不会**进入阶段2的遍历
+- 阶段2 的分支三虽然对普通上游始终要求 COMPLETED，但大部分普通上游失败的下游块在阶段1已被标记，实际上不会进入分支三
+- 阶段0（完成判定）在每次循环开头执行，与阶段1和阶段2共同决定循环是否继续：`allow_blocks_to_fail=True` 时 FAILED/UPSTREAM_FAILED 被视为"完成"，循环可正常退出；否则需等待所有块 COMPLETED 或 CONDITION_FAILED
+- 阶段3 是兜底退出：当无可执行块但完成判定仍为 False（如上游失败且 `allow_blocks_to_fail=False`）时，直接 return 避免死循环
+
 ### 9.2 交叉影响矩阵
 
-| 事件 | 对依赖筛选的影响 | 对运行顺序的影响 | 对状态传播的影响 |
-|------|------------------|------------------|------------------|
-| **上游 FAILED（普通上游）** | 下游被排除出 executable，**无论** `allow_blocks_to_fail` 取值如何（分支三始终用 `completed_block_uuids`） | 下游不会被调度 | 触发 `update_block_run_statuses` 将下游标记为 UPSTREAM_FAILED |
-| **上游 FAILED（动态上游）** | `allow_blocks_to_fail=True` 时使用 `finished_block_uuids`，下游可进入 executable；`allow_blocks_to_fail=False` 时使用 `completed_block_uuids`，下游不可执行（分支二 `schedules.py:1124-1127`） | `allow_blocks_to_fail=True` 时下游仍会被调度 | UPSTREAM_FAILED 仅在 `allow_blocks_to_fail=False` 时阻止下游执行 |
-| **条件块返回 False** | 当前块标记 CONDITION_FAILED，下游在 `update_block_run_statuses` 中被递归标记 | 下游不会被调度（CONDITION_FAILED 不在 completed 集合中） | 触发 CONDITION_FAILED 递归传播（`schedules.py:1275-1292`） |
-| **allow_blocks_to_fail=True** | **仅**影响动态上游分支（分支二）；普通上游分支（分支三）始终要求上游 COMPLETED | 动态上游失败时下游仍可执行；普通上游失败时下游仍不可执行 | Pipeline 完成判定 `all_blocks_completed(include_failed_blocks=True)` 将 FAILED/UPSTREAM_FAILED 视为"已完成" |
-| **动态块生成** | 动态子块通过 `check_all_dynamic_upstreams_completed` 独立检查（分支一），不涉及 `allow_blocks_to_fail`；动态子块的 UUID 可通过 `upstream_block_uuids_override` 加入普通块的检查集合 | 下游需等待所有动态子块完成 | 动态子块的失败会通过 `update_block_run_statuses` 传播给下游 |
-| **依赖关系变更** | 需要重建 executable 筛选逻辑 | 拓扑顺序需重新计算 | 可能导致循环，需重新 validate |
+| 事件 | 状态传播阶段影响（先发生，`pipeline_executor.py:157-158`） | 依赖筛选阶段影响（后发生，`schedules.py:1077-1221`） | 完成判定影响（循环入口，`pipeline_executor.py:156`） |
+|------|----------|----------|----------|
+| **上游 FAILED（普通上游）** | `update_block_run_statuses` 将下游 INITIAL 块标记为 `UPSTREAM_FAILED` | 下游已非 INITIAL，不进入 `executable_block_runs` 的遍历范围，**不会**进入分支三检查；即便分支三判定也因 `completed_block_uuids` 不含 FAILED 而不可执行 | 非 `allow_blocks_to_fail` 时 `UPSTREAM_FAILED` 不在完成状态集合内，循环持续但无可执行块后提前 return；`allow_blocks_to_fail=True` 时视为已完成，循环正常退出 |
+| **上游 FAILED（动态上游）** | `update_block_run_statuses` 将下游 INITIAL 块标记为 `UPSTREAM_FAILED`（`schedules.py:1275-1282`） | `allow_blocks_to_fail=True` 时分支二用 `finished_block_uuids` 判定，`UPSTREAM_FAILED` 属于 finished，下游如仍为 INITIAL 可进入 executable；`allow_blocks_to_fail=False` 时分支二用 `completed_block_uuids`，下游不可执行 | `allow_blocks_to_fail=True` 时 FAILED/UPSTREAM_FAILED 视为已完成，循环正常退出；否则需所有块 COMPLETED/CONDITION_FAILED |
+| **条件块返回 False** | 即时传播：`BlockExecutor._execute` 标记当前块为 `CONDITION_FAILED`，数据集成块递归标记下游（`block_executor.py:412-465`）；批量传播：`update_block_run_statuses` 递归标记下游 INITIAL 块（`schedules.py:1275-1292`） | 下游已被标记 CONDITION_FAILED，不进入 `executable_block_runs` 遍历；CONDITION_FAILED 不在 `completed_block_uuids` 中 | CONDITION_FAILED 始终在完成状态集合内（无论 `allow_blocks_to_fail` 取值），下游视为已完成，不阻塞循环退出 |
+| **allow_blocks_to_fail=True** | 状态传播逻辑**不受**此参数影响，`update_block_run_statuses` 仍按原始规则标记 UPSTREAM_FAILED/CONDITION_FAILED | **仅**影响分支二（动态上游）的完成判定集合（`finished` vs `completed`）；分支一、分支三不受影响 | 传递给 `all_blocks_completed(include_failed_blocks=True)`，将 FAILED/UPSTREAM_FAILED 纳入完成状态集合，使调度循环能正常退出而不挂死 |
+| **动态块生成** | 动态子块失败时 `update_block_run_statuses` 通过 `dynamic_upstream_block_uuids` 定位下游并标记（`schedules.py:1271-1273`） | 分支一用独立检查；分支二/三通过 `upstream_block_uuids_override` 包含动态子块 UUID（`schedules.py:1170-1207`） | 动态子块状态按普通块同样规则判定 |
+| **依赖关系变更** | N/A（依赖变更是设计时操作，不发生在调度运行中） | 需重建 executable 筛选逻辑，拓扑顺序重排 | N/A |
+| **无可执行块** | N/A | `executable_block_runs` 返回空列表 | 调度循环提前 `return` 退出（`pipeline_executor.py:162-163`），即便 `all_blocks_completed` 仍为 False |
 
 ### 9.3 Pipeline 完成判定
 
