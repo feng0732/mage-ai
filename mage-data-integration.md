@@ -902,9 +902,589 @@ def convert_dataframe_to_output(df, stream, chunk_size=None, dir_path=None):
 
 ---
 
-## 9. 后续演进建议
+## 9. 端到端编排链路：从源读取到 Bookmark 回填
 
-### 9.1 功能增强方向
+Mage AI 的数据集成存在两条端到端编排路径——**批处理集成管道**和**流处理管道**。它们在源读取→转换→目标写入→状态回填→Bookmark 更新这五个环节上的串联机制截然不同。
+
+### 9.1 批处理集成管道的完整编排
+
+批处理集成管道的编排核心在 [BlockExecutor._execute](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/executors/block_executor.py#L776-L1198)，它采用**控制器-子进程**模式分阶段执行。
+
+#### 9.1.1 五阶段编排时序
+
+```
+阶段1: 控制器 → 发现流并创建子 BlockRun
+   BlockExecutor._execute (controller=True)
+   ├─ is_data_integration_controller && !is_data_integration_child
+   │  └─ 为每个 selected_stream 创建 child controller block run
+   │     block_uuid: "{original_uuid}:{connector_uuid}:{stream}:controller"
+   └─ 返回 arr (子 block run 列表)，不执行实际数据操作
+
+阶段2: 子控制器 → 计算批次并为每批次创建子 BlockRun
+   BlockExecutor._execute (controller=True, child=True)
+   ├─ 调用 build_block_run_metadata 计算批次
+   │  └─ 为源: count_records + batch_fetch_limit → number_of_batches
+   │  └─ 为目标: get_streams_from_output_directory → number_of_output_files
+   └─ 为每个 batch index 创建子 block run
+      block_uuid: "{original_uuid}:{connector_uuid}:{stream}:{index}"
+
+阶段3: 源端子进程 → 读取数据并写入中间文件
+   execute_data_integration (is_source=True)
+   ├─ 解析 incremental bookmark (3级优先级):
+   │  1. global_vars[VARIABLE_BOOKMARK_VALUES_KEY][block.uuid]
+   │  2. get_state_data(execution_partition_previous)
+   │  3. 空 (全量同步)
+   ├─ subprocess.Popen 启动 mage_integrations.sources.{uuid}
+   │  参数: --config_json --catalog_json --state_json --selected_streams_json
+   │  stdout → 逐行写入 output_file (Singer格式: SCHEMA/RECORD/STATE)
+   └─ proc.communicate() 等待完成
+
+阶段4: 目标端子进程 → 从中间文件读取并写入目标
+   execute_data_integration (is_source=False) → __execute_destination
+   ├─ 查找上游源端 output_file_path
+   │  └─ 若上游是源: 直接使用源端输出文件
+   │  └─ 若上游非源: convert_block_output_data_for_destination → Singer格式
+   ├─ 合并 catalog: source catalog ← destination catalog (keys_to_override)
+   │  覆盖键: bookmark_properties, destination_table, key_properties,
+   │          replication_method, unique_conflict_method, unique_constraints
+   ├─ subprocess.Popen 启动 mage_integrations.destinations.{uuid}
+   │  参数: --config_json --catalog_json --state {state_file_path} --input_file_path
+   │  destination子进程内部:
+   │    1. 读取 --input_file_path 中的 Singer 消息
+   │    2. 写入目标系统
+   │    3. 将最新 bookmark 写入 --state 指定的状态文件
+   └─ proc.communicate() 等待完成
+
+阶段5: Bookmark 回填 → 目标端状态 → 源端状态同步
+   IntegrationBlock._execute_block (source阶段开始前)
+   ├─ update_source_state_from_destination_state(
+   │      source_state_file_path,
+   │      destination_state_file_path)
+   │  实现:
+   │    1. 读取 destination state 文件最后一行
+   │    2. 覆盖写入 source state 文件
+   └─ 下一批次源端读取时将使用更新后的 bookmark
+```
+
+#### 9.1.2 Bookmark 更新的两种路径
+
+**路径A - IntegrationPipeline 模式**（旧式 YAML 管道）：
+
+[integration/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/models/block/integration/__init__.py#L88-L113)
+
+```python
+# 源端执行前：从目标端状态文件回填到源端状态文件
+if stream_catalog.get('replication_method') in ['INCREMENTAL', 'LOG_BASED']:
+    update_source_state_from_destination_state(
+        source_state_file_path,
+        destination_state_file_path,
+    )
+```
+
+[update_source_state_from_destination_state](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_integrations/mage_integrations/sources/utils.py#L120-L143)
+
+```python
+def update_source_state_from_destination_state(
+    absolute_path_to_source_state, absolute_path_to_destination_state):
+    # 读取目标端状态文件（可能是多行，取最后一行）
+    destination_state = None
+    if os.path.isfile(absolute_path_to_destination_state):
+        with open(absolute_path_to_destination_state, 'r') as f:
+            destination_state = f.read().splitlines()
+    else:
+        with open(absolute_path_to_destination_state, 'w') as f:
+            f.write('')  # 首次执行创建空文件
+
+    # 用目标端最新状态覆盖源端状态
+    with open(absolute_path_to_source_state, 'w') as f:
+        line = json.dumps(dict(bookmarks={}))
+        if destination_state and len(destination_state) >= 1:
+            line = destination_state[len(destination_state) - 1]
+        f.write(line)
+```
+
+**路径B - BatchPipeline 模式**（新版数据集成块）：
+
+[data_integration/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/models/block/data_integration/utils.py#L454-L534)
+
+```python
+# 增量同步时从上次执行的输出文件中提取 bookmark
+if REPLICATION_METHOD_INCREMENTAL == stream_catalogs[0].get('replication_method'):
+    # 优先级1: 从全局变量获取（调度器传入）
+    if VARIABLE_BOOKMARK_VALUES_KEY in global_vars_more:
+        bookmark_values = global_vars_more.get(VARIABLE_BOOKMARK_VALUES_KEY)
+        state_data = dict(bookmarks=bookmark_values.get(block.uuid))
+
+    # 优先级2: 从上次执行的状态文件获取
+    if not state_data and execution_partition_previous:
+        state_data = get_state_data(block, catalog,
+            partition=execution_partition_previous, stream_id=stream)
+
+    # 传递给源端子进程
+    if state_data:
+        args += ['--state_json', simplejson.dumps(state_data)]
+```
+
+**路径C - 前端 API 触发 Bookmark 更新**：
+
+[integration/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/models/block/integration/__init__.py#L478-L504)
+
+```python
+class DestinationBlock(IntegrationBlock):
+    def update(self, data, update_state=False, **kwargs):
+        if update_state:
+            from mage_integrations.destinations.utils import (
+                update_destination_state_bookmarks,
+            )
+            tap_stream_id = data.get('tap_stream_id')
+            destination_table = data.get('destination_table')
+            bookmark_values = data.get('bookmark_values', {})
+            if tap_stream_id and destination_table:
+                destination_state_file_path = \
+                    integration_pipeline.destination_state_file_path(
+                        destination_table=destination_table,
+                        stream=tap_stream_id,
+                    )
+                update_destination_state_bookmarks(
+                    destination_state_file_path,
+                    tap_stream_id,
+                    bookmark_values=bookmark_values,
+                )
+```
+
+[update_destination_state_bookmarks](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_integrations/mage_integrations/destinations/utils.py#L42-L50)
+
+```python
+def update_destination_state_bookmarks(
+        absolute_path_to_destination_state, stream, bookmark_values={}):
+    bookmarks = {stream: bookmark_values}
+    with open(absolute_path_to_destination_state, 'w') as f:
+        line = json.dumps(dict(bookmarks=bookmarks))
+        f.write(line)  # 直接覆盖整个状态文件
+```
+
+#### 9.1.3 execution_partition_previous 的来源
+
+[scheduler.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_integrations/utils/scheduler.py#L434-L450)
+
+```python
+execution_partition_previous = None
+
+if at_least_one_incremental and pipeline_run:
+    pipeline_runs_completed = PipelineRun.recently_completed_pipeline_runs(
+        pipeline_run.pipeline_uuid,
+        pipeline_run_id=pipeline_run.id,
+        pipeline_schedule_id=(
+            None if
+            ScheduleInterval.ONCE == pipeline_run.pipeline_schedule.schedule_interval else
+            pipeline_run.pipeline_schedule_id
+        ),
+        sample_size=1,
+    )
+    if pipeline_runs_completed:
+        execution_partition_previous = pipeline_runs_completed[0].execution_partition
+```
+
+这个值会写入子 BlockRun 的 metrics，在 [block_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/executors/block_executor.py#L913-L918) 中被提取：
+
+```python
+if is_source and data_integration_metadata:
+    execution_partition_previous = data_integration_metadata.get(
+        'execution_partition_previous',
+    )
+    if execution_partition_previous:
+        extra_options['execution_partition_previous'] = execution_partition_previous
+```
+
+### 9.2 流处理管道的完整编排
+
+流处理管道的编排核心在 [StreamingPipelineExecutor.__execute_in_python](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/executors/streaming_pipeline_executor.py#L138-L276)，采用**内存回调链**模式。
+
+#### 9.2.1 编排时序
+
+```
+1. 初始化阶段:
+   SourceFactory.get_source(source_config, checkpoint_path=...)
+   SinkFactory.get_sink(sink_config, buffer_path=...)
+
+2. 回调注册:
+   def handle_batch_events(messages, **kwargs):
+       outputs_by_block = {source_block.uuid: messages}
+       handle_batch_events_recursively(source_block, outputs_by_block, **kwargs)
+
+   def handle_batch_events_recursively(curr_block, outputs_by_block, **kwargs):
+       for downstream_block in curr_block.downstream_blocks:
+           if downstream_block.type == TRANSFORMER:
+               output = downstream_block.execute_block(input_args=[deepcopy(curr_output)])
+               outputs_by_block[downstream_block.uuid] = output
+           elif downstream_block.type == DATA_EXPORTER:
+               sinks_by_uuid[downstream_block.uuid].batch_write(deepcopy(curr_output))
+           handle_batch_events_recursively(downstream_block, outputs_by_block, **kwargs)
+
+3. 长运行消费循环:
+   if source.consume_method == BATCH_READ:
+       source.batch_read(handler=handle_batch_events)
+   elif source.consume_method == READ:
+       source.read(handler=handle_event)
+   elif source.consume_method == READ_ASYNC:
+       source.read_async(handler=handle_event_async)
+
+4. 清理阶段:
+   source.destroy()
+   for sink in sinks_by_uuid.values():
+       sink.destroy()
+```
+
+#### 9.2.2 流处理中的 Checkpoint 与状态管理
+
+流处理管道的状态管理完全不同于批处理——**没有中间文件、没有子进程、没有 Singer 格式**。
+
+[BaseSource](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/streaming/sources/base.py#L68-L86) 的 Checkpoint 机制：
+
+```python
+def read_checkpoint(self):
+    if self.checkpoint_path is None:
+        return None
+    with open(self.checkpoint_path) as fp:
+        checkpoint = json.load(fp)
+    return checkpoint
+
+def update_checkpoint(self):
+    if self.checkpoint_path is None or self.checkpoint is None:
+        return
+    with open(self.checkpoint_path, 'w') as fp:
+        json.dump(self.checkpoint, fp)
+```
+
+关键差异：`update_checkpoint()` 由各 Source 实现自行决定何时调用。以 Kafka 为例，在 `batch_read` 中偏移量提交后才更新：
+
+[kafka.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/streaming/sources/kafka.py#L293-L329)
+
+```python
+def batch_read(self, handler: Callable):
+    while True:
+        msg_pack = self.consumer.poll(max_records=batch_size, timeout_ms=timeout_ms)
+        message_values = []
+        for _tp, messages in msg_pack.items():
+            for message in messages:
+                message = self._convert_message(message)
+                message_values.append(message)
+        if len(message_values) > 0:
+            handler(message_values)  # 业务处理
+        self.consumer.commit()       # 手动提交偏移量
+        # 注意：此处并未调用 self.update_checkpoint()
+```
+
+**Kafka Source 没有显式调用 `update_checkpoint()`**——它依赖 Kafka 自身的偏移量提交机制，而非文件 Checkpoint。
+
+### 9.3 两条编排路径的关键差异
+
+| 维度 | 批处理集成管道 | 流处理管道 |
+|------|--------------|-----------|
+| 进程模型 | 子进程 (subprocess.Popen) | 主进程内执行 |
+| 数据传递 | 中间文件 (Singer格式) | 内存回调 (Python对象) |
+| 状态存储 | 文件 (source_state / destination_state) | Checkpoint文件 / Kafka偏移量 |
+| Bookmark回填 | destination_state → source_state (文件覆盖) | 无显式回填，依赖Source自身机制 |
+| 转换执行 | IntegrationBlock逐行转换 | TransformerBlock DataFrame操作 |
+| 事务性 | 目标端子进程内自行控制 | Sink.batch_write内自行控制 |
+| 故障恢复 | BlockExecutor重试 + 子进程重新执行 | StreamingPipelineExecutor全局重试 |
+
+---
+
+## 10. 子进程执行失败恢复路径
+
+### 10.1 批处理子进程失败的三层捕获
+
+批处理集成管道中，子进程失败经过三层捕获机制：
+
+```
+Layer 1: subprocess 返回码检查
+   ├─ proc.communicate() 等待子进程结束
+   ├─ if proc.returncode != 0:
+   │  └─ raise subprocess.CalledProcessError(returncode, filtered_cmd)
+   └─ 过滤敏感信息: filter_out_config_values(cmd, config)
+
+Layer 2: BlockExecutor 重试装饰器
+   ├─ @retry(retries=retry_config.retries, exponential_backoff=True, ...)
+   └─ __execute_with_retry() → self._execute()
+      └─ 失败时记录 retry_metadata，更新 global_vars['retry']
+
+Layer 3: PipelineExecutor 异步任务捕获
+   ├─ asyncio.gather(*block_run_tasks)
+   ├─ 失败时:
+   │  ├─ UsageStatisticLogger.error() 记录统计
+   │  ├─ on_failure(block_uuid, error=error_details) 回调
+   │  ├─ __update_block_run_status(FAILED)
+   │  └─ raise error (向上传播)
+   └─ 下游 block_run 将被标记为 UPSTREAM_FAILED
+```
+
+#### 10.1.1 子进程失败后的数据状态
+
+[integration/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/models/block/integration/__init__.py#L155-L176)
+
+```python
+# 源端子进程
+proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+for line in proc.stdout:
+    f.write(line.decode())  # 逐行写入输出文件
+    lines_in_file += 1
+outputs.append(proc)
+
+proc.communicate()
+if proc.returncode != 0 and proc.returncode is not None:
+    raise subprocess.CalledProcessError(proc.returncode, ...)
+```
+
+**关键风险**：源端子进程在失败前可能已经部分写入了输出文件。当重试时，同一个输出文件会被重新打开写入（`open(source_output_file_path, 'w')`），覆盖之前的部分数据。但如果重试的批次 `index` 不同，可能残留上一次的部分输出。
+
+[data_integration/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/models/block/data_integration/utils.py#L546-L575)
+
+```python
+# 源端子进程 (BatchPipeline模式)
+proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+variable = build_variable(...)
+output_file_path = output_full_path(index=index, variable=variable)
+
+with variable.open_to_write(filename) as f:
+    for line in proc.stdout:
+        f.write(line.decode())  # 逐行写入
+```
+
+#### 10.1.2 目标端子进程失败的影响
+
+[data_integration/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/models/block/data_integration/utils.py#L1033-L1044)
+
+```python
+# 目标端子进程
+proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+for line in proc.stdout:
+    print_log_from_line(line, ...)  # 仅打印日志
+return proc  # 返回给调用方等待
+```
+
+目标端子进程失败后：
+1. **已写入目标系统的数据无法自动回滚**——destination 子进程没有实现事务回滚
+2. **状态文件可能已更新**——destination 在处理 STATE 消息时会更新状态文件
+3. **重试时源端数据不会重新读取**——因为源端 block_run 已完成
+
+### 10.2 流处理失败恢复路径
+
+[StreamingPipelineExecutor.execute](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/executors/streaming_pipeline_executor.py#L75-L136)
+
+```python
+def execute(self, ..., retry_config=None, **kwargs):
+    infinite_retries = False if retry_config else True
+
+    @retry(retries=retry_config.retries, delay=retry_config.delay, ...)
+    def __execute_with_retry():
+        self.__execute_in_python(...)
+
+    __execute_with_retry()
+
+    # 失败后
+    except Exception as e:
+        if not infinite_retries:
+            self.__update_pipeline_run_status(pipeline_run_id, FAILED, error=e)
+        raise e
+```
+
+**流处理的失败恢复是整体重试**——整个 `__execute_in_python` 被重新执行，包括重新创建 Source 和 Sink 实例。这意味着：
+
+1. **Source 会重新读取 checkpoint**——`BaseSource.__init__` 中 `self.checkpoint = self.read_checkpoint()`
+2. **Sink 会恢复缓冲区**——`BaseSink.__init__` 中 `self.buffer = self.read_buffer()`
+3. **但 Kafka 偏移量已在上一轮提交**——重试时会从上次提交的偏移量之后开始，跳过的消息无法恢复
+
+### 10.3 失败恢复的缺失环节
+
+| 场景 | 当前行为 | 缺失能力 |
+|------|---------|---------|
+| 源端子进程中途崩溃 | 输出文件包含部分数据，重试时覆盖 | 无清理机制，部分文件可能残留 |
+| 目标端子进程写入后崩溃 | 目标系统有脏数据，状态文件可能未更新 | 无目标端回滚、无写入确认 |
+| 目标端写入成功但状态更新失败 | 下次增量将重复读取已写入的数据 | 无写入与状态更新的原子性 |
+| 流处理 handler 抛异常 | Kafka 偏移量未提交（batch_read 中 handler 先于 commit） | ✅ 正确：至少一次语义 |
+| 流处理 Sink 写入失败 | 缓冲区数据丢失（内存中），磁盘缓冲可能部分写入 | 无显式事务或两阶段提交 |
+| BatchExecutor 整体重试 | 源端和目标端作为独立 block_run 分别重试 | 源端成功+目标端失败时源端不会重新执行 |
+
+---
+
+## 11. 重复写入风险与一致性边界
+
+### 11.1 重复写入的五种场景
+
+#### 场景1：增量同步的 Bookmark 未回填
+
+**触发条件**：目标端子进程成功写入数据并输出 STATE 消息，但 `update_source_state_from_destination_state` 在下一轮执行前未被调用（如管道调度中断）。
+
+**代码路径**：
+
+[integration/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/models/block/integration/__init__.py#L106-L113)
+
+```python
+if stream_catalog.get('replication_method') in ['INCREMENTAL', 'LOG_BASED']:
+    update_source_state_from_destination_state(
+        source_state_file_path,
+        destination_state_file_path,
+    )
+```
+
+此函数仅在 `index is not None` 时执行。如果控制器未正确设置 index 参数，bookmark 回填将被跳过。
+
+**后果**：源端使用旧的 bookmark 重新读取已同步的数据段，导致目标端重复写入。
+
+#### 场景2：全量同步的 COPY 命令无幂等保障
+
+**触发条件**：PostgreSQL 目标端使用 `COPY` 命令批量加载（非 INSERT ON CONFLICT），重试时整个批次重新写入。
+
+[postgres.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/io/postgres.py#L306-L422)
+
+```python
+if unique_constraints and unique_conflict_method:
+    # INSERT ... ON CONFLICT → 幂等
+    commands.append(f"ON CONFLICT ({', '.join(cleaned_unique_constraints)})")
+    commands.append(f"DO UPDATE SET ..." or "DO NOTHING")
+else:
+    # COPY → 非幂等，重复写入会插入重复行
+    cursor.copy_expert(f"COPY {full_table_name} FROM STDIN ...", buffer)
+```
+
+**后果**：未配置 `unique_constraints` 时，重试或重新运行会产生重复数据行。
+
+#### 场景3：流处理 Kafka 偏移量提交时序
+
+**触发条件**：`handler(message_values)` 成功但 `self.consumer.commit()` 失败。
+
+[kafka.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/streaming/sources/kafka.py#L327-L329)
+
+```python
+if len(message_values) > 0:
+    handler(message_values)  # 业务处理（含 Sink 写入）
+self.consumer.commit()       # 提交偏移量
+```
+
+**分析**：
+- 如果 handler 成功但 commit 失败：下一轮 poll 会重新消费相同消息 → **重复写入**
+- 如果 handler 失败（抛异常）：commit 不会执行 → 重试时重新消费 → **正确行为**
+- 如果 handler 成功且 commit 成功：唯一正常路径
+
+#### 场景4：BatchPipeline 模式下目标端状态文件竞态
+
+**触发条件**：多个 block_run 并行执行同一 stream 的不同批次，共享同一个 destination state 文件。
+
+[data_integration/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/models/block/data_integration/utils.py#L919-L924)
+
+```python
+state_file_path = get_state_file_path(block, data_integration_uuid, stream)
+if state_file_path:
+    args += ['--state', state_file_path]  # 所有批次共享同一状态文件
+```
+
+**后果**：如果 `run_in_parallel=True`，多个目标端子进程并发读写同一状态文件，后写入者可能覆盖前者的更新，导致 bookmark 回退。
+
+#### 场景5：Sink 缓冲区持久化与内存不同步
+
+**触发条件**：Sink 进程在 `write_buffer` 后、`clear_buffer` 前崩溃。
+
+[sinks/base.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/streaming/sinks/base.py#L91-L101)
+
+```python
+def write_buffer(self, data: List[Dict]):
+    self.buffer += data  # 内存追加
+    if self.buffer_path:
+        with open(self.buffer_path, 'a') as fp:  # 磁盘追加
+            for record in data:
+                fp.write(json.dumps(record) + '\n')
+```
+
+**后果**：
+- 如果 `buffer_path` 已配置：恢复时 `read_buffer()` 可读回磁盘缓冲 → 数据不丢失
+- 如果 `buffer_path` 未配置：内存缓冲丢失 → 数据丢失
+- 但如果 `batch_write` 成功而 `clear_buffer` 未执行：重试时会再次写入已成功的缓冲数据 → **重复写入**
+
+### 11.2 一致性边界分析
+
+#### 11.2.1 批处理管道的一致性边界
+
+```
+一致性保障范围:
+┌─────────────────────────────────────────────────────────────┐
+│  源端子进程内部:                                             │
+│    - Singer 规范保证 SCHEMA → RECORD → STATE 的顺序         │
+│    - STATE 消息包含到当前为止的所有 bookmark                  │
+│    ✅ 单次源端读取的一致性有保障                              │
+├─────────────────────────────────────────────────────────────┤
+│  中间文件传输:                                               │
+│    - 源端输出文件可能包含部分数据（子进程中途失败）            │
+│    - 目标端读取文件时无校验机制（如行数对比、checksum）       │
+│    ❌ 中间传输的一致性无保障                                  │
+├─────────────────────────────────────────────────────────────┤
+│  目标端子进程内部:                                           │
+│    - SQL 事务包裹整个 batch 的写入 (self.conn.commit())      │
+│    - ON CONFLICT 保证单批次内的幂等                          │
+│    ⚠️ 跨批次的一致性依赖唯一约束配置                         │
+├─────────────────────────────────────────────────────────────┤
+│  Bookmark 回填:                                             │
+│    - 目标端状态 → 源端状态（文件覆盖）                        │
+│    - 非原子操作：目标端写成功 ≠ 源端更新成功                  │
+│    ❌ 跨阶段的 bookmark 一致性无保障                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 11.2.2 流处理管道的一致性边界
+
+```
+一致性保障范围:
+┌─────────────────────────────────────────────────────────────┐
+│  Source → Transformer:                                       │
+│    - 深拷贝传递，内存中无共享状态                              │
+│    ✅ 单消息处理的原子性                                      │
+├─────────────────────────────────────────────────────────────┤
+│  Transformer → Sink:                                         │
+│    - batch_write 无事务包裹                                  │
+│    - Sink 内部自行决定是否使用事务                            │
+│    ⚠️ 如 PostgresSink 使用 APPEND + ON CONFLICT             │
+│    ⚠️ 其他 Sink 可能无幂等保障                               │
+├─────────────────────────────────────────────────────────────┤
+│  Kafka 偏移量:                                               │
+│    - handler → commit 顺序保证至少一次                       │
+│    - commit 失败时重试会重复消费                              │
+│    ⚠️ 至少一次语义，非精确一次                                │
+├─────────────────────────────────────────────────────────────┤
+│  Sink 缓冲:                                                  │
+│    - buffer_path 持久化是 best-effort                        │
+│    - read_buffer/write_buffer 异常被静默吞掉                 │
+│    ❌ 缓冲一致性无保障                                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 11.3 重复写入的防护矩阵
+
+| 防护层 | 批处理管道 | 流处理管道 | 有效场景 |
+|--------|-----------|-----------|---------|
+| 唯一约束 + ON CONFLICT | ✅ 需显式配置 | ✅ 需显式配置 | 目标端有主键/唯一键时 |
+| 替换写入 (REPLACE) | ✅ DELETE + INSERT | N/A | 全量同步场景 |
+| Kafka 手动提交 | N/A | ✅ handler 后 commit | 防止未处理消息被跳过 |
+| Sink 磁盘缓冲 | N/A | ⚠️ 需配置 buffer_path | 进程崩溃恢复 |
+| 全局变量 Bookmark | ✅ 调度器传入 | N/A | 防止增量重复读取 |
+| 状态文件回填 | ✅ 自动执行 | N/A | 防止跨轮增量重复 |
+| 幂等键配置 | ✅ catalog 中配置 | ✅ Sink config 中配置 | 唯一冲突时忽略或更新 |
+
+### 11.4 缺失的防护与排查方向
+
+| 风险 | 缺失防护 | 排查方向 |
+|------|---------|---------|
+| 目标端部分写入后崩溃 | 无目标端回滚机制 | 检查目标数据库的事务日志，确认是否有半提交状态 |
+| Bookmark 回填失败 | 无回填确认机制 | 比较 `source_state_file` 和 `destination_state_file` 的时间戳 |
+| 并行批次状态文件竞态 | 无文件锁或乐观锁 | 检查 `run_in_parallel` 配置，对增量流关闭并行 |
+| COPY 命令重复加载 | 无去重检查 | 在目标表上创建唯一约束，改用 INSERT ON CONFLICT |
+| Sink 缓冲丢失 | buffer_path 为可选配置 | 确认所有 Sink 配置了 buffer_path |
+| 流处理重试时 Source 重建 | 无处理进度保存 | 考虑在 Source 实现中周期性调用 update_checkpoint() |
+
+---
+
+## 12. 后续演进建议
+
+### 12.1 功能增强方向
 
 1. **精确一次语义（Exactly-Once）**：
    - 当前实现为至少一次，需要结合目标端幂等键
@@ -918,7 +1498,15 @@ def convert_dataframe_to_output(df, stream, chunk_size=None, dir_path=None):
    - 流式处理缺少明确的背压机制
    - 可基于缓冲队列长度实现流量控制
 
-### 9.2 可观测性增强
+4. **子进程失败后的清理机制**：
+   - 源端输出文件在子进程失败后应标记为无效
+   - 可引入 `.incomplete` 后缀，重试前清理
+
+5. **状态文件原子性更新**：
+   - 使用 write-then-rename 模式确保状态文件不会在崩溃时损坏
+   - 为并行批次引入文件锁或每批次独立状态文件
+
+### 12.2 可观测性增强
 
 1. **同步进度指标**：
    - 暴露 lag 指标（最新消息时间 - 处理消息时间）
@@ -931,6 +1519,10 @@ def convert_dataframe_to_output(df, stream, chunk_size=None, dir_path=None):
 3. **链路追踪**：
    - 为每条消息添加 trace_id
    - 跨系统追踪数据流转路径
+
+4. **Bookmark 一致性监控**：
+   - 定期比较源端和目标端 bookmark 值
+   - 检测 bookmark 回退或异常跳跃
 
 ---
 
@@ -949,5 +1541,13 @@ def convert_dataframe_to_output(df, stream, chunk_size=None, dir_path=None):
 | Kafka 连接器 | [streaming/sources/kafka.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/streaming/sources/kafka.py) | L80-L365 |
 | SQL 通用导出 | [io/sql.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/io/sql.py) | L220-L382 |
 | 导出工具函数 | [io/export_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/io/export_utils.py) | L51-L163 |
-| 重试机制 | [shared/retry.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage_ai/shared/retry.py) | L5-L61 |
-| 流处理执行器 | [executors/streaming_pipeline_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/executors/streaming_pipeline_executor.py) | L28-L150 |
+| 重试机制 | [shared/retry.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/shared/retry.py) | L5-L61 |
+| 流处理执行器 | [streaming_pipeline_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/executors/streaming_pipeline_executor.py) | L28-L319 |
+| Block 执行器 | [block_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/executors/block_executor.py) | L51-L1459 |
+| Pipeline 执行器 | [pipeline_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/executors/pipeline_executor.py) | L21-L215 |
+| 集成块定义 | [integration/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/models/block/integration/__init__.py) | L28-L510 |
+| 集成管道 | [integration_pipeline.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_preparation/models/pipelines/integration_pipeline.py) | L32-L418 |
+| 数据集成调度器 | [scheduler.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/data_integrations/utils/scheduler.py) | L258-L504 |
+| 源端状态回填 | [sources/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_integrations/mage_integrations/sources/utils.py) | L120-L143 |
+| 目标端 Bookmark 更新 | [destinations/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_integrations/mage_integrations/destinations/utils.py) | L42-L50 |
+| PostgreSQL Sink | [sinks/postgres.py](file:///d:/fz/0601/solo-dogfeeding/code/311-mage-ai/mage_ai/streaming/sinks/postgres.py) | L31-L72 |
