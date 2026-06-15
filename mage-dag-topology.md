@@ -513,7 +513,7 @@ Integration 管道具有特殊的拓扑结构：
 
 ## 9. 调度失败提示路径
 
-调度失败沿着 **块级 → 管道级 → 通知** 三层传播，以下是完整调用链。
+调度失败沿着 **块级状态更新 → 管道级检测 → 通知发送** 三层传播，以下是沿源码核对的完整调用链。
 
 ### 9.1 块运行状态机
 
@@ -568,10 +568,9 @@ BlockExecutor.execute()
 
 **触发路径**：`PipelineRun.update_block_run_statuses()`（[schedules.py:1223](mage_ai/orchestration/db/models/schedules.py#L1223)）
 
-在每次 `schedule()` 开头被调用：
+在每次 `schedule()` 开头被调用（[pipeline_scheduler_original.py:617](mage_ai/orchestration/pipeline_scheduler_original.py#L617)）：
 
 ```python
-# pipeline_scheduler_original.py:617
 self.pipeline_run.update_block_run_statuses(self.pipeline_run.initial_block_runs)
 ```
 
@@ -590,7 +589,7 @@ self.pipeline_run.update_block_run_statuses(self.pipeline_run.initial_block_runs
 
 递归保证：失败状态会沿 DAG 逐层传播到所有间接下游。
 
-### 9.5 块级失败 → PipelineScheduler.on_block_failure()
+### 9.5 块级失败回调 → PipelineScheduler.on_block_failure()
 
 **触发路径**：[pipeline_scheduler_original.py:443](mage_ai/orchestration/pipeline_scheduler_original.py#L443)
 
@@ -605,43 +604,176 @@ on_block_failure(block_uuid, **kwargs)
       → kill_integration_stream_job() 对每个 stream
 ```
 
-### 9.6 管道级失败 → on_pipeline_run_failure()
+**重要**：`on_block_failure()` **不直接触发** `on_pipeline_run_failure()`。它只更新块状态 + 日志 + 可选 kill 作业。管道级失败由下一次 `schedule()` 调用时通过 `any_blocks_failed()` 检查发现。
 
-**触发路径**：`schedule()` 方法中的三个入口（[pipeline_scheduler_original.py:260](mage_ai/orchestration/pipeline_scheduler_original.py#L260)、[pipeline.py:307](mage_ai/data_preparation/models/pipeline.py#L307)、[pipeline_scheduler_original.py:309](mage_ai/orchestration/pipeline_scheduler_original.py#L309)）：
+### 9.6 管道级失败：5 个触发入口
 
-1. **所有块完成但有失败的**：`any_blocks_failed() and not allow_blocks_to_fail`
-2. **管道超时**：`__check_pipeline_run_timeout()` 返回 True
-3. **存在失败块**：`any_blocks_failed() and not allow_blocks_to_fail`
+管道级失败共有 **5 个独立入口**，其中 2 个直接调用 `send_pipeline_run_failure_message()`（绕过 `on_pipeline_run_failure`），3 个通过 `on_pipeline_run_failure()` 统一处理。
+
+#### 入口 1：start() 初始化失败（直接发通知）
+
+**位置**：[pipeline_scheduler_original.py:188](mage_ai/orchestration/pipeline_scheduler_original.py#L188)
+
+**触发条件**：`start()` 中 `create_block_runs()`（或集成管道初始化）抛异常。
+
+**error**：`'Fail to initialize block runs.'`
+
+**特征**：直接调用 `notification_sender.send_pipeline_run_failure_message()`，不经过 `on_pipeline_run_failure()`，因此 **不会触发 cancel_block_runs_and_jobs()**。
+
+#### 入口 2：所有块完成 + 存在失败块（经 on_pipeline_run_failure）
+
+**位置**：[pipeline_scheduler_original.py:250](mage_ai/orchestration/pipeline_scheduler_original.py#L250)
+
+**触发条件**：
+```python
+if self.pipeline_run.all_blocks_completed(self.allow_blocks_to_fail):
+    if self.pipeline_run.any_blocks_failed():
+        # → 触发失败
+    else:
+        # → 成功完成
+```
+
+其中：
+- `all_blocks_completed(include_failed_blocks)`（[schedules.py:1522](mage_ai/orchestration/db/models/schedules.py#L1522)）：默认认为 COMPLETED + CONDITION_FAILED 是"完成"状态；若 `include_failed_blocks=True`，则 FAILED + UPSTREAM_FAILED 也算完成
+- 当 `allow_blocks_to_fail=True` 时，`include_failed_blocks=True`，意味着即使有块失败，也要等所有块都跑完才判定管道结束
+- `any_blocks_failed()`（[schedules.py:1519](mage_ai/orchestration/db/models/schedules.py#L1519)）：`any(b.status == FAILED for b in self.block_runs)`，只检查 FAILED 状态（不含 UPSTREAM_FAILED）
+
+**error_msg**：`'Failed blocks: {uuid1}, {uuid2}.'`（列出所有 FAILED 状态块的 UUID）
+
+#### 入口 3：管道超时（经 on_pipeline_run_failure）
+
+**位置**：[pipeline_scheduler_original.py:302](mage_ai/orchestration/pipeline_scheduler_original.py#L302)
+
+**触发条件**：`__check_pipeline_run_timeout()` 返回 True。
+
+**error_msg**：`'Pipeline run timed out.'`
+
+**status**：取 `self.pipeline_schedule.timeout_status`，默认 `PipelineRunStatus.FAILED`。只有当 status == FAILED 时才发送通知。
+
+#### 入口 4：存在失败块 + 不允许失败（经 on_pipeline_run_failure）
+
+**位置**：[pipeline_scheduler_original.py:308](mage_ai/orchestration/pipeline_scheduler_original.py#L308)
+
+**触发条件**：`any_blocks_failed() and not self.allow_blocks_to_fail`
+
+与入口 2 的区别：入口 2 是**所有块都跑完后**才判定；入口 4 是**只要有块失败且不允许失败**，就立即判定管道失败（不等其他块跑完）。
+
+**error_msg**：`'Failed blocks: {uuid1}, {uuid2}.'`
+
+#### 入口 5：内存超限（直接发通知）
+
+**位置**：[pipeline_scheduler_original.py:501](mage_ai/orchestration/pipeline_scheduler_original.py#L501)
+
+**触发条件**：`memory_usage_failure()` 被调用（内存使用达到 `MEMORY_USAGE_MAXIMUM * 100%` 上限）。
+
+**summary**：`'Memory usage across all pipeline runs has reached or exceeded the maximum limit of {int(MEMORY_USAGE_MAXIMUM * 100)}%.'`
+
+**特征**：通过 `summary=` 参数传递，直接调用 `send_pipeline_run_failure_message()`，不经过 `on_pipeline_run_failure()`，因此 **不会触发 cancel_block_runs_and_jobs()**（但之前已调用 `stop()` → `stop_pipeline_run()`）。
+
+### 9.7 on_pipeline_run_failure() 统一处理流程
+
+**位置**：[pipeline_scheduler_original.py:341](mage_ai/orchestration/pipeline_scheduler_original.py#L341)
+
+仅入口 2、3、4 会走到这里。入口 1 和 5 直接发通知绕过。
 
 ```
-on_pipeline_run_failure(error_msg)
+on_pipeline_run_failure(error_msg, status=FAILED)
   → UsageStatisticLogger().pipeline_run_ended_sync()
-  → 收集失败块错误信息:
-      → 遍历 failed_block_runs
-      → 取 br.metrics['error']['message']
-      → 截断到最后 50 行（超过 50 行插入 '... (error truncated)'）
-      → 拼接 stacktrace = f'Error for block {br.block_uuid}:\n{message}'
-  → notification_sender.send_pipeline_run_failure_message(
-        pipeline, pipeline_run, error=error_msg, stacktrace=stacktrace
-    )
+  → 若 status == FAILED:
+      → 收集失败块错误信息（详见 9.8）
+      → notification_sender.send_pipeline_run_failure_message(
+            pipeline, pipeline_run, error=error_msg, stacktrace=stacktrace
+        )
   → cancel_block_runs_and_jobs(pipeline_run, pipeline)
       → BlockRun.batch_update_status(ids, CANCELLED)
       → job_manager.kill_pipeline_run_job()
       → 若为 Integration/Streaming: kill_integration_stream_job() 每个 stream
 ```
 
-### 9.7 失败通知消息格式
+注意：当 `status != FAILED` 时（如超时状态被配置为其他值），**不发送通知**，但仍会取消作业。
 
-`notification_sender.send_pipeline_run_failure_message()` 发送的通知包含：
+### 9.8 多失败块的取值规则
 
-| 字段 | 来源 |
+#### failed_block_runs 的范围
+
+`failed_block_runs` 属性（[schedules.py:853](mage_ai/orchestration/db/models/schedules.py#L853)）仅包含状态为 **FAILED** 的块：
+
+```python
+def failed_block_runs(self) -> List['BlockRun']:
+    return [b for b in self.block_runs if b.status == BlockRun.BlockRunStatus.FAILED]
+```
+
+**不包含** UPSTREAM_FAILED、CONDITION_FAILED、CANCELLED 状态的块。
+
+#### error_msg 中的块列表
+
+所有失败块的 UUID 都会被列出，用逗号分隔：
+
+```python
+error_msg = 'Failed blocks: ' f'{", ".join([b.block_uuid for b in failed_block_runs])}.'
+```
+
+#### stacktrace 的选取规则
+
+`on_pipeline_run_failure()` 中（[pipeline_scheduler_original.py:350](mage_ai/orchestration/pipeline_scheduler_original.py#L350)）选取 stacktrace 的逻辑：
+
+```python
+stacktrace = None
+for br in failed_block_runs:
+    if br.metrics:
+        message = br.metrics.get('error', {}).get('message')
+        if message:
+            message_split = message.split('\n')
+            if len(message_split) > 50:
+                message_split = message_split[-50:]
+                message_split.insert(0, '... (error truncated)')
+            message = '\n'.join(message_split)
+            stacktrace = f'Error for block {br.block_uuid}:\n{message}'
+            break    # ← 第一个有 error.message 的块，break 退出
+```
+
+**规则**：
+- 按 `failed_block_runs` 的迭代顺序（即 `self.block_runs` 的自然顺序，通常是 DB 主键顺序）
+- 取 **第一个** 具有 `metrics.error.message` 的失败块
+- 错误消息截断到最后 **50 行**，超过则在开头插入 `'... (error truncated)'`
+- 格式：`'Error for block {block_uuid}:\n{truncated_message}'`
+- 如果所有失败块都没有 error message，则 `stacktrace = None`
+
+### 9.9 通知发送机制
+
+#### NotificationSender
+
+`NotificationSender`（[sender.py:45](mage_ai/orchestration/notification/sender.py#L45)）支持多种通知渠道：
+
+| 渠道 | 发送函数 |
 |---|---|
-| `error` | `'Failed blocks: {uuid1}, {uuid2}.'` 或 `'Pipeline run timed out.'` |
-| `stacktrace` | `'Error for block {block_uuid}:\n{truncated_message}'`（最多 50 行） |
-| `pipeline` | Pipeline 对象 |
-| `pipeline_run` | PipelineRun 对象 |
+| Slack | `send_slack_message()` |
+| Microsoft Teams | `send_teams_message()` |
+| Discord | `send_discord_message()` |
+| Google Chat | `send_google_chat_message()` |
+| Email | `send_email()` |
+| Opsgenie | `send_opsgenie_alert()` |
+| Telegram | `send_telegram_message()` |
 
-### 9.8 重试机制
+#### 消息优先级
+
+`__send_pipeline_run_message()`（[sender.py:187](mage_ai/orchestration/notification/sender.py#L187)）的消息构建优先级：
+
+1. **最高**：直接传入的 `summary` 参数（如 `memory_usage_failure` 传入的 summary）
+2. **次之**：用户配置的 `message_template`（NotificationConfig 中的自定义模板）
+3. **默认**：`DEFAULT_MESSAGES['failure']` 中的默认模板
+
+默认失败消息模板：
+- **title**：`'Failed to run Mage pipeline {pipeline_uuid}'`
+- **summary**：`'Failed to run Pipeline {pipeline_uuid} with Trigger {pipeline_schedule_id} {pipeline_schedule_name} at execution time {execution_time}. Error: {error}'`
+
+变量插值（`__interpolate_vars`）支持：`error`、`stacktrace`、`execution_time`、`pipeline_run_url`、`pipeline_schedule_id`、`pipeline_schedule_name`、`pipeline_schedule_description`、`pipeline_uuid`。
+
+#### 发送条件
+
+只有当 `AlertOn.PIPELINE_RUN_FAILURE` 在 `config.alert_on` 列表中时，才会实际发送通知。
+
+### 9.10 重试机制
 
 Block 执行支持可配置的重试策略（[block_executor.py:594](mage_ai/data_preparation/executors/block_executor.py#L594)），合并管道级和块级配置：
 
@@ -740,16 +872,26 @@ retry_config = merge_dict(
 
 ```
 1. PipelineScheduler.start()
+   → 异常捕获: 初始化失败 → 直接 send_pipeline_run_failure_message (入口1)
    → PipelineRun.create_block_runs()      # 为所有可执行块创建 BlockRun
 2. PipelineScheduler.schedule()
-   → update_block_run_statuses()          # 传播 FAILED/CONDITION_FAILED
+   → update_block_run_statuses()          # 传播 UPSTREAM_FAILED / CONDITION_FAILED
+   → 判定管道状态（按优先级）:
+     a. all_blocks_completed(allow_blocks_to_fail)
+        ├── any_blocks_failed → on_pipeline_run_failure (入口2)
+        └── 全部成功 → complete() + 成功通知
+     b. __check_pipeline_run_timeout() → on_pipeline_run_failure (入口3)
+     c. any_blocks_failed and not allow_blocks_to_fail
+        → on_pipeline_run_failure (入口4, 立即失败不等全部完成)
    → executable_block_runs()              # 基于 DB 状态筛选可执行块
    → job_manager.add_job(run_block, ...)  # 提交作业
-3. on_block_complete() → schedule()       # 递归调度
-   或 on_block_failure() → 更新状态为 FAILED
-4. 判断管道完成/失败
-   → on_pipeline_run_failure()            # 通知 + 取消剩余作业
-   或 pipeline_run.complete()             # 成功完成
+3. 块完成回调: on_block_complete() → schedule()
+   块失败回调: on_block_failure() → 更新 FAILED 状态（不直接触发管道失败）
+4. 内存超限: memory_usage_failure() → stop() + 直接发通知 (入口5)
+5. on_pipeline_run_failure() 统一处理:
+   → UsageStatisticLogger.pipeline_run_ended_sync()
+   → status == FAILED 时: 收集 stacktrace + send_pipeline_run_failure_message()
+   → cancel_block_runs_and_jobs()         # 批量取消剩余作业
 ```
 
 ---
@@ -760,9 +902,12 @@ retry_config = merge_dict(
 |---|---|---|---|
 | **缺失节点静默忽略** | YAML 中引用不存在的块 UUID 不会报错，仅被列表推导式过滤，上游丢失使块意外成为 root block | [pipeline.py:1032](mage_ai/data_preparation/models/pipeline.py#L1032) | 高 |
 | **get_block() 仅 print 不抛异常** | 找不到块时 `print` 到 stdout 后返回 `None`，调用方若不检查则后续 AttributeError | [pipeline.py:1913](mage_ai/data_preparation/models/pipeline.py#L1913) | 高 |
+| **失败通知入口不统一** | 5 个失败入口中 2 个直接调用 `send_pipeline_run_failure_message()` 绕过 `on_pipeline_run_failure()`，导致不执行 `cancel_block_runs_and_jobs()` | [pipeline_scheduler_original.py:188](mage_ai/orchestration/pipeline_scheduler_original.py#L188)、[pipeline_scheduler_original.py:501](mage_ai/orchestration/pipeline_scheduler_original.py#L501) | 中 |
+| **stacktrace 只取第一个失败块** | 多失败块场景下通知仅包含第一个有 `error.message` 的块的堆栈，其余失败原因被隐藏，排障困难 | [pipeline_scheduler_original.py:350](mage_ai/orchestration/pipeline_scheduler_original.py#L350) | 中 |
 | **图结构修改无事务** | `add_block()` / `update_block()` 中先修改内存结构再 validate，环检测失败时内存状态已被修改 | [pipeline.py:1878](mage_ai/data_preparation/models/pipeline.py#L1878)、[pipeline.py:2137](mage_ai/data_preparation/models/pipeline.py#L2137) | 中 |
 | **运行时环检测滞后** | `run_blocks()` 中通过 tries >= 1000 检测环，最多需要 1000 次无效迭代才能发现，且异常消息不含环路径 | [block/\_\_init\_\_.py:242](mage_ai/data_preparation/models/block/__init__.py#L242) | 中 |
 | **BlockRun 永久 INITIAL** | 调度器中 `block is None` 的 BlockRun 永远不执行也不报错，最终残留为 INITIAL | [schedules.py:1176](mage_ai/orchestration/db/models/schedules.py#L1176) | 中 |
+| **any_blocks_failed 仅统计 FAILED** | 仅检查 FAILED 状态，UPSTREAM_FAILED 块不计入失败统计（虽不影响最终判定，因其上游必有 FAILED） | [schedules.py:1519](mage_ai/orchestration/db/models/schedules.py#L1519) | 低 |
 | **动态块 UUID 冲突** | 动态子块使用 `parent_uuid:index` 格式，`get_block()` 用 `split(':')[0]` 回退查找，若用户块 UUID 包含 `:` 可能导致误匹配 | [pipeline.py:1910](mage_ai/data_preparation/models/pipeline.py#L1910) | 低 |
 | **Streaming 管道结构限制** | 强制单 source、单上游 transformer 的约束过于严格，无法表达更复杂的 DAG | [streaming_pipeline_executor.py:35](mage_ai/data_preparation/executors/streaming_pipeline_executor.py#L35) | 低 |
 
