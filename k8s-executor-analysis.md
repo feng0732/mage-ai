@@ -407,29 +407,40 @@ if should_finish:
 
 `on_complete` 回调对应 `PipelineScheduler.on_block_complete()`：
 
-文件：`mage_ai/orchestration/pipeline_scheduler_original.py`，L377-L410
+文件：`mage_ai/orchestration/pipeline_scheduler_original.py`，L376-L410
 
 ```python
+@safe_db_query                                    # ★ 外层：DB 异常类的额外重试（3 次）
 def on_block_complete(self, block_uuid, metrics=None):
     block_run = BlockRun.get(pipeline_run_id=self.pipeline_run.id, block_uuid=block_uuid)
 
-    @retry(retries=2, delay=5)    # ★ 共 3 次 DB 写入机会（1 次正跑 + 2 次重试）
-    def update_status(metrics=metrics):
+    @retry(retries=2, delay=5)                    # ★ 内层：全异常的通用重试（3 次）
+    def update_status(metrics=metrics):            #   delay=5 + 指数退避 → 5s → 10s
         block_run.update(
             status=BlockRun.BlockRunStatus.COMPLETED,
             completed_at=datetime.now(tz=pytz.UTC),
-            metrics=...
+            metrics=metrics_prev,
         )
-    update_status()
+    update_status()                                 # 两层嵌套：最多 3×3 = 9 次 DB 写入尝试
 
     self.pipeline_run.refresh()
     if self.pipeline_run.status != PipelineRun.PipelineRunStatus.RUNNING:
         return
-    # ★★★ 核心职责：触发下一轮调度，选出下一批可执行 Block ★★★
-    self.schedule()
+    else:
+        self.schedule()                             # ★★★ 触发下一轮调度 ★★★
 ```
 
+**两层嵌套重试机制详解**（核准自 `mage_ai/shared/retry.py` L29 和 `mage_ai/orchestration/db/__init__.py` L155-L171）：
+
+| 装饰器 | 重试次数 | 触发条件 | 退避策略 |
+|--------|---------|---------|---------|
+| `@retry(retries=2)` | `retries + 1 = 3` 次（1 正跑 + 2 重试） | **所有异常** | `delay=5`，`exponential_backoff=True` → 5s → 10s |
+| `@safe_db_query` | `DB_RETRY_COUNT + 1 = 3` 次 | 仅 `OperationalError`、`PendingRollbackError`、`InternalError` | 无延迟，立即重试 |
+| **嵌套合计** | **最多 9 次**（特定 DB 异常场景） | — | — |
+
 > **边界要点 3**：Pod 外部回调的核心职责**不是**写状态（那是 Pod 内优先尝试的），而是**调用 `self.schedule()` 推进整个 Pipeline 的调度**。状态写入是附带的幂等操作，保证即使 Pod 内写入失败也能在调度侧补写。
+>
+> **重试全失败的影响**：两层重试全部失败后，异常向上传播到 `BlockExecutor.execute()`，`self.schedule()` 永远不会被调用，Pipeline 的调度推进完全依赖外部周期性调度循环。
 
 #### 3.4.2 失败路径回调
 
@@ -448,22 +459,57 @@ except Exception as error:
 
 `on_failure` 回调对应 `PipelineScheduler.on_block_failure()`：
 
-文件：`mage_ai/orchestration/pipeline_scheduler_original.py`，L443-L488
+文件：`mage_ai/orchestration/pipeline_scheduler_original.py`，L442-L488
 
 ```python
-def on_block_failure(self, block_uuid, **kwargs):
+@safe_db_query                                    # ★ 外层：DB 异常类的额外重试（3 次）
+def on_block_failure(self, block_uuid: str, **kwargs) -> None:
     block_run = BlockRun.get(pipeline_run_id=self.pipeline_run.id, block_uuid=block_uuid)
     metrics = block_run.metrics or {}
-    if error:
-        metrics['error'] = dict(error=..., errors=..., message=...)  # 异常类型、堆栈、traceback
-    block_run.update(metrics=metrics, status=BlockRun.BlockRunStatus.FAILED)
-    # ★ 注意：on_block_failure 没有 @retry 装饰器，只有 1 次写入机会
 
-    if not self.allow_blocks_to_fail and PipelineType.INTEGRATION == self.pipeline.type:
-        job_manager.kill_pipeline_run_job(self.pipeline_run.id)
-        for stream in self.streams:
-            job_manager.kill_integration_stream_job(...)
+    @retry(retries=2, delay=5)                    # ★ 内层：全异常的通用重试（3 次）
+    def update_status():
+        block_run.update(
+            metrics=metrics,
+            status=BlockRun.BlockRunStatus.FAILED,
+        )
+
+    error = kwargs.get('error', {})
+    if error:
+        metrics['error'] = dict(
+            error=str(error.get('error')),         # 异常类型
+            errors=error.get('errors'),            # 堆栈帧列表
+            message=error.get('message'),          # 完整 traceback 字符串
+        )
+
+    update_status()                                 # 两层嵌套：与 on_block_complete 相同的 9 次机会
+
+    # ★ 注意：on_block_failure **不调用** self.schedule()
+    # 失败后的调度推进依赖：① 外部周期性调度循环 ② on_pipeline_run_failure
+
+    if not self.allow_blocks_to_fail:
+        if PipelineType.INTEGRATION == self.pipeline.type:
+            # 集成管道：kill 所有其他流的 Mage 内部 Job
+            job_manager.kill_pipeline_run_job(self.pipeline_run.id)
+            for stream in self.streams:
+                job_manager.kill_integration_stream_job(...)
+            calculate_pipeline_run_metrics(...)
 ```
+
+**成功/失败回调重试机制对比**：
+
+| 对比项 | on_block_complete | on_block_failure |
+|--------|------------------|------------------|
+| `@retry(retries=2, delay=5)` | ✅ 有（3 次通用重试，5s/10s 退避） | ✅ **同样有**（与成功回调完全一致） |
+| `@safe_db_query` 外层 | ✅ 有（3 次 DB 特定异常重试） | ✅ **同样有**（与成功回调完全一致） |
+| 嵌套合计最大尝试次数 | 最多 9 次 | 最多 **9 次**（之前的「仅 1 次」分析错误，已修正） |
+| 写入失败后对调度的影响 | `schedule()` 不执行，Pipeline 调度卡在下一轮外部周期循环 | **不直接影响调度**（本就不调 `schedule()`），依赖外部周期循环聚合 |
+| 写入成功后对调度的影响 | 立即 `schedule()` 推进下一批 Block | 不直接推进调度，等外部循环在下一轮聚合 |
+| 额外副作用 | — | `not allow_blocks_to_fail` + 集成管道 → kill 所有其他流 Job |
+
+> **边界要点 3.1**：失败回调的重试机制与成功回调**完全对称**，两层嵌套、最多 9 次尝试。之前的「on_block_failure 只有 1 次写入机会」结论错误，在此修正。
+>
+> **边界要点 3.2**：失败回调**不主动推进调度**，失败后 PipelineRun 的最终状态（FAILED / CANCELLED / 继续跑其他分支）由外部周期性调度循环在下一次 `schedule()` 调用中通过 `all_blocks_completed()` / `any_blocks_failed()` 聚合决定。
 
 ### 3.5 PipelineRun 状态聚合
 
@@ -494,48 +540,59 @@ def schedule(self, ...):
 双端写入并非完全可靠，每一端都有明确的失败条件和兜底上限：
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                     Pod 内部状态写入（__update_block_run_status）                    │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│  主路径：DB 直写 block_run.update(**kwargs)                                           │
-│    ├─ 成功：直接 return                                                              │
-│    └─ 失败（DB 连接异常、SQL 错误等） → 进入 except                                    │
-│                                                                                      │
-│  兜底路径：HTTP PUT callback_url                                                      │
-│    ├─ 前置条件：callback_url 必须非 None                                              │
-│    │                                                                                  │
-│    │  ★ 关键限制 ★                                                                   │
-│    │  BlockExecutor._run_commands() (mage_ai/data_preparation/executors/             │
-│    │  block_executor.py L1324-L1367) 构建 Pod 内 CLI 命令时，**不拼接                │
-│    │  --callback-url 参数**；K8sBlockExecutor._execute() 也没额外传入。                │
-│    │  因此 Pod 内执行时 callback_url 几乎总是 None（除非用户手动传）。                  │
-│    │                                                                                  │
-│    ├─ callback_url is None → 函数开头 L1390-1391 `if not block_run_id and            │
-│    │   not callback_url: return` 直接返回，**状态写入完全丢失**                        │
-│    └─ callback_url 非 None → 发送 HTTP PUT，但可能因网络/API 问题失败，代码无再重试    │
-│                                                                                      │
-│  极端后果：Pod 内业务执行成功，但 DB 连不上 + callback_url=None → BlockRun 永远        │
-│           停在 RUNNING 状态，后续只能靠 Pod 外回调或外部人工修复                        │
-└─────────────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│                     Pod 内部状态写入（__update_block_run_status）                      │
+├───────────────────────────────────────────────────────────────────────────────────────┤
+│  主路径：DB 直写 block_run.update(**kwargs)                                             │
+│    ├─ 成功：直接 return                                                                │
+│    └─ 失败（DB 连接异常、SQL 错误等） → 进入 except                                      │
+│                                                                                        │
+│  兜底路径：HTTP PUT callback_url                                                        │
+│    ├─ 前置条件：callback_url 必须非 None                                                │
+│    │                                                                                    │
+│    │  ★ 关键限制 ★                                                                     │
+│    │  BlockExecutor._run_commands() (mage_ai/data_preparation/executors/               │
+│    │  block_executor.py L1324-L1367) 构建 Pod 内 CLI 命令时，**不拼接                  │
+│    │  --callback-url 参数**；K8sBlockExecutor._execute() 也没额外传入。                  │
+│    │  因此 Pod 内执行时 callback_url 几乎总是 None（除非用户手动传）。                    │
+│    │                                                                                    │
+│    ├─ callback_url is None + block_run_id 也 None → 函数开头 L1390-1391                 │
+│    │   `if not block_run_id and not callback_url: return` 直接返回，                    │
+│    │   **状态写入完全丢失**                                                              │
+│    └─ callback_url 非 None → 发送 HTTP PUT，但可能因网络/API 问题失败，代码无再重试      │
+│                                                                                        │
+│  极端后果：Pod 内业务执行成功，但 DB 连不上 + callback_url=None → BlockRun 永远          │
+│           停在 RUNNING 状态，后续只能靠 Pod 外回调或外部人工修复                          │
+└───────────────────────────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                   Pod 外部回调写入（on_block_complete / on_block_failure）            │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│  on_block_complete：                                                                 │
-│    ├─ @retry(retries=2, delay=5) → 共 3 次 DB 写入机会                                │
-│    ├─ 3 次全失败：抛出异常，后续 self.schedule() 不会执行，Pipeline 调度卡住           │
-│    └─ 成功写入后：self.schedule() 推进下一批 Block 的调度                              │
-│                                                                                      │
-│  on_block_failure：                                                                  │
-│    ├─ 无 @retry 装饰器 → 仅 1 次 DB 写入机会                                          │
-│    ├─ 写入失败：异常向上传播，BlockRun 可能停在 RUNNING                                │
-│    └─ 集成管道模式：kill 其他关联 Job                                                  │
-│                                                                                      │
-│  极端后果：Worker 进程在回调执行前被 SIGKILL（见四），则回调完全不执行，Pod 外写入丢失  │
-└─────────────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│                 Pod 外部回调写入（on_block_complete / on_block_failure）               │
+├───────────────────────────────────────────────────────────────────────────────────────┤
+│  ★ 两个回调共享相同的两层嵌套重试机制 ★                                                 │
+│                                                                                        │
+│  on_block_complete：                                                                   │
+│    ├─ 外层 @safe_db_query → 针对 OperationalError / PendingRollbackError /            │
+│    │     InternalError，共 3 次，无延迟立即重试                                         │
+│    ├─ 内层 @retry(retries=2, delay=5, 指数退避) → 针对所有异常，共 3 次，5s/10s 退避    │
+│    ├─ 嵌套合计：最多 9 次 DB 写入尝试（特定 DB 异常场景）                                │
+│    ├─ 全部失败：异常向上传播，self.schedule() 不会执行，Pipeline 调度推进需等外部循环     │
+│    └─ 成功写入后：self.schedule() 立即推进下一批 Block 的调度                            │
+│                                                                                        │
+│  on_block_failure：                                                                    │
+│    ├─ 外层 @safe_db_query → 与 on_block_complete **完全一致**（3 次 DB 特定异常重试）    │
+│    ├─ 内层 @retry(retries=2, delay=5) → 与 on_block_complete **完全一致**（3 次通用重试）│
+│    ├─ 嵌套合计：最多 9 次 DB 写入尝试                                                   │
+│    ├─ 全部失败：异常向上传播，BlockRun 状态无法落库                                      │
+│    ├─ 成功写入后：不调用 schedule()，调度聚合需等外部下一轮 schedule()                  │
+│    └─ 额外副作用：集成管道 + not allow_blocks_to_fail → kill 所有其他流 Mage 内部 Job   │
+│                                                                                        │
+│  公共极端后果：Worker 进程在回调执行前被 SIGKILL（见四），则回调完全不执行，Pod 外写入丢失│
+└───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-> **边界要点 5**：双端写入是「尽量写」而非「强一致保证」。Pod 内优先写，Pod 外回调做幂等补写并推进调度；但两端各有其失败模式，状态最终一致性依赖至少一端写入成功。
+> **边界要点 5**：双端写入是「尽量写」而非「强一致保证」。Pod 内优先写（但兜底 callback_url 在 K8s 场景下形同虚设），Pod 外回调做幂等补写并推进调度（但两层嵌套重试共 9 次仍可能全部失败）；状态最终一致性依赖至少一端写入成功。
+>
+> **边界要点 5.1**：成功/失败两个回调的重试机制完全对称（此前分析中误以为 on_block_failure 无重试，在此修正）。两者唯一的调度行为差异是：on_block_complete 成功后立即 `schedule()` 推进；on_block_failure 成功后不推进，交由外部周期循环聚合。
 
 **【状态推进阶段结束】**：所有 BlockRun 状态已尽量落库，PipelineRun 状态已聚合，后续 Block 的调度决策已完成。
 
@@ -805,25 +862,28 @@ def on_pipeline_run_failure(self, error_msg, status=FAILED):
 ### 6.1 两层执行器 + 双端写入模型
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  调度层 Executor（Pod 外，Mage Worker 进程）               │
-│  K8sPipelineExecutor / K8sBlockExecutor                   │
-│    职责：提交 K8s Job、轮询状态、触发 on_complete 回调      │
-│          → 回调负责推进调度（self.schedule()）             │
-│          → on_block_complete 有 3 次 DB 写入重试          │
-│          → on_block_failure 仅 1 次 DB 写入机会           │
-└──────────────────────┬───────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│  调度层 Executor（Pod 外，Mage Worker 进程）                 │
+│  K8sPipelineExecutor / K8sBlockExecutor                     │
+│    职责：提交 K8s Job、轮询状态、触发 on_complete/on_failure │
+│          → on_block_complete：成功后立即 self.schedule()     │
+│          → on_block_failure：不调 schedule，等外部循环聚合   │
+│          → 两个回调**共享相同的两层嵌套重试**：               │
+│            · 外层 @safe_db_query：3 次 DB 特定异常重试       │
+│            · 内层 @retry(retries=2)：3 次通用异常重试        │
+│            · 嵌套合计：最多 9 次 DB 写入尝试                 │
+└──────────────────────┬─────────────────────────────────────┘
                        │ K8s API
                        ▼
-┌──────────────────────────────────────────────────────────┐
-│  执行层 Executor（Pod 内，CLI 启动）                       │
-│  PipelineExecutor / BlockExecutor（type=local_python）     │
-│    职责：执行业务逻辑、DB 直写 BlockRun 状态                │
-│          → 主路径：block_run.update()                     │
-│          → 兜底：callback_url HTTP PUT（但 K8s 场景下      │
-│            _run_commands() 不传 callback_url，基本为 None）│
-│          → 两端都失败则状态写入丢失                        │
-└──────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│  执行层 Executor（Pod 内，CLI 启动）                         │
+│  PipelineExecutor / BlockExecutor（type=local_python）       │
+│    职责：执行业务逻辑、DB 直写 BlockRun 状态                  │
+│          → 主路径：block_run.update() （1 次机会）           │
+│          → 兜底：callback_url HTTP PUT（K8s 场景下形同虚设） │
+│            原因：_run_commands() 不拼接 --callback-url       │
+│          → 主兜底都失败 → 状态写入丢失                      │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ### 6.2 三个阶段的清晰边界
@@ -843,10 +903,12 @@ def on_pipeline_run_failure(self, error_msg, status=FAILED):
 
 ### 6.4 双端状态写入的兜底限制
 
-- Pod 内兜底路径 `callback_url` 在 K8s 场景下几乎总是 None（`_run_commands()` 不拼接该参数），Pod 内实际上只有 DB 直写一次机会
-- Pod 外 `on_block_complete` 有 `@retry(retries=2, delay=5)` 共 3 次机会，`on_block_failure` 无重试
+- Pod 内写入：主路径 `block_run.update()` 仅 1 次 DB 写入机会；兜底路径 `callback_url` 在 K8s 场景下几乎总是 None（`_run_commands()` 不拼接 `--callback-url` 参数），因此 Pod 内实际上**只有 DB 直写 1 次机会**，无有效兜底
+- Pod 外回调：`on_block_complete` 和 `on_block_failure` 重试机制**完全对称**，均为两层嵌套：外层 `@safe_db_query` 3 次（DB 特定异常，无延迟）+ 内层 `@retry(retries=2, delay=5, 指数退避)` 3 次（所有异常，5s/10s），嵌套合计**最多 9 次尝试**
+- 两个回调对调度的影响不对称：on_block_complete 成功后**立即** `schedule()` 推进；on_block_failure 成功后**不**推进，交由外部下一轮 `schedule()` 聚合
 - 如果 Worker 被 SIGKILL（取消场景），Pod 外回调完全不执行，只能依赖 Pod 内写入
 - 极端情况下（Pod 内 DB 不可达 + Pod 外 Worker 被强杀），BlockRun 会永久停在 RUNNING，需人工修复
+- 极端情况下（Pod 内 DB 不可达 + Pod 外 9 次重试全失败），BlockRun 同样停在 RUNNING，同样需人工修复
 
 ### 6.5 同步阻塞与并发解耦
 
