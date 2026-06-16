@@ -52,7 +52,8 @@ Variable.__init__(storage=...)
     ↓
 Variable.write_data(data)
     ├─ DataManager.write_sync() 可写? → 批量写
-    ├─ DataFrame → __write_parquet()
+    ├─ DATAFRAME → __write_parquet()
+    ├─ MATRIX_SPARSE → __write_matrix_sparse()（自写 data.json + sample_data.json）
     ├─ 复杂对象 → __save_complex_object + __write_json
     └─ 其他 → __should_save_object + __write_json
     ↓
@@ -248,7 +249,7 @@ if not skip_delete and is_dynamic_child:
 | `GEO_DATAFRAME` | `data.shp` 系列 | `sample_data.shp` | — | `__write_geo_dataframe()` |
 | `DICTIONARY_COMPLEX` | `data.json` | `sample_data.json` | `data_column_types.json` | `__save_complex_object` + `__write_json` |
 | `LIST_COMPLEX` | `data.json` | `sample_data.json` | `data_column_types.json` | 同上 |
-| `MATRIX_SPARSE` | `data.json` (序列化矩阵) | — | — | `__write_matrix_sparse` + `__write_json` |
+| `MATRIX_SPARSE` | `data.json` | `sample_data.json` | `statistics.json` (单矩阵时) | `__write_matrix_sparse()` |
 | `SERIES_PANDAS` | `data.parquet` 或 `data.json` | — | `data_column_types.json` | `__write_series_pandas` |
 | `MODEL_SKLEARN` | `model.joblib` | — | — | `__should_save_object` |
 | `MODEL_XGBOOST` | `model.ubj` | — | — | 同上 |
