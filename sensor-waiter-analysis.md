@@ -373,14 +373,24 @@ if BlockType.CHART != self.type:
 
 ### 3.3 aggregate_summary_info 的边界条件
 
-[aggregate_summary_info](file:///d:/fz/0601/solo-dogfeeding/code/331-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L3760-L3774) 在 [execute_sync.L1642-L1645](file:///d:/fz/0601/solo-dogfeeding/code/331-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1642-L1645) 中被调用：
+#### 调用顺序与前置条件
 
-```python
-if not is_dynamic_block_child(self):
-    self.aggregate_summary_info()
+[aggregate_summary_info](file:///d:/fz/0601/solo-dogfeeding/code/331-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L3760-L3774) 在 [execute_sync.L1642-L1645](file:///d:/fz/0601/solo-dogfeeding/code/331-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1642-L1645) 中被调用，位于 `store_variables` **之后**：
+
+```
+store_variables()
+    ↓
+aggregate_summary_info()  [L1642-L1645]
+    ↓
+self._outputs = None     [L1648]
+    ↓
+analyze_outputs()        [L1650-L1661]
 ```
 
-内部实现：
+由于 `store_variables` 内部已经删除了旧输出变量（见 2.3 节），`aggregate_summary_info` 扫描时磁盘上的变量状态取决于写入策略。
+
+#### 内部实现与退出条件
+
 ```python
 def aggregate_summary_info(self, execution_partition=None):
     if not VARIABLE_DATA_OUTPUT_META_CACHE or not self.variable_manager:
@@ -397,7 +407,21 @@ def aggregate_summary_info(self, execution_partition=None):
 1. `VARIABLE_DATA_OUTPUT_META_CACHE` 为 False（配置开关）
 2. `self.variable_manager` 为 None（无管道）
 
-**Sensor 影响**：即使 Sensor 本次没有输出变量，`aggregate_summary_info_for_all_variables` 仍然会扫描磁盘上的变量目录。如果之前有残留的 `output_0`、`print_0`、`statistics` 等变量文件，它们会被统计到汇总信息中，造成**过时的汇总数据**。
+#### Sensor 场景下的精确行为
+
+不同写入策略下，`aggregate_summary_info` 扫描到的变量不同：
+
+| 写入策略 | 输出变量 (output_*, df) | 非输出变量 (print_*, statistics 等) | 汇总数据状态 |
+|---------|------------------------|-------------------------------------|-------------|
+| 默认（无策略） | ❌ 已被 `store_variables` 删除 | ✅ 仍存在（从未被清理） | 输出变量缺失，非输出变量过时 |
+| FAIL（有旧数据） | ❌ 第一个变量抛异常，后续状态不确定 | ✅ 仍存在 | 不一致（取决于异常发生位置） |
+| APPEND（有旧数据） | ✅ 第一个变量触发 return，全部残留 | ✅ 仍存在 | 全部过时 |
+| 动态子块 | — | — | `aggregate_summary_info` 不被调用 [L1642] |
+
+**关键结论**：
+- **默认路径下输出变量不会造成过时汇总**——因为 `store_variables` 已先将其删除
+- **非输出变量始终造成过时汇总**——因为它们从未被 `__store_variables_prepare` 选中删除
+- **只有写入策略异常时输出变量才可能残留**——FAIL 抛异常终止、APPEND 直接 return 都会导致输出变量未被删除
 
 ### 3.4 _outputs 缓存重置
 
@@ -514,8 +538,9 @@ return __execute()
 │   → ❌ 非输出变量残留                                 │
 │                                                       │
 │  aggregate_summary_info()                             │
-│   → 扫描磁盘变量目录                                 │
-│   → 可能统计到残留变量的过时数据                      │
+│   → 扫描磁盘变量目录（在 store_variables 之后）       │
+│   → 默认：输出变量已被删，只剩非输出变量过时数据       │
+│   → FAIL/APPEND策略：输出变量也可能残留，全部过时     │
 │                                                       │
 │  analyze_outputs({})                                  │
 │   → for 循环不执行 → 空操作                           │
@@ -534,9 +559,11 @@ return __execute()
 |------|-------------------|------|
 | **同步路径不跳过 Sensor** | `run_blocks_sync` 没有 `run_sensors` 跳过逻辑 | `run_sensors=False` 时同步路径仍会执行 Sensor，只是降级为单次检查 |
 | **`from_notebook` 语义误导** | 实际含义是"是否轮询"，由 `not run_sensors` 推导 | 代码可读性差，容易误解为"来自 Notebook" |
-| **空输出会清理旧输出变量** | `override_outputs=True`（默认）+ `__store_variables_prepare` 判断逻辑 | 旧的 `output_*` 和 `df` 变量会被删除（默认无写策略时） |
-| **非输出变量始终残留** | `override=False` 硬编码 + `is_output_variable` 过滤逻辑 | `print_*`、`statistics`、`insights_*` 等变量永远不会被清理 |
-| **APPEND 策略的异常行为** | `delete_variables` 遇到第一个有数据的变量就 `return` | 后续变量（即使在删除列表中）都不会被删除 |
+| **默认路径空输出会清旧输出变量** | `override_outputs=True`（默认）+ `__store_variables_prepare` 判断逻辑 + `delete_variables` 正常执行 | 默认无写策略时，旧的 `output_*` 和 `df` 变量会被删除 |
+| **输出变量残留有条件** | 仅 FAIL 抛异常、APPEND 提前 return 时，输出变量才可能未被删除 | 默认路径下输出变量不会残留，只有写入策略异常时才会残留 |
+| **非输出变量始终残留** | `override=False` 硬编码 + `is_output_variable` 过滤逻辑 | `print_*`、`statistics`、`insights_*` 等非输出变量永远不会被清理 |
+| **APPEND 策略的异常行为** | `delete_variables` 遇到第一个有数据的变量就 `return` | 后续变量（即使在删除列表中）都不会被删除，批量删除失效 |
+| **aggregate_summary_info 与变量清理联动** | 调用顺序在 `store_variables` 之后 | 默认路径下输出变量已被删，汇总不会包含过时输出变量；但非输出变量仍会造成过时汇总 |
 | **轮询路径无内存跟踪** | `SensorBlock.execute_block_function` 重写跳过 `execute_with_memory_tracking` | `self.resource_usage = None`，长时间轮询的内存消耗不可观测 |
 | **execute_sync 的 MemoryManager 被注释** | 不再有外层内存管理 | 所有块类型都失去了这层保护，Sensor 尤其受影响 |
 | **线程池阻塞风险** | `time.sleep(60)` 在 `run_in_executor` 线程中 | 多个 Sensor 并行时可能耗尽线程池 |
