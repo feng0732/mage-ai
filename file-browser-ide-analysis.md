@@ -225,13 +225,13 @@ useFileComponents (核心 Hook)
 
 | HTTP 方法 | 前端调用 | 后端路由模式 | 处理 Handler | 对应 Resource |
 |----------|---------|-------------|-------------|--------------|
-| GET | `api.files.list()` | `/api/files` | `ApiResourceListHandler` | [FileResource.collection()](mage_ai/api/resources/FileResource.py#L30-L127) |
-| POST | `api.files.useCreate()` | `/api/files` | `ApiResourceListHandler` | [FileResource.create()](mage_ai/api/resources/FileResource.py#L129-L200) |
-| GET | `api.files.detail(pk)` | `/api/files/{pk}` | `ApiResourceDetailHandler` | [FileResource.member()](#) |
-| PUT | `api.files.useUpdate(pk)` | `/api/files/{pk}` | `ApiResourceDetailHandler` | [FileResource.update()](#) |
-| DELETE | `api.files.useDelete(pk)` | `/api/files/{pk}` | `ApiResourceDetailHandler` | [FileResource.delete()](#) |
-| GET | `api.file_contents.detail(pk)` | `/api/file_contents/{pk}` | `ApiResourceDetailHandler` | [FileContentResource.member()](mage_ai/api/resources/FileContentResource.py#L1-L50) |
-| PUT | `api.file_contents.useUpdate(pk)` | `/api/file_contents/{pk}` | `ApiResourceDetailHandler` | [FileContentResource.update()](#) |
+| GET | `api.files.list()` | `/api/files` | `ApiResourceListHandler` | [FileResource.collection()](mage_ai/api/resources/FileResource.py#L33-L127) |
+| POST | `api.files.useCreate()` | `/api/files` | `ApiResourceListHandler` | [FileResource.create()](mage_ai/api/resources/FileResource.py#L131-L204) |
+| GET | `api.files.detail(pk)` | `/api/files/{pk}` | `ApiResourceDetailHandler` | [FileResource.member()](mage_ai/api/resources/FileResource.py#L208-L215) |
+| PUT | `api.files.useUpdate(pk)` | `/api/files/{pk}` | `ApiResourceDetailHandler` | [FileResource.update()](mage_ai/api/resources/FileResource.py#L240-L271) |
+| DELETE | `api.files.useDelete(pk)` | `/api/files/{pk}` | `ApiResourceDetailHandler` | [FileResource.delete()](mage_ai/api/resources/FileResource.py#L224-L237) |
+| GET | `api.file_contents.detail(pk)` | `/api/file_contents/{pk}` | `ApiResourceDetailHandler` | [FileContentResource.member()](mage_ai/api/resources/FileContentResource.py#L19-L45) |
+| PUT | `api.file_contents.useUpdate(pk)` | `/api/file_contents/{pk}` | `ApiResourceDetailHandler` | [FileContentResource.update()](mage_ai/api/resources/FileContentResource.py#L47-L69) |
 | GET | `api.files.file_versions.list(parentId)` | `/api/files/{pk}/file_versions` | `ApiChildListHandler` | — |
 
 **路由优先级说明**（`server.py` 中定义顺序）：
