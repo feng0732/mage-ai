@@ -453,48 +453,290 @@ Mage 中有 **两套独立的** 运行时变量传递机制：
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.5 Block 级别变量覆盖（Pipeline 级别之上）
+### 7.5 Hook 变量的完整生命周期
 
-Block 执行时还有 **两层额外覆盖**，在 Pipeline 级 `global_vars` 基础上继续叠加：
+Hook 变量的注入涉及 **3 个阶段**：Hook 自身执行、hook_variables 设入 metrics、下游 Block 读取并 merge。
+
+#### 阶段 A: Hook 自身执行（独立 pipeline，独立变量空间）
+
+[pipelines.py attach_global_hook_execution()](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/global_hooks/pipelines.py#L15-L96) 在 pipeline 运行前插入 Hook Block Run：
 
 ```
-Pipeline 级 global_vars (优先级 1-6 合并结果)
-        ↓
-  ┌──── 优先级 7: Hook 变量 ────┐
-  │ 来源: block_run.metrics['hook_variables']
-  │ 位置: BlockExecutor.execute() 第 178 行
-  │ 合并: global_vars = merge_dict(global_vars, hook_variables)
-  │ 条件: FeatureUUID.GLOBAL_HOOKS 启用
-  └──────────────────────────────┘
-        ↓
-  ┌──── 优先级 8 (最高): 上游 Block kwargs 输出 ────┐
-  │ 来源: 上游 Block 的输出变量中被标记为 kwargs 的部分
-  │ 位置: Block.execute_sync() 第 1904-1908 行
-  │ 合并: for kwargs_var in kwargs_vars:
-  │         global_vars_copy.update(kwargs_var)
-  │ 特点: 每个上游 Block 依次覆盖，后执行的上游优先级更高
-  └──────────────────────────────────────────────┘
+1. GlobalHooks.load_from_file() → 加载 global_hooks.yaml
+2. 匹配: operation=EXECUTE, resource=Pipeline, stage=BEFORE
+3. 构建 hook_variables:
+   hook_variables = dict(
+       operation_resource=pipeline_run.to_dict(),
+       payload=dict(block_runs=..., pipeline_schedule=...),
+       resource=pipeline.to_dict(),
+       resource_id=pipeline.uuid,
+   )
+4. 创建 HookBlockRun:
+   metrics = {
+       downstream_blocks: [root_block_uuids],   ← Hook 的下游是根 Block
+       hook: hook.to_dict(),                    ← Hook 配置
+       hook_variables: hook_variables,          ← Hook 上下文变量
+   }
+5. 修改根 Block 的 create_options:
+   metrics = { upstream_blocks: [hook_block_run_uuids] }  ← 根 Block 上游是 Hook
 ```
 
-### 7.6 优先级冲突示例（同名 key `env` 在各层的覆盖）
+#### 阶段 B: HookBlock 执行（触发独立 pipeline）
 
-| 层级 | 值 | 是否生效 | 说明 |
-|------|---|---------|------|
-| Pipeline YAML | `'dev'` | ❌ | 被调度器变量覆盖 |
-| Schedule 变量 | `'staging'` | ❌ | 被 Run 变量覆盖 |
-| PipelineRun 变量 | `'test'` | ❌ | 被系统变量覆盖 |
-| Event 变量 | `'prod_event'` | ❌ | 填空模式，key 已存在不覆盖 |
-| 系统注入 (`env = ENV_PROD`) | `'production'` | ❌ | 被 extra_variables 覆盖 |
-| extra_variables (CLI runtime) | `'custom_env'` | ✅ | 最终生效（优先级 6） |
-| Hook 变量 | `'hook_env'` | ✅ | 如果启用 Hook，覆盖上面所有 |
-| 上游 kwargs 输出 | `'upstream_env'` | ✅ | 最终最终生效（优先级 8） |
+[block.py HookBlock._execute_block()](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/hook/block.py#L8-L38)
 
-**关键结论**：
-1. `merge_dict(a, b)` 和 `dict.update(b)` 都是 **后者赢**（b 覆盖 a）
-2. Event 变量是唯一 **不覆盖** 的（仅填空），但 `event` 字段内部是覆盖模式
-3. 系统变量 **不是** 最高优先级，`extra_variables` 可以覆盖它们
-4. Block 级别还有两层额外覆盖：Hook 变量 → 上游 kwargs 输出
-5. 有 **两套独立的** 运行时变量：`pipeline_run.variables`（DB存，优先级3）和 `extra_variables`（参数传，优先级6）
+```python
+class HookBlock(Block):
+    def _execute_block(self, *args, **kwargs):
+        global_vars = kwargs.get('global_vars') or {}
+        self.hook.run(
+            with_trigger=True,
+            **(global_vars or {}),   # ← Hook 自身的 global_vars 作为 kwargs 传入
+        )
+```
+
+[Hook.run()](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/global_hooks/models.py#L373-L441) 执行时构建变量：
+
+```python
+variables = merge_dict(
+    self.pipeline_settings.get('variables') or {},       # ① Hook pipeline 自身变量
+    merge_dict(
+        variables_from_operation,                         # ② 操作上下文变量 (error, meta, resource...)
+        dict(
+            hook=self.to_dict(),                          # ③ Hook 配置自身
+            project=self.project,                         # ④ 项目信息
+        ),
+    ),
+)
+# 然后触发独立 pipeline 执行:
+# trigger_pipeline(..., variables=variables)
+# 或 PipelineExecutor(...).execute(global_vars=variables)
+```
+
+**关键**：Hook 执行的 pipeline 是 **完全独立的**，它有自己的 PipelineRun、自己的变量空间。Hook 的输出通过 `Hook.get_and_set_output()` 提取到 `self.output` 字典中。
+
+#### 阶段 C: 下游普通 Block 读取 hook_variables 并 merge
+
+[block_executor.py BlockExecutor.execute()](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/executors/block_executor.py#L158-L181)
+
+```python
+# 条件: FeatureUUID.GLOBAL_HOOKS 启用 + block_run.metrics.get('hook') 存在
+if block_run.metrics.get('hook_variables'):
+    global_vars = merge_dict(
+        global_vars,                                      # Pipeline 级已合并变量
+        block_run.metrics.get('hook_variables') or {},    # hook_variables (覆盖)
+    )
+```
+
+**注意**：`hook_variables` 来自 `attach_global_hook_execution()` 构建的 `metrics['hook_variables']`，**不是** Hook pipeline 的输出结果。它是操作上下文（pipeline_run 信息、resource 信息等），不是 Hook 执行后的 output。
+
+---
+
+### 7.6 kwargs_vars 的三条来源路径
+
+[block/utils.py fetch_input_variables()](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/utils.py#L389-L845)
+
+`kwargs_vars` 是上游 Block 输出中被提取出来作为 `**kwargs` 注入当前 Block 的 **metadata 字典**。它有 3 条独立的来源路径：
+
+#### 路径 1: GLOBAL_DATA_PRODUCT 上游
+
+[block/utils.py L527-L546](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/utils.py#L527-L546)
+
+```python
+if BlockType.GLOBAL_DATA_PRODUCT == upstream_block.type:
+    global_data_product = upstream_block.get_global_data_product()
+    input_vars[idx] = global_data_product.get_outputs()   # 主输出
+
+    mds = {}
+    variable_uuids = upstream_block.output_variables(execution_partition=...)
+    for variable_uuid in variable_uuids:
+        md = pipeline.get_block_variable(upstream_block_uuid, variable_uuid, ...)
+        if isinstance(md, dict):
+            mds.update(md)
+    kwargs_vars.append(mds)   # ← GDP 的所有输出变量逐个读取，dict 的 merge 到 mds
+    continue
+```
+
+**特点**：GDP 的 kwargs_vars 是所有输出变量的 dict 合并结果。如果多个变量是 dict，后面的 key 会覆盖前面的同名 key。
+
+#### 路径 2: Dynamic Block 上游（metadata 输出）
+
+[block/utils.py L618-L680](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/utils.py#L618-L680)
+
+Dynamic Block 的 `output_0` 是主数据，`output_1` 是 metadata 字典：
+
+```python
+# 多个 dynamic block indexes 的情况
+if len(variable_values) >= 2:
+    metadata_data = variable_values[1]
+    kwargs_vars.append(metadata_data[index])   # ← 按 dynamic_block_index 取对应 metadata
+
+# 单个 dynamic block 的情况
+if len(variable_values) >= 2:
+    arr = variable_values[1]
+    if dynamic_block_index is None:
+        kwargs_vars.append(arr)                # ← 整个 metadata
+    elif type(arr) is list:
+        kwargs_vars.append(arr[dynamic_block_index])  # ← 取对应 index
+```
+
+**特点**：Dynamic Block 的第 2 个输出变量（`output_1`）是 metadata，被提取为 kwargs_vars。
+
+#### 路径 3: 普通 Block 上游
+
+[block/utils.py L681-L690](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/utils.py#L681-L690)
+
+普通 Block 不产生 kwargs_vars —— 它们的输出直接作为 `input_vars[idx]` 传入当前 Block 的位置参数。
+
+```python
+elif not dynamic_upstream_block_uuids or not upstream_in_dynamic_upstream:
+    input_vars[idx] = final_val   # ← 仅填充 input_vars，不 append kwargs_vars
+```
+
+**结论**：只有 **GLOBAL_DATA_PRODUCT** 和 **Dynamic Block** 类型的上游才会产生 `kwargs_vars`。普通 Block 的输出只进入 `input_vars`，不会覆盖 `global_vars` 的任何 key。
+
+---
+
+### 7.7 Remote Blocks 输出处理
+
+[block/utils.py L825-L843](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/utils.py#L825-L843)
+
+Remote Blocks 嵌入在 `kwargs_vars` 的 `remote_blocks` key 中，在 `fetch_input_variables()` 返回前被替换：
+
+```python
+if kwargs_vars:
+    remote_blocks_output = []
+    for kwargs in kwargs_vars:
+        for remote_block_dict in kwargs.get('remote_blocks', []):
+            if current_block and BlockType.GLOBAL_DATA_PRODUCT == current_block.type:
+                output = remote_block_dict            # GDP 只需信息，不要输出
+            else:
+                output = RemoteBlock.load(**remote_block_dict).get_outputs()  # 读取输出
+            remote_blocks_output.append(output)
+
+    for kwargs in kwargs_vars:
+        if kwargs.get('remote_blocks'):
+            kwargs['remote_blocks'] = remote_blocks_output  # ← 替换为实际输出数据
+```
+
+[RemoteBlock.get_outputs()](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/remote/models.py#L48-L57) 从远程 pipeline 的 VariableManager 读取输出。
+
+**Remote Block 不是独立路径**：它嵌入在 kwargs_vars 的 `remote_blocks` key 中，随 kwargs_vars 一起被 `global_vars_copy.update(kwargs_var)` 合并。
+
+---
+
+### 7.8 Block 级别完整变量合并时序（代码实际执行顺序）
+
+```
+BlockExecutor.execute(global_vars)
+│
+├─ 步骤 1: Hook 变量 merge (仅 GLOBAL_HOOKS + hook 存在时)
+│  │  位置: block_executor.py L177-L181
+│  │  代码: global_vars = merge_dict(global_vars, hook_variables)
+│  │  效果: hook_variables 覆盖 global_vars 同名 key
+│  │  来源: attach_global_hook_execution() 在 pipeline_scheduler 中设入 metrics
+│  │  内容: operation_resource, payload, resource, resource_id 等
+│  ↓
+│  global_vars 已包含 Hook 覆盖
+│
+├─ 步骤 2: 进入 Block.execute_block() / execute_sync()
+│  │
+│  ├─ 步骤 2a: fetch_input_variables()
+│  │  │  从上游 Block 读取输出 → input_vars + kwargs_vars
+│  │  │  kwargs_vars 只在以下上游类型中产生:
+│  │  │    - GLOBAL_DATA_PRODUCT: 所有 dict 输出变量 merge
+│  │  │    - Dynamic Block: output_1 (metadata)
+│  │  │  普通 Block 的输出仅进入 input_vars，不产生 kwargs_vars
+│  │  │  Remote Blocks 嵌入 kwargs_vars['remote_blocks']，已替换为实际输出
+│  │  ↓
+│  │
+│  ├─ 步骤 2b: kwargs_vars merge 到 global_vars_copy
+│  │  │  位置: block/__init__.py L1904-L1908
+│  │  │  代码:
+│  │  │    global_vars_copy = global_vars.copy()
+│  │  │    for kwargs_var in kwargs_vars:
+│  │  │        if kwargs_var:
+│  │  │            global_vars_copy.update(kwargs_var)
+│  │  │  效果: 每个 kwargs_var 按 upstream 遍历顺序覆盖
+│  │  │  注意: 后遍历的上游 Block 覆盖先遍历的
+│  │  ↓
+│  │
+│  └─ 步骤 2c: _execute_block(..., global_vars=global_vars_copy)
+│     │  最终调用: block_function(*input_vars, **global_vars_copy)
+│     └─ global_vars_copy 作为 **kwargs 注入用户代码
+```
+
+---
+
+### 7.9 同名 key 覆盖的最终顺序（从低到高）
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│ Pipeline 级 (详见 7.4 节)                                          │
+│ 优先级 1: Pipeline YAML 全局变量                                    │
+│ 优先级 2: PipelineSchedule 调度器变量                                │
+│ 优先级 3: PipelineRun.variables (DB 存储)                           │
+│ 优先级 4: Event 事件变量 (填空，不覆盖)                               │
+│ 优先级 5: 系统注入变量 (ds, hr, env, ...)                           │
+│ 优先级 6: extra_variables (runtime 传参，最后 update)                │
+├────────────────────────────────────────────────────────────────────┤
+│ Block 级 (在 Pipeline 级结果之上继续覆盖)                             │
+│ 优先级 7: hook_variables                                           │
+│   来源: block_run.metrics['hook_variables']                        │
+│   合并: merge_dict(global_vars, hook_variables)                    │
+│   内容: operation_resource, payload, resource, resource_id        │
+│   条件: FeatureUUID.GLOBAL_HOOKS 启用 + hook 存在                  │
+│   ⚠️ 注意: 这是操作上下文，不是 Hook pipeline 的执行输出              │
+├────────────────────────────────────────────────────────────────────┤
+│ 优先级 8: kwargs_vars (上游 metadata)                              │
+│   来源:                                                            │
+│     8a: GLOBAL_DATA_PRODUCT 上游 → 所有 dict 输出变量 merge        │
+│     8b: Dynamic Block 上游 → output_1 (metadata dict)              │
+│   合并: for kwargs_var in kwargs_vars:                             │
+│           global_vars_copy.update(kwargs_var)                      │
+│   遍历顺序: 按 upstream_block_uuids 列表顺序                        │
+│   ⚠️ 最后一个上游的 kwargs_var 优先级最高                           │
+│   Remote Blocks: 嵌入 kwargs_vars['remote_blocks']，               │
+│                  先替换为实际输出再 update                            │
+├────────────────────────────────────────────────────────────────────┤
+│ ⭐ 最终注入: block_function(*input_vars, **global_vars_copy)         │
+│    同名 key 在 global_vars_copy 中的值就是最终值                     │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.10 同名 key 冲突示例
+
+假设 `api_key` 在各层都有值：
+
+| 优先级 | 层级 | 值 | 是否生效 | 说明 |
+|--------|------|---|---------|------|
+| 1 | Pipeline YAML | `'yaml_key'` | ❌ | 被 schedule 覆盖 |
+| 2 | Schedule 变量 | `'schedule_key'` | ❌ | 被 run 变量覆盖 |
+| 3 | PipelineRun 变量 | `'run_key'` | ❌ | 被系统变量覆盖 |
+| 4 | Event 变量 | `'event_key'` | ❌ | 填空模式，key 已存在 |
+| 5 | 系统变量 | N/A | — | `api_key` 非系统变量 |
+| 6 | extra_variables | `'runtime_key'` | ❌ | 被 hook_variables 覆盖 |
+| 7 | hook_variables | `'hook_key'` | ❌ | 被 kwargs_vars 覆盖 |
+| 8 | kwargs_vars (上游 GDP) | `'gdp_key'` | ✅ | 最终生效（最高） |
+
+**特殊情况**：如果 `api_key` 是系统变量名（如 `env`）：
+
+| 优先级 | 层级 | 值 | 是否生效 |
+|--------|------|---|---------|
+| 5 | 系统注入 `env = ENV_PROD` | `'production'` | ❌ |
+| 6 | extra_variables `env = 'custom'` | `'custom'` | ❌ |
+| 7 | hook_variables `env = 'hook'` | `'hook'` | ❌ |
+| 8 | kwargs_vars `env = 'upstream'` | `'upstream'` | ✅ |
+
+### 7.11 三条路径的变量边界总结
+
+| 路径 | 变量空间 | 是否独立 PipelineRun | 输出如何注入下游 |
+|------|---------|---------------------|----------------|
+| Hook 自身执行 | 独立变量空间（Hook.run() 构建） | ✅ 独立 PipelineRun | 不直接注入下游。输出存入 `hook.output`，但 **下游 Block 收到的** 是 `hook_variables`（操作上下文），不是 Hook pipeline 的 output |
+| 普通 Block 上游 | 同一 PipelineRun | ❌ 同一 PipelineRun | 输出进入 `input_vars[idx]`（位置参数），**不产生 kwargs_vars**，不覆盖 global_vars |
+| GDP 上游 | 同一 PipelineRun | ❌ 同一 PipelineRun | 输出分两部分：主输出 → `input_vars[idx]`，dict 输出 → `kwargs_vars.append(mds)` |
+| Dynamic Block 上游 | 同一 PipelineRun | ❌ 同一 PipelineRun | output_0 → `input_vars[idx]`，output_1 (metadata dict) → `kwargs_vars.append()` |
+| Remote Blocks | 跨 PipelineRun | ✅ 独立 PipelineRun | 嵌入 kwargs_vars 的 `remote_blocks` key，替换为 `RemoteBlock.get_outputs()` 结果 |
 
 ---
 
@@ -687,9 +929,17 @@ metadata.yaml 中的 `{{ env_var('KEY') }}` 和 `{{ mage_secret_var('key') }}` �
 | merge_dict (覆盖语义) | [hash.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/shared/hash.py#L198-L209) | L198-L209 |
 | VariableResource API | [VariableResource.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/api/resources/VariableResource.py) | L1-L190 |
 | get_template_vars | [shared/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/shared/utils.py#L7-L37) | L7-L37 |
-| fetch_input_variables | [block/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/utils.py#L389-L502) | L389-L502 |
+| fetch_input_variables (含 kwargs_vars) | [block/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/utils.py#L389-L845) | L389-L845 |
+| **GDP kwargs_vars 产生** | [block/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/utils.py#L527-L546) | **L527-L546** |
+| **Dynamic Block kwargs_vars 产生** | [block/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/utils.py#L618-L680) | **L618-L680** |
+| **Remote Blocks 替换** | [block/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/utils.py#L825-L843) | **L825-L843** |
 | Block **kwargs 注入 | [block/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L2161-L2171) | L2161-L2171 |
 | **Hook 变量 merge** | [block_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/executors/block_executor.py#L177-L181) | **L177-L181** |
-| **上游 kwargs 输出 merge** | [block/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1904-L1908) | **L1904-L1908** |
+| **上游 kwargs_vars merge** | [block/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1904-L1908) | **L1904-L1908** |
+| **HookBlock._execute_block** | [block.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/hook/block.py#L8-L38) | **L8-L38** |
+| **Hook.run() 变量构建** | [models.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/global_hooks/models.py#L373-L441) | **L373-L441** |
+| **Hook.get_and_set_output()** | [models.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/global_hooks/models.py#L259-L371) | **L259-L371** |
+| **attach_global_hook_execution()** | [pipelines.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/global_hooks/pipelines.py#L15-L96) | **L15-L96** |
+| RemoteBlock.get_outputs() | [models.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/remote/models.py#L48-L57) | L48-L57 |
 | CLI run 变量流（两种分支） | [cli/main.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/cli/main.py#L237-L242) | L237-L242 |
 | configure_pipeline_run_payload | [pipeline_scheduler_original.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/orchestration/pipeline_scheduler_original.py#L1365-L1394) | L1365-L1394 |
