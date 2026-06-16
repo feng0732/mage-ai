@@ -381,13 +381,18 @@ async def validate_condition_with_cache(policy, operation, ...):
 
 **结果**：原本只有 pipeline-a 权限的用户，会被认为对所有 pipeline 都有权限。
 
-#### 3.5.4 对跨项目隔离的影响
+#### 3.5.4 对权限粒度控制的影响（重要纠正）
 
-缓存污染会进一步加剧跨项目隔离的失效：
+缓存污染会削弱细粒度权限控制，但**不会导致跨项目数据泄漏**：
 
-1. **放大效应**：只要有一个资源匹配了权限，同类型的所有资源都会被认为有权限
-2. **项目间泄漏**：如果在项目 A 中缓存了授权结果，切换到项目 B 后（如果共享 result_set）缓存仍然有效
+1. **放大效应（同项目内）**：只要有一个资源匹配了权限，同类型的所有资源都会被认为有权限
+2. **作用域限制**：
+   - ✅ 仅在同一请求内生效
+   - ✅ 仅作用于当前项目的数据（数据层已过滤）
+   - ❌ 不会跨请求（每个请求有独立的 ResultSet）
+   - ❌ 不会跨项目（数据查询层 repo_path 过滤是独立防线）
 3. **属性级同样受影响**：属性级缓存的 key 也不含 entity_id，同样存在污染问题
+4. **关键澄清**："项目间泄漏"只有在数据查询层也出现缺陷时才会发生，默认配置下不会泄漏数据
 
 ---
 
@@ -419,13 +424,13 @@ return authorized and not unauthorized  # 禁用优先
 | 属性操作全禁用 | `permission.access & DISABLE_QUERY_ALL` 等 | `user_permissions.py L172-L174` |
 | 具体属性禁用 | `attribute in permission.access_options['disabled_attributes']` | `user_permissions.py L185-L198` |
 
-#### 3.6.3 跨项目场景下的禁用优先问题
+#### 3.6.3 禁用权限的影响范围（重要纠正）
 
-由于新模式不区分 Entity 层级，且 entity_id 在 resource=None 时不检查，禁用权限可能产生跨项目的影响：
+由于新模式不区分 Entity 层级，且 entity_id 在 resource=None 时不检查，禁用权限可能产生**跨资源类型**的影响，但**不会跨项目泄漏数据**：
 
 **场景示例**：
 - 项目 A 中，用户有一个全局 Viewer 权限（entity_name=ALL, access=VIEWER）
-- 项目 B 中，管理员设置了一个禁用权限（entity_name=Pipeline, entity_id=None, access=DISABLE_OPERATION_ALL）
+- 管理员设置了一个禁用权限（entity_name=Pipeline, entity_id=None, access=DISABLE_OPERATION_ALL）
 - 用户在项目 A 调用 LIST /pipelines
 
 ```
@@ -437,7 +442,13 @@ return authorized and not unauthorized  # 禁用优先
 结果: authorized=True, unauthorized=True → ❌ 被禁用
 ```
 
-**问题**：项目 B 的禁用权限，影响了用户在项目 A 的访问。
+**影响分析**：
+- ✅ 不会导致其他项目的数据被返回（数据层 repo_path 过滤）
+- ⚠️ 可能错误地拒绝当前项目的合法访问（禁用权限影响范围过大）
+- ⚠️ 禁用权限不区分项目，可能影响所有项目中的 Pipeline 访问
+- ❌ 不会"泄漏"数据，只会"误伤"合法访问
+
+**关键澄清**：这里的"跨项目影响"是指禁用权限可能在多个项目中生效（因为权限加载不按项目过滤），但不会导致项目 A 的数据返回到项目 B 的请求中。
 
 #### 3.6.4 禁用权限与缓存的交互
 
@@ -508,7 +519,10 @@ return authorized and not unauthorized  # 禁用优先
         └─ 同样因缓存污染而通过 ⚠️
 ```
 
-**最终结论**：在新模式下，由于 entity_id 检查在 resource=None 时被跳过，且授权缓存不含 entity_id 维度，细粒度的 entity_id 权限在 LIST 操作中基本起不到隔离作用，反而可能因缓存污染导致权限泄漏。
+**最终结论（重要校准）**：在新模式下，由于 entity_id 检查在 resource=None 时被跳过，且授权缓存不含 entity_id 维度，细粒度的 entity_id 权限在 LIST 操作中基本起不到隔离作用。但需要明确：
+- ✅ **不会跨项目泄漏数据**（数据层 repo_path 过滤是独立可靠的防线）
+- ⚠️ **同项目内越权访问**（用户可以看到当前项目中原本无权限的资源）
+- ❌ **LIST 操作级过度放行**（本应拒绝的用户可以调用接口）
 
 ---
 
@@ -520,12 +534,13 @@ return authorized and not unauthorized  # 禁用优先
 | `entity_name` (Pipeline, Block, ...) | 枚举 | 新模式：权限作用的**资源类型** | 无层级，但有通配符 | ✅ 区分 |
 | `entity_id` (资源实例 ID) | 字符串 | 新模式：权限作用的**具体资源** | 无，但 resource=None 时跳过 | ❌ 不区分 |
 
-**重要结论**:
-- 新模式**完全不使用** `Permission.entity` 字段（GLOBAL/PROJECT/PIPELINE 层级）
-- 新模式只使用 `permission.entity_name`（资源类型）和 `permission.entity_id`（资源实例）
+**重要结论（校准版）**:
+- 新模式**完全不使用** `Permission.entity` 字段（GLOBAL/PROJECT/PIPELINE 层级）进行权限验证
+- 新模式只使用 `permission.entity_name`（资源类型）和 `permission.entity_id`（资源实例）进行匹配
 - 新模式下，所有 Permission 记录不论 entity 字段值为何，都会被加载和检查
 - entity_id 精确匹配在操作级和列表场景下基本失效，仅在单资源操作（DETAIL/UPDATE/DELETE）中有效
 - 缓存进一步削弱了 entity_id 的隔离作用
+- ✅ **关键澄清**：虽然权限层不感知项目，但**数据层的 repo_path 过滤**提供了可靠的项目隔离，默认配置下不会发生跨项目数据泄漏
 
 ### 3.9 资源类型匹配规则
 
@@ -588,7 +603,7 @@ RESERVED_ENTITY_NAMES = [
 | 第一个资源授权通过 → 后续资源缓存命中 | 全部通过 | 缓存 key 不含 entity_id |
 | 第一个资源被禁用 → 后续资源缓存命中 | 全部失败 | 禁用结果也会被缓存 |
 | resource=None 时缓存的结果应用到有 resource 的场景 | 结果不确定 | 两种场景 entity_id 检查行为不同 |
-| 不同项目共享 ResultSet | 跨项目权限泄漏 | 缓存在 ResultSet 级别共享 |
+| ~~不同项目共享 ResultSet~~ | ~~跨项目权限泄漏~~ | ✅ **修正**：ResultSet 是请求级的，不会跨项目共享；数据层 repo_path 过滤防止跨项目数据泄漏 |
 
 ---
 
@@ -696,70 +711,161 @@ Permission 3:
 
 ### 5.2 新模式下的多租户
 
-新模式**没有显式的租户边界**（因为不使用 Entity.PROJECT 层级），理论上可以通过 `entity_name + entity_id` 实现细粒度控制，但实际效果受多重因素制约：
+新模式**不使用 `Entity` 枚举层级**（GLOBAL/PROJECT/PIPELINE），理论上通过 `entity_name + entity_id` 实现细粒度控制，但实际有三道防线共同作用于跨项目隔离：
 
-#### 5.2.1 理论上的隔离方式
+| 防线层级 | 实现方式 | 可靠性 | 代码位置 |
+|----------|---------|--------|---------|
+| 数据查询层 | `repo_path` 过滤 | ✅ 高 | `mage_ai/api/resources/PipelineResource.py` [L135-L204] |
+| 权限系统层 | `entity_name + entity_id` 匹配 | ⚠️ 中（有缺陷） | `mage_ai/api/policies/mixins/user_permissions.py` [L117-L127] |
+| 缓存层 | 请求级 ResultSet | ✅ 高（不会跨请求） | `mage_ai/api/mixins/result_set.py` [L81-L170] |
 
+#### 5.2.1 数据查询层的项目隔离（最可靠防线）
+
+**核心机制**：所有数据查询通过 `repo_path` 限制在当前项目范围内。
+
+**代码位置**：
+- `mage_ai/api/resources/PipelineResource.py` [L204]: `Pipeline.get_all_pipelines(repo_path=repo_path)`
+- `mage_ai/settings/repo.py` [L34-L64]: `get_repo_path()` 根据请求上下文确定当前项目
+- `mage_ai/server/server.py` [L784]: 服务器启动时 `set_repo_path(project)` 初始化项目路径
+
+**查询流程**：
 ```
-方式 1: 通过 entity_name + entity_id 控制具体资源
-    Permission:
-      entity_name = "Pipeline"
-      entity_id = "pipeline-in-project-a"
-      access = EDITOR
-    → 理论上只能操作项目A中的特定流水线
-
-方式 2: 通过 entity_name 通配控制一类资源
-    Permission:
-      entity_name = "Pipeline"
-      entity_id = None  # 空表示所有 Pipeline
-      access = VIEWER
-    → 可以查看所有 Pipeline（跨项目！）
+LIST /pipelines
+    ↓
+PipelineResource.collection()
+    ├─ repo_path = get_repo_path()  ← 获取当前项目路径
+    └─ Pipeline.get_all_pipelines(repo_path=repo_path)  ← 仅查询当前项目数据
+        ↓ （数据层面已过滤，不会返回其他项目的 pipeline）
+    返回当前项目的 pipeline 列表
 ```
 
-#### 5.2.2 实际隔离效果（三大削弱因素）
+**关键结论**：即使权限系统有缺陷，**数据查询层天然保证了不会返回其他项目的数据**。
 
-| 操作类型 | 理论隔离 | 实际效果 | 削弱因素 |
-|----------|---------|---------|---------|
-| DETAIL（详情） | ✅ 精确匹配 | ✅ 基本有效 | 仅单资源操作 |
-| UPDATE（更新） | ✅ 精确匹配 | ✅ 基本有效 | 仅单资源操作 |
-| DELETE（删除） | ✅ 精确匹配 | ✅ 基本有效 | 仅单资源操作 |
-| LIST（列表）- 操作级 | ✅ 精确匹配 | ❌ 完全失效 | resource=None → entity_id 检查跳过 |
-| LIST（列表）- 属性级 | ✅ 精确匹配 | ❌ 基本失效 | 缓存污染 → 第一个通过全部通过 |
-| CREATE（创建） | ❌ 无法控制 | ❌ 完全失效 | resource 始终为 None |
-| 跨项目访问 | ✅ 项目隔离 | ❌ 完全失效 | 不使用 Entity.PROJECT 层级 |
+#### 5.2.2 权限系统层的四种场景分析
 
-#### 5.2.3 三大核心问题
+需要严格区分以下四种不同场景，它们的影响范围和后果完全不同：
 
-**问题 1：resource=None 时 entity_id 检查被跳过**
+##### 场景 1：列表操作级放行
 
-代码位置：`mage_ai/api/policies/mixins/user_permissions.py` [L117-L127]
+**触发条件**：
+- LIST 操作的阶段 1 检查（操作级）
+- `policy = PipelinePolicy(None, user)` → resource=None
+- `permission.entity_id is not None and resource` → False（AND 逻辑）
+
+**代码位置**：`mage_ai/api/policies/mixins/user_permissions.py` [L117-L127]
 ```python
-if permission.entity_id is not None and resource:  # AND 逻辑
-    # 只有两个条件都满足才检查 entity_id
+if permission.entity_id is not None and resource:  # 两个条件同时满足才检查
 ```
-- LIST/CREATE 操作级检查时，resource 始终为 None
-- 带具体 entity_id 的权限在操作级被当作全量权限使用
 
-**问题 2：缓存不含 entity_id，导致跨资源污染**
+**影响范围**：
+- ✅ 仅影响"能不能调用 LIST 接口"
+- ❌ 不影响数据返回范围（数据查询层已过滤）
+- ⚠️ 带具体 entity_id 的权限被当作全量权限使用
 
-代码位置：`mage_ai/api/mixins/result_set.py` [L81-L170]
-- 缓存 key：`entity_name → operation → authorized`
-- 同一 ResultSet 中的所有资源共享缓存
-- 第一个资源的授权结果会影响后续所有同类型资源
+**实际后果**：
+- 用户只有项目 A 中 pipeline-a 的权限 → 在项目 B 中调用 LIST /pipelines
+- 阶段 1 操作级检查：✅ 通过（entity_id 检查被跳过）
+- 阶段 3 数据查询：仅返回项目 B 的 pipeline（repo_path 过滤）
+- 阶段 4 属性级检查：逐个验证项目 B 的 pipeline
+- **结果**：不会泄漏项目 A 的数据，只是可能放行本应拒绝的接口调用
 
-**问题 3：完全不使用 Entity 层级**
+##### 场景 2：列表属性级缓存污染
 
-- Permission 表的 `entity` 字段（GLOBAL/PROJECT/PIPELINE）在新模式下完全不被检查
-- 所有权限记录不论属于哪个项目层级，都会被加载和判断
-- 禁用权限可以跨项目生效
+**触发条件**：
+- LIST 操作的阶段 4 检查（属性级，逐个资源）
+- 同一 ResultSet 内多个同类型资源共享缓存
+- 缓存 key：`entity_name → operation → authorized`（不含 entity_id）
 
-#### 5.2.4 重要提醒
+**代码位置**：`mage_ai/api/mixins/result_set.py` [L81-L170]
 
-新模式下如果不做额外处理，权限默认是跨项目的。这是因为：
-1. 不检查 `permission.entity` 字段（PROJECT 层级）
-2. 只检查 `entity_name` 和 `entity_id`
-3. entity_id 在列表/创建场景下检查被跳过
-4. 缓存进一步放大了权限范围
+**缓存作用域**：
+- ✅ 请求级别：每个请求创建独立的 ResultSet（`BasePolicy.__init__` [L62]）
+- ✅ 不跨请求：不同请求的 ResultSet 互不影响
+- ⚠️ 同一请求内：所有同类型资源共享缓存
+
+**影响范围**：
+- ⚠️ 仅限于**当前请求**返回的**当前项目**数据范围内
+- ❌ 不会跨项目（数据查询层已过滤）
+- ❌ 不会跨请求（ResultSet 是请求级的）
+
+**实际后果**：
+- 当前项目返回 [pipeline-1, pipeline-2, pipeline-3]
+- 用户只有 pipeline-1 的权限
+- pipeline-1 检查通过 → 缓存 `operations → Pipeline → LIST → True`
+- pipeline-2 和 pipeline-3 查缓存 → 全部通过
+- **结果**：用户可以看到当前项目中原本无权限的资源，但**不会看到其他项目的数据**
+
+##### 场景 3：创建操作放行
+
+**触发条件**：
+- CREATE 操作的阶段 1 和阶段 2 检查
+- resource 始终为 None（资源还未创建）
+- entity_id 检查始终被跳过
+
+**代码位置**：`mage_ai/api/operations/base.py` [L500-L529]
+
+**影响范围**：
+- ✅ 影响"能不能创建资源"
+- ✅ 创建的资源存储在当前项目 repo_path 下
+- ❌ 不会跨项目创建
+
+**实际后果**：
+- 用户只有项目 A 中特定 pipeline 的编辑权限
+- 用户在项目 B 中调用 POST /pipelines 创建新 pipeline
+- 操作级检查：✅ 通过（resource=None，entity_id 检查跳过）
+- 写属性检查：✅ 通过（resource=None）
+- 实际创建：新 pipeline 存储在项目 B 的 repo_path 下
+- **结果**：权限粒度控制失效，但不会跨项目创建资源
+
+##### 场景 4：真实跨项目泄漏
+
+**真实跨项目泄漏需要同时满足以下所有条件**：
+
+| 条件 | 说明 | 默认状态 |
+|------|------|---------|
+| 1. 权限加载不按项目过滤 | `load_and_cache_user_permissions()` 查询时只有 `user_id` 过滤，没有项目过滤 | ❌ 默认满足 |
+| 2. 权限验证不使用 Entity 层级 | 新模式完全不检查 `Permission.entity` 字段 | ❌ 默认满足 |
+| 3. 数据查询层不按 repo_path 过滤 | `get_all_pipelines()` 等方法没有使用 repo_path 参数 | ✅ 默认不满足（数据层有过滤） |
+| 4. 缓存跨请求共享 | ResultSet 在多个请求间共享 | ✅ 默认不满足（ResultSet 是请求级的） |
+
+**结论**：
+- ⚠️ 权限系统本身存在设计缺陷（条件 1、2 默认满足）
+- ✅ 但数据查询层的 `repo_path` 过滤和 ResultSet 的请求级作用域提供了有效的兜底保护
+- ❌ **在默认配置下，不会发生真实的跨项目数据泄漏**
+- ⚠️ 但权限粒度控制失效（同项目内越权访问）是真实存在的问题
+
+#### 5.2.3 权限系统的实际问题（非跨项目）
+
+虽然不会跨项目泄漏，但新模式在**同项目内**存在以下权限控制缺陷：
+
+| 问题 | 影响 | 条件 |
+|------|------|------|
+| LIST 接口过度放行 | 本应拒绝的用户可以调用列表接口 | resource=None 时 entity_id 检查跳过 |
+| 同项目内越权查看 | 用户可以看到项目内原本无权限的资源 | 缓存污染（同请求内） |
+| CREATE 权限过度放行 | 本应只能编辑特定资源的用户可以创建新资源 | CREATE 时 resource 始终为 None |
+| 禁用权限范围过大 | 一个禁用权限可能影响整个资源类型 | 不检查 entity 层级 + resource=None 时跳过检查 |
+
+#### 5.2.4 易混淆点澄清
+
+| 说法 | 准确性 | 说明 |
+|------|--------|------|
+| "缓存污染会跨项目" | ❌ 错误 | 数据查询层已按项目过滤，缓存只作用于当前项目数据 |
+| "权限系统缺陷会导致跨项目泄漏" | ❌ 错误 | 数据层的 repo_path 过滤是独立且可靠的防线 |
+| "新模式完全没有项目隔离" | ❌ 错误 | 数据层有 repo_path 隔离，只是权限层不感知项目 |
+| "entity_id 精确匹配完全失效" | ❌ 错误 | 在 DETAIL/UPDATE/DELETE 等单资源操作中仍然有效 |
+| "缓存会跨请求泄漏" | ❌ 错误 | ResultSet 是请求级的，每个请求独立 |
+
+#### 5.2.5 重要提醒
+
+新模式的权限系统存在设计缺陷，但**不会导致跨项目数据泄漏**。实际风险是：
+1. **同项目内的权限粒度控制失效**（用户可以看到项目内原本无权限的资源）
+2. **LIST/CREATE 接口的操作级权限检查失效**（过度放行）
+3. **禁用权限的影响范围可能超出预期**（跨资源类型生效）
+
+如果需要严格的细粒度权限控制，需要修复以下问题：
+1. resource=None 时的 entity_id 检查逻辑
+2. 缓存 key 中加入 entity_id 维度
+3. 权限加载时增加项目级过滤
 
 ---
 
@@ -776,9 +882,10 @@ if permission.entity_id is not None and resource:  # AND 逻辑
 | entity_id 检查被跳过（resource 为空时） | ❌ | ✅（LIST/CREATE 操作级） | - |
 | 禁用权限优先 | ❌（位或聚合，禁用位不会抵消授权位） | ✅（显式禁用优先逻辑） | - |
 | 属性级禁用 | ❌（属性级只有 allow/deny） | ✅（disabled_attributes 白/黑名单） | - |
-| 缓存导致隐性绕过 | ❌ | ✅（缓存 key 不含 entity_id） | - |
-| 跨项目禁用影响 | ❌（项目层级隔离） | ✅（禁用权限跨项目生效） | - |
+| 缓存导致隐性绕过（同请求内） | ❌ | ✅（缓存 key 不含 entity_id） | - |
+| 禁用权限跨资源类型影响 | ❌（项目层级隔离） | ⚠️（可能，但不跨项目数据） | - |
 | LIST 整体 403 | ❌（按项目过滤结果） | ✅（一个不通过全部失败） | - |
+| 跨项目数据泄漏 | ❌（有 Entity.PROJECT 隔离） | ❌（数据层 repo_path 隔离兜底） | ✅ 都不会 |
 | DEBUG 调试信息 | ✅ | ✅ | ✅ |
 | 指标埋点 | ✅ | ✅ | ✅ |
 | 无项目权限友好提示 | ✅（旧模式特有） | ❌ | - |
@@ -971,15 +1078,19 @@ GET /pipelines (LIST)
    - 属性级缓存 key：`entity_name → operation → attribute_operation → attribute → authorized`
    - 后果：同类型不同资源共享缓存，第一个资源的结果决定全部
 
-9. **缓存污染的放大效应**:
-   - 只要有一个资源授权通过 → 同类型所有资源都被认为有权限
-   - 只要有一个资源被禁用 → 同类型所有资源都被认为被禁用
+9. **缓存污染的范围（重要纠正）**:
+   - ✅ 仅在**同一请求**内的**同一 ResultSet** 中生效
+   - ❌ 不会跨请求（每个请求新建独立的 ResultSet）
+   - ❌ 不会跨项目（数据查询层已按 repo_path 过滤）
+   - ⚠️ 同一请求内：只要有一个资源授权通过 → 同类型所有资源都被认为有权限
+   - ⚠️ 同一请求内：只要有一个资源被禁用 → 同类型所有资源都被认为被禁用
    - 遍历顺序决定最终结果，具有不确定性
 
 10. **缓存的作用域**:
     - 存储位置：`ResultSet.context.data`
     - 共享范围：同一个 ResultSet 中的所有资源共享
     - 跨请求：不共享（每次请求新建 ResultSet）
+    - 初始化位置：`BasePolicy.__init__` [L62] - resource=None 时创建空 ResultSet
 
 ### 8.4 禁用优先原则的影响
 
@@ -987,21 +1098,45 @@ GET /pipelines (LIST)
     - 旧模式：位或运算，禁用位不会抵消授权位（没有显式禁用概念）
     - 新模式：`authorized and not unauthorized`，任一禁用则整体拒绝
 
-12. **禁用权限的跨项目影响**:
-    - 新模式不检查 Permission.entity 层级
-    - 一个项目中的禁用权限可能影响另一个项目的访问
-    - 特别是 resource=None 时，entity_id 检查被跳过，禁用影响范围更大
+12. **禁用权限的影响范围（重要纠正）**:
+    - ⚠️ 新模式不检查 Permission.entity 层级，禁用权限可能跨**资源类型**生效
+    - ⚠️ resource=None 时，entity_id 检查被跳过，禁用影响范围更大
+    - ❌ 但**不会跨项目泄漏数据**（数据层 repo_path 过滤是独立防线）
+    - ❌ 不会导致其他项目的数据被返回，只是可能错误地拒绝当前项目的访问
 
 ### 8.5 多租户隔离效果总结
 
-13. **新模式下的实际隔离能力**:
-    - DETAIL/UPDATE/DELETE：✅ 基本有效（单资源操作，entity_id 精确匹配）
-    - LIST 操作级：❌ 完全失效（resource=None，entity_id 检查跳过）
-    - LIST 属性级：❌ 基本失效（缓存污染）
-    - CREATE：❌ 完全失效（resource 始终为 None）
-    - 跨项目：❌ 完全失效（不使用 Entity.PROJECT 层级）
+13. **新模式下的实际隔离能力（重要纠正）**:
+    | 操作类型 | 权限粒度控制 | 跨项目数据隔离 | 说明 |
+    |----------|-------------|---------------|------|
+    | DETAIL/UPDATE/DELETE | ✅ 基本有效 | ✅ 有效 | 单资源操作，entity_id 精确匹配 + 数据层过滤 |
+    | LIST 操作级 | ❌ 完全失效 | ✅ 有效 | resource=None 时 entity_id 检查跳过，但数据层仍过滤 |
+    | LIST 属性级 | ❌ 基本失效 | ✅ 有效 | 缓存污染（同请求内），但数据层已过滤 |
+    | CREATE | ❌ 完全失效 | ✅ 有效 | resource 始终为 None，但创建的数据在当前项目 |
+    | 跨项目数据泄漏 | - | ✅ 有效 | 数据层 repo_path 过滤提供可靠兜底 |
 
 14. **新旧模式对比**:
-    - 旧模式：粗粒度但可靠的项目级隔离
-    - 新模式：细粒度但有缺陷的资源级隔离
+    - 旧模式：粗粒度但可靠的项目级隔离（Entity.PROJECT 层级）
+    - 新模式：细粒度权限控制有缺陷，但数据层隔离兜底
     - 注意：新模式的 entity_id 精确匹配在单资源操作时是可靠的，但列表和创建场景存在设计缺陷
+    - 关键区别：旧模式在**权限层**实现项目隔离，新模式在**数据层**实现项目隔离
+
+### 8.6 跨项目影响的澄清
+
+15. **不会导致跨项目数据泄漏的三道防线**:
+    - 防线 1：数据查询层 `repo_path` 过滤 → 最可靠，默认启用
+    - 防线 2：ResultSet 请求级作用域 → 缓存不会跨请求
+    - 防线 3：项目切换时重新设置 repo_path → 服务器级别的项目上下文
+
+16. **权限系统的真实风险（非跨项目）**:
+    - 同项目内越权访问（用户可以看到项目内原本无权限的资源）
+    - LIST/CREATE 接口过度放行（本应拒绝的用户可以调用接口）
+    - 禁用权限影响范围过大（可能错误地拒绝当前项目的合法访问）
+    - 权限粒度控制失效（entity_id 精确匹配在列表场景无效）
+
+17. **真实跨项目泄漏的必要条件（全部满足才会发生）**:
+    - 条件 1：权限加载不按项目过滤（默认满足）
+    - 条件 2：权限验证不使用 Entity 层级（默认满足）
+    - 条件 3：**数据查询层不按 repo_path 过滤**（默认不满足，需要代码缺陷）
+    - 条件 4：**缓存跨请求共享**（默认不满足，ResultSet 是请求级的）
+    - 结论：默认配置下不会发生跨项目数据泄漏
