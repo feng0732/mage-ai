@@ -1,47 +1,64 @@
 # Pipeline 编辑同步保存阶段调用参数详解
 
-## 一、两条保存入口总览
+## 一、保存入口总览
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│           入口 A：异步编辑保存（前端编辑页面 → 全量保存）                   │
+│  入口 A：异步编辑保存（前端编辑页面 → PUT ?update_content=true）           │
 │                                                                          │
 │  前端 savePipelineContent()                                              │
 │  → PUT /api/pipelines/:uuid?update_content=true                         │
 │  → PipelineResource.update()                                            │
 │  → Pipeline.update(data, update_content=True)                           │
-│      ├─ 调用① save_async()              ← 无参，全量 self.to_dict()     │
-│      └─ 调用③ save_async(block_type=,   ← 无 block_uuid，               │
-│                         widget=)           仍是全量 self.to_dict()       │
+│      │                                                                    │
+│      ├─ 阶段 A：元数据变化 → save_async()  ← 异步全量保存                │
+│      │                                                                    │
+│      └─ 阶段 B：遍历每个 block                                           │
+│          │                                                                │
+│          ├─ block.update_content_async(content)  ← 写 .py/.sql 块内容   │
+│          │   └─ __update_pipeline_block(widget=widget)  ← L3208        │
+│          │       └─ pipeline.update_block(block, widget=widget)         │
+│          │           ├─ save_kwargs = {block_uuid: block.uuid}         │
+│          │           └─ save(block_type=, block_uuid=, ext_uuid=,       │
+│          │                          widget=)  ← 同步精确保存！           │
+│          │               ↑ 这是支线 1：先读磁盘→只替换该 block→写回      │
+│          │                                                                │
+│          ├─ block.save_outputs_async()       ← 写变量输出                │
+│          ├─ block.update(has_callback/color) ← 更新内存属性              │
+│          ├─ block.configuration = ...           ← 设 should_save_async=T│
+│          ├─ block.update(name/upstream_blocks)  ← 设 should_save_async=T│
+│          ├─ block 重命名                           ← 设 should_save_async=T│
+│          │                                                                │
+│          └─ if should_save_async:                                          │
+│              save_async(block_type=, widget=)  ← 异步全量保存！          │
+│                  ↑ 这是支线 2：全量 self.to_dict() 覆盖写盘              │
 │                                                                          │
-│  结果：metadata.yaml 被全量覆盖写入，block_uuid 分支不触发                │
+│  结果：每次块内容变化都会触发一次同步精确保存，元数据变化再追加一次全量    │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
-│           入口 B：同步单区块保存（Block 属性/关系变更 → 精确保存）          │
+│  入口 B：同步单区块保存（Block 属性/关系变更 → 非编辑页面）                │
 │                                                                          │
-│  Block.update() / Block.__update_pipeline_block()                       │
-│  → Pipeline.update_block(block, widget=widget)                          │
+│  BlockResource.update() / Block.update() / Block.__update_pipeline_block()│
+│  → Pipeline.update_block(block, ...)                                     │
 │      ├─ 有 upstream/callback/conditional/downstream 参数                 │
-│      │   → save_kwargs 为空 → save(block_type=, extension_uuid=,       │
-│      │                            widget=)  ← 无 block_uuid，全量写盘    │
+│      │   → save_kwargs 为空 → save(block_type=, ext_uuid=, widget=)     │
+│      │                         ← 无 block_uuid，全量写盘                 │
 │      └─ else（只改 block 自身属性）                                      │
 │          → save_kwargs = {block_uuid: block.uuid}                       │
-│          → save(block_type=, block_uuid=, extension_uuid=, widget=)     │
-│            ← 有 block_uuid，走"先读磁盘再合并"精确保存分支               │
+│          → save(block_type=, block_uuid=, ext_uuid=, widget=)           │
+│            ← 有 block_uuid，同步精确保存                                 │
 │                                                                          │
 │  Pipeline.add_block() / delete_block()                                   │
 │  → save()  ← 无 block_uuid，全量写盘                                    │
-│                                                                          │
-│  结果：部分场景走精确保存（先读磁盘再合并），部分场景全量写盘              │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 二、入口 A：异步编辑保存 —— 参数逐层传递
+## 二、入口 A：异步编辑保存 —— 两条保存支线
 
-### 2.1 前端：savePipelineContent → updatePipeline
+### 2.1 前端到后端的参数传递
 
 `savePipelineContent`（`edit.tsx` L1187-L1446）构造 payload：
 
@@ -68,10 +85,6 @@ api.pipelines.useUpdate(pipelineUUID, { update_content: true })
 // Body: { pipeline: updatedPipeline }
 ```
 
-**关键参数**：
-- URL query `update_content=true` —— 唯一控制后端"是否更新 block 文件"的开关
-- **没有** `block_uuid` 等参数 —— 永远是全量保存
-
 ### 2.2 API 层：PipelineResource.update
 
 `PipelineResource.update`（`PipelineResource.py` L653-L876）：
@@ -89,32 +102,70 @@ await self.model.update(
 )
 ```
 
-传入 `Pipeline.update()` 的 `data` 参数是整个 `pipeline` 对象（外层 key 已由 BaseResource 剥掉），包含 `blocks`/`callbacks`/`conditionals`/`extensions`/`widgets` 等完整数据。
-
 ### 2.3 模型层：Pipeline.update(data, update_content=True)
 
-`Pipeline.update`（`pipeline.py` L1246-L1589）内部有 **3 次** `save_async` 调用：
+`Pipeline.update`（`pipeline.py` L1246-L1589）内部有 **3 次** `save_async` 调用，以及 **N 次**隐式的 `save` 调用（通过 `__update_pipeline_block` 支线）。
 
-#### 调用 ①：L1277 —— pipeline 重命名时
+#### 支线 1：块内容写入后触发的同步精确保存（关键！）
 
-```python
-await self.save_async()
-# 无参数！block_uuid=None → 走 else 分支 → 全量序列化 self.to_dict() 写盘
+**关键发现**：`block.update_content_async()` 内部会调用 `__update_pipeline_block()` → `pipeline.update_block()` → `save(block_uuid=block.uuid)`，这是一条**隐式同步保存支线**，之前被遗漏了。
+
+调用链：
+
+```
+Pipeline.update() L1439
+  └─ block.update_content_async(content, widget=widget)
+      ├─ L3207: await self.file.update_content_async(content)
+      │    ← 写块内容文件（.py/.sql/.yaml 等）
+      └─ L3208: self.__update_pipeline_block(widget=widget)
+          └─ L4211: self.pipeline.update_block(self, widget=widget)
+              ├─ L2018: save_kwargs = dict()
+              ├─ L2022-L2115: 检查 upstream/callback/conditional/downstream
+              │    都为 None（调用时没传这些参数）
+              ├─ L2120: else 分支 → save_kwargs['block_uuid'] = block.uuid
+              └─ L2138-L2143: self.save(
+                      block_type=block.type,
+                      extension_uuid=extension_uuid,
+                      widget=widget,
+                      **save_kwargs,  # {block_uuid: block.uuid}
+                  )
 ```
 
-**场景**：仅当 `data['name']` 改变触发重命名时执行。
-
-#### 调用 ②：L1351 —— 元数据变化时
+**`save(block_uuid=block.uuid)` 的执行逻辑**（`pipeline.py` L2342-L2368）：
 
 ```python
-if should_save:
-    await self.save_async()
-# 无参数！block_uuid=None → 走 else 分支 → 全量序列化 self.to_dict() 写盘
+if block_uuid is not None:
+    # 1. 从磁盘同步加载 current_pipeline
+    current_pipeline = Pipeline(self.uuid, repo_path=self.repo_path)
+    
+    # 2. 从 self 内存中取出目标 block
+    block = self.get_block(block_uuid, block_type=block_type,
+                           extension_uuid=extension_uuid, widget=widget)
+    
+    # 3. 按类型把 block 塞进 current_pipeline
+    if widget:
+        current_pipeline.widgets_by_uuid[block_uuid] = block
+    elif BlockType.EXTENSION == block.type:      # ← 读 block 实例的 type
+        self.extensions[extension_uuid]['blocks_by_uuid'][block_uuid] = block
+    elif BlockType.CALLBACK == block.type:        # ← 读 block 实例的 type
+        current_pipeline.callbacks_by_uuid[block_uuid] = block
+    elif BlockType.CONDITIONAL == block.type:     # ← 读 block 实例的 type
+        current_pipeline.conditionals_by_uuid[block_uuid] = block
+    else:
+        current_pipeline.blocks_by_uuid[block_uuid] = block
+    
+    # 4. 序列化 current_pipeline（非 self）写盘
+    pipeline_dict = current_pipeline.to_dict(
+        include_execution_framework=True,
+        include_extensions=True,
+    )
 ```
 
-**场景**：extensions / tags / description / type / executor_type / retry_config / settings / block 顺序等任一变化。
+**这是同步精确保存**：先读磁盘 → 只替换目标 block → 写回。每个块内容变化都会触发一次。
 
-#### 调用 ③：L1532-L1536 —— block 内容变化时（update_content=True 分支）
+#### 支线 2：元数据变化后触发的异步全量保存
+
+在 `Pipeline.update()` 的 for 循环末尾（L1532-L1536）：
 
 ```python
 if should_save_async:
@@ -122,17 +173,58 @@ if should_save_async:
         block_type=block.type,
         widget=widget,
     )
-# ⚠️ 缺少 block_uuid 和 extension_uuid！
-# block_uuid=None → 走 else 分支，block_type 和 widget 是死参数
 ```
 
-**这是最频繁调用的 save_async**，每个有内容变化的 block 都会触发一次。
+`should_save_async` 在以下情况被设为 `True`：
+- `configuration` 变化（L1473）
+- widget 的 `name` 或 `upstream_blocks` 变化（L1489）
+- block 重命名（L1530）
+
+**`save_async(block_type=block.type, widget=widget)` 的执行逻辑**：
+- `block_uuid=None`（没传）→ 走 `else` 分支（L2446-L2453）
+- `block_type` 和 `widget` 参数在 else 分支中**完全不使用**（死参数）
+- 直接 `self.to_dict()` 全量序列化后写盘
+
+**这是异步全量保存**：全量覆盖 metadata.yaml。仅在元数据变化时追加触发。
+
+#### 调用 ① 和 ②：元数据变化时的异步全量保存
+
+- **调用 ① L1277**：pipeline 重命名时 `await self.save_async()`
+- **调用 ② L1351**：extensions/tags/description/type/executor_type/retry_config/settings/block 顺序等任一变化时 `await self.save_async()`
+
+都是无参数调用，走全量写盘分支。
+
+### 2.4 两条支线的时序关系
+
+对**每个 block**，如果**内容有变化**，执行顺序为：
+
+```
+1. block.update_content_async(content)  ← 写 .py/.sql 块内容文件（异步等待）
+   └─ __update_pipeline_block()
+       └─ pipeline.update_block(block)
+           └─ save(block_uuid=xxx)      ← 同步精确保存 metadata.yaml
+                                            ↑ 先读磁盘→只替换该 block→写回
+2. block.save_outputs_async()            ← 写变量输出（异步等待）
+3. block.update(has_callback/color)      ← 更新内存属性（同步）
+4. block.configuration = ...             ← 设 should_save_async=True
+5. block.update(name/upstream_blocks)    ← 设 should_save_async=True
+6. block 重命名                           ← 设 should_save_async=True
+7. if should_save_async:
+     save_async(block_type=, widget=)    ← 异步全量保存 metadata.yaml
+                                            ↑ 全量 self.to_dict() 覆盖
+```
+
+如果**内容无变化但元数据有变化**，则跳过步骤 1，只执行 3-7。
+
+**修正上一版结论**："异步编辑保存只全量写盘"的说法**错误**。实际上：
+- ✅ 每次块内容变化都会触发一次**同步精确保存**（`save(block_uuid=xxx)`）
+- ✅ 如果元数据也变化了，再追加一次**异步全量保存**（`save_async()`）
 
 ---
 
 ## 三、入口 B：同步单区块保存 —— 关键路径
 
-### 3.1 触发路径：Block.update() → Pipeline.update_block()
+### 3.1 触发路径
 
 当用户通过 API 或交互修改单个 block 的属性时，调用链为：
 
@@ -233,7 +325,9 @@ if block_uuid is not None:
     )
 ```
 
-**实际调用场景**：`Pipeline.update_block()` 在只改 block 自身属性时传入 `block_uuid=block.uuid`，走这个分支。
+**实际调用场景**：
+- 入口 A：`block.update_content_async()` → `__update_pipeline_block()` → `update_block()` → `save(block_uuid=block.uuid)`
+- 入口 B：`update_block()` 只改自身属性时 → `save(block_uuid=block.uuid)`
 
 ### 4.3 save_async() 的 block_uuid 分支（异步精确保存）
 
@@ -277,9 +371,33 @@ else:
 
 ---
 
-## 五、发现的问题
+## 五、各 save 调用点参数对照表
 
-### ⚠️ 问题 1：链路 A 的 save_async 调用③ 传了 block_type 和 widget，但没传 block_uuid
+| 调用位置 | 方法 | block_type | block_uuid | extension_uuid | widget | 写盘方式 |
+|---------|------|-----------|-----------|---------------|--------|---------|
+| L1277 (rename) | `save_async()` | ❌ | ❌ | ❌ | ❌ | 全量 |
+| L1351 (元数据变化) | `save_async()` | ❌ | ❌ | ❌ | ❌ | 全量 |
+| L1533 (block元数据变化) | `save_async(block_type=, widget=)` | ✅ | ❌ | ❌ | ✅ | 全量（死参数） |
+| L2138 (update_block-改关系) | `save(block_type=, ext_uuid=, widget=)` | ✅ | ❌ | ✅ | ✅ | 全量 |
+| L2138 (update_block-改属性) | `save(block_type=, block_uuid=, ext_uuid=, widget=)` | ✅ | ✅ | ✅ | ✅ | **精确保存** |
+| L4211 (update_content_async→__update_pipeline_block) | `save(block_type=, block_uuid=, ext_uuid=, widget=)` | ✅ | ✅ | ✅ | ✅ | **精确保存** |
+| L1879 (add_block) | `save()` | ❌ | ❌ | ❌ | ❌ | 全量 |
+| L2206 (rename_block) | `save()` | ❌ | ❌ | ❌ | ❌ | 全量 |
+| L2217 (update_global_variable) | `save()` | ❌ | ❌ | ❌ | ❌ | 全量 |
+| L2221 (delete_global_variable) | `save()` | ❌ | ❌ | ❌ | ❌ | 全量 |
+| L2320 (delete_block) | `save()` | ❌ | ❌ | ❌ | ❌ | 全量 |
+
+**修正上一版结论**：
+- `save()` 的 `block_uuid` 分支**不是死代码**，它在**两个场景**中被调用：
+  1. 入口 A：`block.update_content_async()` → `__update_pipeline_block()` → `update_block()` → `save(block_uuid=xxx)`
+  2. 入口 B：`update_block()` 只改自身属性时 → `save(block_uuid=xxx)`
+- `save_async()` 的 `block_uuid` 分支**确实是死代码**——当前没有任何异步路径传入 `block_uuid`
+
+---
+
+## 六、发现的问题
+
+### ⚠️ 问题 1：入口 A 的 save_async 调用③ 传了 block_type 和 widget，但没传 block_uuid
 
 `Pipeline.update()` L1532-L1536：
 
@@ -312,7 +430,7 @@ elif extension_uuid:                       # 读函数参数
 | Extension block，extension_uuid 有值 | `BlockType.EXTENSION == block.type` → True | `extension_uuid` truthy → True | ✅ |
 | Extension block，extension_uuid 漏传 | `BlockType.EXTENSION == block.type` → True | `extension_uuid` falsy → 错误分支 | ❌ |
 
-当前同步入口 B 中 `extension_uuid` 总是从 `block.extension_uuid` 取值，不会漏传，所以不会触发此问题。但 `save_async()` 的 `block_uuid` 分支一旦被启用（目前是死代码），就可能埋坑。
+当前同步入口中 `extension_uuid` 总是从 `block.extension_uuid` 取值，不会漏传，所以不会触发此问题。但 `save_async()` 的 `block_uuid` 分支一旦被启用（目前是死代码），就可能埋坑。
 
 ---
 
@@ -325,11 +443,11 @@ elif extension_uuid:                       # 读函数参数
 
 ---
 
-### ⚠️ 问题 4：链路 A 中每个有变化的 block 都触发一次 save_async()，导致多次全量写盘
+### ⚠️ 问题 4：入口 A 中每个有元数据变化的 block 都触发一次 save_async()，导致多次全量写盘
 
 `Pipeline.update()` L1532-L1536 的 `should_save_async` 在每个 block 的 for 循环末尾判断，有变化就立即 `save_async()`。由于 `block_uuid=None`，每次都是全量 `self.to_dict()` 写盘。
 
-如果一次编辑保存中有 N 个 block 有变化，metadata.yaml 会被完整写入 N 次（加上元数据变化时的调用②，最多 N+1 次）。幂等但浪费 I/O。
+如果一次编辑保存中有 N 个 block 的元数据有变化，metadata.yaml 会被完整写入 N 次（加上阶段 A 的调用②，最多 N+1 次）。幂等但浪费 I/O。
 
 ---
 
@@ -345,38 +463,18 @@ elif extension_uuid:                       # 读函数参数
 
 ---
 
-### ⚠️ 问题 6：链路 A 全量写盘 vs 链路 B 精确保存的并发冲突
+### ⚠️ 问题 6：同步精确保存 vs 异步全量保存的并发冲突
 
-链路 B 的 `save(block_uuid=xxx)` 走"先读磁盘再合并"精确保存，保护了链路 B 之间的并发。但链路 A 的 `save_async()`（无 block_uuid）直接 `self.to_dict()` 全量写盘，**会覆盖磁盘上链路 B 刚写入的更新**。
+同步精确保存（`save(block_uuid=xxx)`）走"先读磁盘再合并"，保护了同步调用之间的并发。但异步全量保存（`save_async()`）直接 `self.to_dict()` 全量写盘，**会覆盖磁盘上同步精确保存刚写入的更新**。
 
 **场景**：
-1. 用户 A 通过编辑页面保存（链路 A），self 内存中有 block1 和 block2 的最新内容
-2. 用户 B 通过 API 单独更新了 block3（链路 B），磁盘上 block3 已更新
-3. 用户 A 的 `save_async()` 执行 `self.to_dict()` → self 中没有 block3 的最新内容
-4. **结果**：用户 B 对 block3 的更新被用户 A 的全量写盘覆盖
+1. 用户 A 编辑 block1 内容（触发 `save(block_uuid=block1)` 精确保存）
+2. 用户 B 编辑 block2 内容（触发 `save(block_uuid=block2)` 精确保存）
+3. 用户 A 的 block1 元数据也变化了（触发 `save_async()` 全量保存）
+4. 此时 `self` 内存中只有 block1 的最新元数据，没有 block2 的最新元数据
+5. **结果**：用户 B 对 block2 的元数据更新被用户 A 的全量写盘覆盖
 
-链路 B 的精确保存只保护了 B-B 并发，无法防御 A-B 并发。
-
----
-
-## 六、各 save 调用点参数对照表
-
-| 调用位置 | 方法 | block_type | block_uuid | extension_uuid | widget | 写盘方式 |
-|---------|------|-----------|-----------|---------------|--------|---------|
-| L1277 (rename) | `save_async()` | ❌ | ❌ | ❌ | ❌ | 全量 |
-| L1351 (元数据变化) | `save_async()` | ❌ | ❌ | ❌ | ❌ | 全量 |
-| L1533 (block内容变化) | `save_async(block_type=, widget=)` | ✅ | ❌ | ❌ | ✅ | 全量（死参数） |
-| L1879 (add_block) | `save()` | ❌ | ❌ | ❌ | ❌ | 全量 |
-| L2138 (update_block-改关系) | `save(block_type=, ext_uuid=, widget=)` | ✅ | ❌ | ✅ | ✅ | 全量 |
-| L2138 (update_block-改属性) | `save(block_type=, block_uuid=, ext_uuid=, widget=)` | ✅ | ✅ | ✅ | ✅ | **精确保存** |
-| L2206 (rename_block) | `save()` | ❌ | ❌ | ❌ | ❌ | 全量 |
-| L2217 (update_global_variable) | `save()` | ❌ | ❌ | ❌ | ❌ | 全量 |
-| L2221 (delete_global_variable) | `save()` | ❌ | ❌ | ❌ | ❌ | 全量 |
-| L2320 (delete_block) | `save()` | ❌ | ❌ | ❌ | ❌ | 全量 |
-
-**修正上一版结论**：`save()` 的 `block_uuid` 分支**不是死代码**。`Pipeline.update_block()` 在只改 block 自身属性时，会通过 `save_kwargs` 传入 `block_uuid`，走"先读磁盘再合并"的精确保存分支。
-
-但 `save_async()` 的 `block_uuid` 分支**确实是死代码**——当前没有任何异步路径传入 `block_uuid`。
+同步精确保存只保护了 block 内容的并发，无法防御异步全量保存对元数据的覆盖。
 
 ---
 
@@ -392,23 +490,23 @@ elif extension_uuid:                       # 读函数参数
 | 时间戳防碰撞 | `time.sleep(0.0005)` | 无 |
 | 全量序列化参数 | `include_execution_framework=True` | **缺少** `include_execution_framework` |
 | data_integration 写入 | 同步 `open/write` | 异步 `aiofiles.open/write` |
-| block_uuid 分支是否活跃 | ✅ 活跃（update_block 改属性时触发） | ❌ 死代码（无异步调用传入 block_uuid） |
-
-**最关键的差异**：`save()` 的 `block_uuid` 分支活跃且有防并发保护，`save_async()` 的 `block_uuid` 分支是死代码，所有异步保存都是全量覆盖。
+| block_uuid 分支是否活跃 | ✅ 活跃（入口 A 内容更新 + 入口 B 属性更新） | ❌ 死代码（无异步调用传入 block_uuid） |
 
 ---
 
 ## 八、对上一版分析的修正
 
-上一版得出"所有保存调用都全量写盘"的结论，这是**不准确的**。修正如下：
+上一版得出"异步编辑保存只全量写盘"的结论，这是**严重错误**。修正如下：
 
-1. **`Pipeline.update_block()` 在只改 block 自身属性时，确实传入 `block_uuid`，走 `save()` 的精确保存分支**。这不是死代码。
+1. **入口 A（异步编辑保存）中存在两条保存支线**：
+   - **支线 1**（每次内容变化触发）：`block.update_content_async()` → `__update_pipeline_block()` → `update_block()` → `save(block_uuid=xxx)` → **同步精确保存**（先读磁盘再合并）
+   - **支线 2**（元数据变化时追加）：`save_async(block_type=, widget=)` → **异步全量保存**（全量 self.to_dict()）
 
-2. **`save_async()` 的 `block_uuid` 分支确实是死代码**，因为异步编辑保存（入口 A）从不传 `block_uuid`。
+2. **`save()` 的 `block_uuid` 分支不仅在入口 B 中活跃，在入口 A 中也活跃**。每次块内容变化都会触发一次同步精确保存。
 
-3. 上版遗漏了入口 B（同步单区块保存）的完整分析，只关注了 `Pipeline.update()` 内部的调用点，没注意到 `Pipeline.update_block()` 是另一个独立入口，且它**确实使用了 `block_uuid` 精确保存**。
+3. **`__update_pipeline_block()` 是连接块内容更新和元数据保存的关键桥梁**，之前的分析完全遗漏了这条隐式支线。
 
-4. "先读后合并"防并发机制在同步路径中**确实生效**，只是在异步路径中不生效。
+4. **"先读后合并"防并发机制在入口 A 中也生效**，但只保护块内容更新，不保护元数据更新（元数据更新走异步全量保存，会覆盖并发修改）。
 
 ---
 
@@ -421,5 +519,5 @@ elif extension_uuid:                       # 读函数参数
 | `PipelineResource.py` | `mage_ai/api/resources/PipelineResource.py` | 入口 A 承接层：解析 update_content、注册收尾回调 |
 | `pipeline.py` | `mage_ai/data_preparation/models/pipeline.py` | 入口 A 处理层：Pipeline.update + save/save_async 写文件 + 缓存收尾 |
 | `BlockResource.py` | `mage_ai/api/resources/BlockResource.py` | 入口 B 承接层：Block.update 属性变更 |
-| `block/__init__.py` | `mage_ai/data_preparation/models/block/__init__.py` | 入口 B 发起层：Block.update → Pipeline.update_block |
+| `block/__init__.py` | `mage_ai/data_preparation/models/block/__init__.py` | 入口 B 发起层：Block.update → Pipeline.update_block + __update_pipeline_block 支线 |
 | `StatusFooter/index.tsx` | `mage_ai/frontend/components/PipelineDetail/StatusFooter/index.tsx` | 展示层：已保存/未保存图标与文案 |
