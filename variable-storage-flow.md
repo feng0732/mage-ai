@@ -246,7 +246,7 @@ if not skip_delete and is_dynamic_child:
 | `DATAFRAME` | `data.parquet` | `sample_data.parquet` | `data_column_types.json` | `__write_parquet()` |
 | `POLARS_DATAFRAME` | `data.parquet` | — | `data_column_types.json` | `__write_polars_dataframe()` |
 | `SPARK_DATAFRAME` | parquet 多文件目录 | — | — | `__write_spark_parquet()` |
-| `GEO_DATAFRAME` | `data.shp` 系列 | `sample_data.shp` | — | `__write_geo_dataframe()` |
+| `GEO_DATAFRAME` | `data.sh` 系列 | `sample_data.sh` | — | `__write_geo_dataframe()` |
 | `DICTIONARY_COMPLEX` | `data.json` | `sample_data.json` | `data_column_types.json` | `__save_complex_object` + `__write_json` |
 | `LIST_COMPLEX` | `data.json` | `sample_data.json` | `data_column_types.json` | 同上 |
 | `MATRIX_SPARSE` | `data.json` | `sample_data.json` | `statistics.json` (单矩阵时) | `__write_matrix_sparse()` |
