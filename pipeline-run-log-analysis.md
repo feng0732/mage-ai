@@ -1030,9 +1030,305 @@ DictLogger
 
 ---
 
-## 9. 设计亮点与可改进点
+## 9. 原始调度器 vs 项目平台版调度器：取消路径对比分析
 
-### 9.1 设计亮点
+### 9.1 两个调度器的定位
+
+| 调度器版本 | 文件路径 | 定位 | 激活条件 |
+|-----------|---------|------|---------|
+| **原始调度器** | `mage_ai/orchestration/pipeline_scheduler_original.py` | 单机版 Mage AI 使用的调度器，功能完整但不支持多项目 | `project_platform_activated() == False` |
+| **项目平台版调度器** | `mage_ai/orchestration/pipeline_scheduler_project_platform.py` | 多项目平台版调度器，支持 Backfill、多项目路径、SLA 检查等 | `project_platform_activated() == True` |
+
+两个调度器类名都叫 `PipelineScheduler`，在运行时根据配置选择加载哪个。
+
+---
+
+### 9.2 取消清理作业差异：enqueue_cancel_pipeline_run
+
+这是两个调度器之间最重大的差异之一。
+
+#### 原始调度器（original）：有取消清理作业
+
+**代码位置**：`pipeline_scheduler_original.py` L1519
+
+```python
+def cancel_block_runs_and_jobs(pipeline_run, pipeline):
+    ...
+    # 批量取消块
+    BlockRun.batch_update_status([...], CANCELLED)
+    ...
+    # 终止作业
+    ...
+
+    # ✅ 关键差异：入队异步取消清理作业
+    GenericJob.enqueue_cancel_pipeline_run(
+        pipeline_run.id,
+        cancelled_block_run_ids,
+    )
+```
+
+**清理作业内容**：`on_pipeline_run_cancelled()`（L936-L1008）
+1. 验证管道运行状态必须是 CANCELLED
+2. 对每个被取消的块执行 `on_cancelled` 回调
+3. 用于资源释放、回滚等清理操作
+
+#### 项目平台版调度器（project_platform）：没有取消清理作业
+
+**代码位置**：`pipeline_scheduler_project_platform.py` L1325-L1382
+
+```python
+def cancel_block_runs_and_jobs(pipeline_run, pipeline):
+    ...
+    # 批量取消块
+    BlockRun.batch_update_status([...], CANCELLED)
+    ...
+    # 终止作业
+    ...
+    # ❌ 关键差异：没有 enqueue_cancel_pipeline_run！
+```
+
+#### 差异影响
+
+| 影响维度 | 原始调度器 | 项目平台版调度器 |
+|---------|-----------|----------------|
+| 块的 `on_cancelled` 回调 | ✅ 会被异步执行 | ❌ **永远不会执行** |
+| 取消后资源清理 | 有保障（用户可在回调中释放资源） | 无回调，资源清理取决于作业终止本身 |
+| 取消完成状态追踪 | 通过 GenericJob 追踪清理作业状态 | 块状态更新为 CANCELLED 即认为取消完成 |
+| **状态判断影响** | 块即使状态是 CANCELLED，回调可能仍在后台执行；需等待清理作业完成才是真正取消完毕 | 块状态为 CANCELLED 即为取消完毕，没有后续异步操作 |
+
+> ⚠️ **重要**：如果代码中使用了块的 `on_cancelled` 回调，在项目平台版中需要重新考虑清理策略——这些回调不会被触发。
+
+---
+
+### 9.3 超时取消通知差异
+
+#### 原始调度器：`on_pipeline_run_failure()` 接受 status 参数
+
+**函数签名**（`pipeline_scheduler_original.py` L341）：
+
+```python
+def on_pipeline_run_failure(
+    self,
+    error_msg,
+    status=PipelineRun.PipelineRunStatus.FAILED,   # ✅ 接受 status 参数
+):
+    UsageStatisticLogger().pipeline_run_ended_sync(self.pipeline_run)
+
+    # 关键：只有 status == FAILED 时才发送通知
+    if status == PipelineRun.PipelineRunStatus.FAILED:
+        self.notification_sender.send_pipeline_run_failure_message(...)
+
+    cancel_block_runs_and_jobs(self.pipeline_run, self.pipeline)
+```
+
+**超时代码**（L302-L307）：
+
+```python
+elif self.__check_pipeline_run_timeout():
+    status = (
+        self.pipeline_schedule.timeout_status
+        or PipelineRun.PipelineRunStatus.FAILED
+    )
+    self.pipeline_run.update(status=status)
+    # ✅ 传递 status，CANCELLED 时不发送通知
+    self.on_pipeline_run_failure(
+        'Pipeline run timed out.',
+        status=status,   # 传入最终状态
+    )
+```
+
+#### 项目平台版调度器：`on_pipeline_run_failure()` 不接受 status 参数
+
+**函数签名**（`pipeline_scheduler_project_platform.py` L339）：
+
+```python
+def on_pipeline_run_failure(
+    self,
+    error: str,     # ❌ 只有 error 参数，没有 status
+) -> None:
+    UsageStatisticLogger().pipeline_run_ended_sync(self.pipeline_run)
+
+    # 关键：没有 status 判断，无条件发送通知！
+    self.notification_sender.send_pipeline_run_failure_message(
+        pipeline=self.pipeline,
+        pipeline_run=self.pipeline_run,
+        error=error,
+    )
+
+    cancel_block_runs_and_jobs(self.pipeline_run, self.pipeline)
+```
+
+**超时代码**（L299-L305）：
+
+```python
+elif self.__check_pipeline_run_timeout():
+    status = (
+        self.pipeline_schedule.timeout_status
+        or PipelineRun.PipelineRunStatus.FAILED
+    )
+    self.pipeline_run.update(status=status)
+
+    # ❌ 不传递 status，即使是 CANCELLED 也会调用
+    self.on_pipeline_run_failure('Pipeline run timed out.')
+```
+
+#### 差异影响
+
+| 配置 | timeout_status | 原始调度器行为 | 项目平台版调度器行为 |
+|------|---------------|---------------|---------------------|
+| 默认 | FAILED | ✅ 发送失败通知 | ✅ 发送失败通知 |
+| 配置为 | CANCELLED | ❌ **不发送通知**（因为 status != FAILED） | ❌ **仍发送失败通知**（无条件发送） |
+
+> ⚠️ **关键不一致**：当 `timeout_status == CANCELLED` 时，项目平台版会**发送失败通知**，但原始调度器**不会发送任何通知**。这会导致同一配置在两个版本中的用户感知完全不同。
+>
+> **状态判断影响**：
+> - 原始调度器：CANCELLED 超时的管道运行 + 没有失败通知 → 运维可能以为没有异常
+> - 项目平台版：CANCELLED 超时的管道运行 + 有失败通知（标注 error="Pipeline run timed out."）→ 运维能看到超时通知
+> - 两个版本的最终状态都是 CANCELLED，但通知行为完全相反
+
+---
+
+### 9.4 失败处理参数差异汇总
+
+| 对比项 | 原始调度器 (original) | 项目平台版调度器 (project_platform) |
+|-------|----------------------|-----------------------------------|
+| **on_pipeline_run_failure 签名** | `(self, error_msg, status=FAILED)` | `(self, error: str)` — 无 status 参数 |
+| **通知发送条件** | `if status == FAILED` 才发送 | 无条件发送，不判断状态 |
+| **超时时 CANCELLED 是否发通知** | ❌ 不发送 | ✅ **发送**（error="Pipeline run timed out."） |
+| **通知内容** | error + stacktrace（失败块） | error（不收集 stacktrace） |
+| **cancel_block_runs_and_jobs 后清理** | ✅ `enqueue_cancel_pipeline_run` | ❌ **无** |
+| **块 on_cancelled 回调** | ✅ 异步执行 | ❌ **不执行** |
+| **运行中块失败时 Backfill 处理** | ❌ 不处理 | ✅ 更新 Backfill 状态为 FAILED |
+| **全部块结束后失败时 Backfill 处理** | ❌ 不处理 | ✅ 成功则 Backfill → COMPLETED，调度器 → INACTIVE |
+| **全部块结束后通知发送** | 通过 `on_pipeline_run_failure()` 统一发送 | 直接调用 `send_pipeline_run_failure_message()`，**不经过** `on_pipeline_run_failure()` |
+| **管道运行结束后日志输出** | ❌ 不调用 | ✅ `output_logs_to_destination()` 上传到目标存储 |
+| **schedule ONCE 调度器处理** | ❌ 不处理 | ✅ 完成后调度器状态更新为 INACTIVE |
+| **使用统计记录位置** | `on_pipeline_run_failure()` 内 | 两种情况：1. `on_pipeline_run_failure()` 内；2. 全部块完成后直接调用 `pipeline_run_ended_sync()` |
+
+---
+
+### 9.5 全部块完成后的处理差异（重点）
+
+#### 原始调度器（L240-L267）
+
+```python
+if self.pipeline_run.all_blocks_completed(self.allow_blocks_to_fail):
+    if self.pipeline_run.any_blocks_failed():
+        self.pipeline_run.update(
+            status=FAILED,
+            completed_at=...,
+        )
+        # 构造 error_msg ...
+        # ✅ 统一走 on_pipeline_run_failure
+        self.on_pipeline_run_failure(error_msg)
+    else:
+        self.pipeline_run.complete()
+        self.notification_sender.send_pipeline_run_success_message(...)
+```
+
+**特点**：
+- 失败时走 `on_pipeline_run_failure()`（内部有通知 + 取消块 + 统计记录）
+- 无 Backfill 处理
+- 无日志输出
+- 无 ONCE 调度器处理
+
+#### 项目平台版调度器（L233-L298）
+
+```python
+if self.pipeline_run.all_blocks_completed(self.allow_blocks_to_fail):
+    if PipelineType.INTEGRATION == self.pipeline.type:
+        calculate_pipeline_run_metrics(...)  # 先计算指标
+
+    if self.pipeline_run.any_blocks_failed():
+        self.pipeline_run.update(status=FAILED, completed_at=...)
+        error_msg = ...
+        # ❌ 关键差异：不调用 on_pipeline_run_failure！
+        self.notification_sender.send_pipeline_run_failure_message(
+            error=error_msg,
+            pipeline=self.pipeline,
+            pipeline_run=self.pipeline_run,
+        )
+    else:
+        self.pipeline_run.complete()
+        self.notification_sender.send_pipeline_run_success_message(...)
+
+    # ✅ 记录使用统计（直接调用，不走 on_pipeline_run_failure）
+    UsageStatisticLogger().pipeline_run_ended_sync(self.pipeline_run)
+
+    # ✅ 输出日志到目标存储
+    self.logger_manager.output_logs_to_destination()
+
+    # ✅ Backfill 处理
+    if schedule:
+        if backfill is not None:
+            # 检查所有回填运行是否都成功
+            if all(pr.status == COMPLETED for pr in latest_pipeline_runs):
+                backfill.update(completed_at=..., status=COMPLETED)
+                schedule.update(status=ScheduleStatus.INACTIVE)
+        # ONCE 调度器处理
+        elif schedule.status == ACTIVE and schedule_type == TIME and interval == ONCE:
+            schedule.update(status=ScheduleStatus.INACTIVE)
+```
+
+**对状态判断的影响**：
+- 项目平台版中，`all_blocks_completed + any_blocks_failed` 路径**不会触发 `cancel_block_runs_and_jobs()`**（原始版会），但实际上此时已没有需要取消的块，所以功能上无差异
+- 项目平台版中管道完成后**会输出日志到目标存储**（S3/GCS等），原始版不会——可能导致原始版的日志只存在于本地文件
+- Backfill 状态更新只在项目平台版中进行，原始版的 Backfill 永远停留在 RUNNING 状态
+
+---
+
+### 9.6 运行中块失败后的 Backfill 状态处理差异
+
+#### 原始调度器：不处理 Backfill
+
+原始调度器 `schedule()` 中 `any_blocks_failed` 分支（L308-L331）：
+```python
+elif self.pipeline_run.any_blocks_failed() and not self.allow_blocks_to_fail:
+    self.pipeline_run.update(status=FAILED)
+    error_msg = ...
+    self.on_pipeline_run_failure(error_msg)
+```
+
+#### 项目平台版调度器：更新 Backfill 状态
+
+项目平台版 `schedule()` 中同分支（L306-L329）：
+```python
+elif self.pipeline_run.any_blocks_failed() and not self.allow_blocks_to_fail:
+    self.pipeline_run.update(status=FAILED)
+
+    # ✅ Backfill 状态更新
+    if backfill is not None:
+        latest_pipeline_runs = PipelineSchedule.fetch_latest_pipeline_runs_without_retries([...])
+        if any(pr.status == FAILED for pr in latest_pipeline_runs):
+            backfill.update(status=Backfill.Status.FAILED)
+
+    error_msg = ...
+    self.on_pipeline_run_failure(error_msg)
+```
+
+**对状态判断的影响**：
+- 原始调度器：Backfill 创建后状态会从 INITIAL → RUNNING，然后**永远停留在 RUNNING**，即使所有管道运行都失败
+- 项目平台版：Backfill 在管道运行失败时会正确转为 FAILED，全部成功时转为 COMPLETED
+
+---
+
+### 9.7 差异对状态判断的综合影响
+
+| 场景 | 原始调度器状态表现 | 项目平台版调度器状态表现 | 可能造成的问题 |
+|------|------------------|----------------------|--------------|
+| **timeout_status=CANCELLED** | 状态 CANCELLED，无通知 | 状态 CANCELLED，**有失败通知** | 同一配置行为不一致，用户困惑 |
+| **取消块的 on_cancelled 回调** | 异步执行，取消后可能仍在运行 | 不执行，取消后立即停止 | 原始版中资源可能延迟释放；项目平台版中依赖回调的清理不会执行 |
+| **Backfill（回填任务）** | 永远 RUNNING，无法结束 | RUNNING → COMPLETED/FAILED | 原始版中无法通过 Backfill 状态判断回填是否完成 |
+| **日志持久化** | 本地文件（20MB轮转） | 本地 + `output_logs_to_destination()` 上传 | 原始版在容器化环境中，管道完成后日志可能随容器销毁而丢失 |
+| **ONCE 调度器** | 保持 ACTIVE | 完成后变为 INACTIVE | 原始版中 ONCE 类型调度器保持 ACTIVE，可能被误判为活跃调度器 |
+| **全部块完成后失败** | 走 `on_pipeline_run_failure()`（调用 cancel_block_runs_and_jobs） | 直接发通知，不调用 `on_pipeline_run_failure()` | 功能上差异小，代码路径不同增加维护复杂度 |
+| **使用统计记录** | 仅在失败/超时路径中记录 | 成功/失败/完成均记录 | 原始版可能缺少成功管道运行的使用统计 |
+
+---
+
+## 10. 设计亮点与可改进点
+
+### 10.1 设计亮点
 
 1. **分层日志架构**：工厂模式支持多种日志存储后端（本地、S3、GCS），扩展性好
 2. **结构化日志**：JSON 格式便于日志分析、检索和监控集成
@@ -1041,9 +1337,9 @@ DictLogger
 5. **分布式锁**：防止并发调度冲突，保证状态一致性
 6. **细粒度并发控制**：支持管道级别的块并发数限制
 7. **丰富的可观测性**：metrics 字段支持收集详细的运行指标
-8. **取消后回调机制**：通过 `on_pipeline_run_cancelled` 异步作业执行块的 `on_cancelled` 回调
+8. **取消后回调机制**：通过 `on_pipeline_run_cancelled` 异步作业执行块的 `on_cancelled` 回调（仅原始调度器）
 
-### 9.2 可改进点
+### 10.2 可改进点
 
 **问题1：completed_at 设置不一致**
 
@@ -1067,31 +1363,39 @@ DictLogger
 三种取消路径（用户取消、内存超限、超时取消）走的代码分支完全不同，通知行为也不一致：
 - 用户取消：不发通知
 - 内存超限：发通知（summary）
-- 超时取消（CANCELLED）：不发通知
+- 超时取消（CANCELLED）：不发通知（原始版）/ 发通知（项目平台版）
 
 建议：统一取消处理逻辑，增加配置项控制是否发送取消通知。
 
-**问题3：on_pipeline_run_failure 命名有歧义**
+**问题3：两个调度器差异过大，缺少对齐**
 
-该函数名暗示只处理失败，但实际上它也处理 CANCELLED 状态（超时取消时）。只是 CANCELLED 时跳过通知发送，但仍然会执行 `cancel_block_runs_and_jobs()`。更准确的命名可能是 `on_pipeline_run_terminated()` 或 `handle_pipeline_run_end()`。
+原始调度器和项目平台版调度器存在多处功能差异（取消清理作业、Backfill处理、超时通知、日志持久化等），这些差异不是由平台特性引起的，而是代码分叉导致的不一致。建议：
+1. 将通用功能（如 `enqueue_cancel_pipeline_run`）统一到公共基类或工具模块
+2. 两个版本的 `on_pipeline_run_failure()` 签名对齐，都接受 status 参数
+3. Backfill 状态更新逻辑也可以引入原始调度器
+4. `output_logs_to_destination()` 在原始调度器完成时也应该调用
 
-**问题4：BlockRun 的 FAILED 状态没有 completed_at**
+**问题4：on_pipeline_run_failure 命名有歧义**
+
+该函数名暗示只处理失败，但实际上它也处理 CANCELLED 状态（超时取消时）。更准确的命名可能是 `on_pipeline_run_terminated()` 或 `handle_pipeline_run_end()`。
+
+**问题5：BlockRun 的 FAILED 状态没有 completed_at**
 
 块失败时不设置 completed_at，但块的运行时长是可以计算的（started_at 到失败时间）。这使得无法准确统计失败块的执行时长。
 
-**问题5：内存超限取消的通知内容不完整**
+**问题6：内存超限取消的通知内容不完整**
 
 内存超限取消发送的失败通知只有 summary，没有 error 和 stacktrace。如果用户习惯在失败通知中查找错误信息，可能会困惑。建议统一通知格式，或明确标记为"取消通知"而非"失败通知"。
 
 ---
 
-## 10. 关键文件索引
+## 11. 关键文件索引
 
 | 模块 | 文件路径 | 核心职责 |
 |------|---------|---------|
 | 数据模型 | `mage_ai/orchestration/db/models/schedules.py` | PipelineRun / BlockRun 模型定义，状态枚举，complete() 方法 |
-| 调度器 | `mage_ai/orchestration/pipeline_scheduler_original.py` | 管道调度、状态管理、超时检查、各种终止路径 |
-| 调度器（平台版） | `mage_ai/orchestration/pipeline_scheduler_project_platform.py` | 项目平台版调度器 |
+| 原始调度器 | `mage_ai/orchestration/pipeline_scheduler_original.py` | 单机版管道调度、状态管理、取消清理作业、超时检查 |
+| 平台版调度器 | `mage_ai/orchestration/pipeline_scheduler_project_platform.py` | 多项目版调度器、Backfill 处理、日志持久化、ONCE 调度器 |
 | Streaming 执行器 | `mage_ai/data_preparation/executors/streaming_pipeline_executor.py` | Streaming 管道状态更新（独立路径，始终设置 completed_at） |
 | 日志管理 | `mage_ai/data_preparation/logging/logger_manager.py` | 日志存储、轮转、清理 |
 | 日志工厂 | `mage_ai/data_preparation/logging/logger_manager_factory.py` | 日志管理器工厂 |
