@@ -1,5 +1,18 @@
 # Templates → Magic 执行链：入口衔接、数据交接、状态回传与出错处理
 
+## 本次修正要点
+
+针对前端接收 Magic 结果的 4 处理解错误进行了校正：
+
+| # | 之前理解 | 实际情况 | 关键证据 |
+|---|---------|---------|---------|
+| 1 | SSE 地址 `/events/stream/{uuid}` | ✅ `/event-streams/{uuid}` | `getEventStreamsUrl` 返回 `/event-streams/`，后端路由正则 `/event-streams/(?P<uuid>...)` |
+| 2 | 重连是「指数退避」 | ✅ **线性退避**，每次 +1s | 重连公式 `(max - remaining + 1) * 1000ms`，时间表：1s → 2s → 3s → ... → 10s |
+| 3 | `main_queue` 是内部通知信号 | ✅ **预留参数，永远为 None** | 整个调用链 6 个调用点都只传 6 个参数，main_queue 永远缺省为 None |
+| 4 | 未区分真实生效 vs 预留 | ✅ 新增 7.6 节明确区分 | `pool.apply_async(args=[...])` 参数数量检查法 |
+
+---
+
 ## 一、全局架构：两套内核，一条链路
 
 Mage AI 实际存在 **两套内核**，通过环境变量 `KERNEL_MANAGER` 选择：
@@ -169,14 +182,28 @@ Magic Kernel 路径采用 **「REST 提交任务 + SSE 推送结果」** 的双�
     │          │
     │          └─► 存入 messages 数组（仅用于追踪提交记录）
     │
-    └─► EventSource ──────────────────► GET /events/stream/{uuid}
+    └─► EventSource ──────────────────► GET /event-streams/{uuid}
           (浏览器原生 API)                EventStreamHandler.get()
           onmessage ◄───────────────────── SSE 长连接，每 0.1s 轮询队列
               │
               └─► 追加到 events 数组（所有 ExecutionResult）
 ```
 
-前端 Hook 定义于 `mage_ai/frontend/utils/server/events/useEventStreams.ts`：
+前端 URL 生成函数（`mage_ai/frontend/api/utils/url.ts`）：
+
+```typescript
+export function getEventStreamsUrl(uuid?: string): string {
+  const host = getHostCore(...);
+  return `${prefix}${host}/event-streams/${uuid || ''}`;
+}
+```
+
+后端路由（`mage_ai/server/server.py`）：
+```python
+(r'/event-streams/(?P<uuid>[\w\-\%2f\.]+)', EventStreamHandler),
+```
+
+> 关键修正：SSE 地址是 `/event-streams/{uuid}`，不是 `/events/stream/{uuid}`。
 
 ```typescript
 // 发送通道：REST API
@@ -203,7 +230,18 @@ useEffect(() => {
 }, [uuid]);
 ```
 
-**重连机制**：连接断开后自动指数退避重连（默认最多 10 次），重连间隔 = `(重连次数 + 1) * 1000ms`。
+**重连机制**：连接断开后自动**线性退避**重连（默认最多 10 次），重连间隔 = `(Math.max(0, maxAttempts - remaining) + 1) * 1000ms`。
+
+实际重连等待时间表（maxAttempts = 10）：
+| 重连次数 | remaining | 等待时间 |
+|---------|-----------|----------|
+| 第 1 次 | 10 → 9 | 1s |
+| 第 2 次 | 9 → 8 | 2s |
+| 第 3 次 | 8 → 7 | 3s |
+| ... | ... | ... |
+| 第 10 次 | 1 → 0 | 10s |
+
+> 关键修正：不是指数退避（2^n），是线性退避（每次增加 1s）。
 
 #### 3.2.2 代码提交
 
@@ -335,14 +373,29 @@ if result is not None:       # ← None 在此被过滤
 
 > **关键修正**：None 哨兵不是给前端/外层用的，它只在「子进程 → ReaderThread」这一跳中传递，用于标记单次执行输出流的结束。外层（write_queue 及之后）通过 `ExecutionStatus.READY / ERROR / CANCELLED` 状态消息判断执行结束。
 
-#### 4.2.3 main_queue：另一个内部信号
+#### 4.2.3 main_queue：预留但未启用的参数
 
-除了 read_queue / write_queue 这对「数据队列」，还有一个独立的 **main_queue**（仅传 uuid 字符串），在两处被写入：
+`execute_code_async` 和 `read_stdout_continuously` 函数签名中都定义了 `main_queue: Optional[FasterQueue] = None` 参数，但**在当前真实调用链中，main_queue 永远是 None**。
 
-1. `read_stdout_continuously` 中每输出一行 stdout 就 `main_queue.put(uuid)`
-2. `execute_code_async` 的 finally 块中 `main_queue.put(uuid)`
+**调用链检查（均未传入 main_queue）**：
 
-> 这是一个**内部通知信号**，用于唤醒外部消费者（如日志收集器、状态监控器）"这个 kernel 有新动态"，不承载 ExecutionResult 数据。它只在内部队列流转，不会推送到浏览器。
+```
+CodeExecutionResource.create()
+    ↓ kernel.run(message)
+    ↓ process.start(pool, queue, stop_event, context)
+    ↓ pool.apply_async(execute_message, args=[uuid, queue, stop_events, message, process_details, context])
+    ↓ execute_code_async(uuid, queue, stop_events, message, process_details, context)
+```
+
+所有调用点都只传 6 个参数，没有传入第 7 个参数 `main_queue`，因此它始终使用默认值 `None`。函数内的 `if main_queue is not None:` 判断永远不成立：
+
+```python
+# execution.py - 这些逻辑永远不会执行
+if main_queue is not None:
+    main_queue.put(uuid)    # ← 预留代码，实际未启用
+```
+
+> **关键修正**：main_queue 是为未来扩展（如日志收集器、状态监控器）预留的接口参数，**不是当前真实生效链路的一部分**。没有任何地方会接收到 main_queue 的通知。
 
 #### 4.2.4 哪些状态会到浏览器？哪些只在内部？
 
@@ -357,12 +410,13 @@ if result is not None:       # ← None 在此被过滤
 | `CANCELLED` | `STATUS` | ✅ 是 | 用户中断（含 ErrorDetails） |
 | `ERROR` | `STATUS` | ✅ 是 | 执行异常（含 ErrorDetails） |
 
-**仅在内部流转的信号**：
+**仅在内部流转的信号 / 预留参数**：
 
-| 信号 | 载体 | 流转范围 |
-|-----|------|---------|
-| None 哨兵 | read_queue | 子进程 → ReaderThread 之间 |
-| main_queue 通知 | uuid 字符串 | 子进程内部（预留接口） |
+| 信号 / 参数 | 载体 | 状态 | 说明 |
+|------------|------|------|------|
+| None 哨兵 | read_queue | ✅ 真实生效 | 子进程 → ReaderThread 之间，标记流结束 |
+| main_queue 通知 | uuid 字符串 | ❌ 预留未启用 | 参数定义但永远为 None |
+| ProcessContext（lock/shared_dict/shared_list） | 跨进程共享对象 | ✅ 传入但未使用 | 传入了 execute_code_async，但函数内未使用 |
 
 #### 4.2.5 EventStream 消息结构
 
@@ -718,6 +772,68 @@ client.execute() ──► 完整可执行代码字符串
 - **上层有更好的状态机制**：write_queue 及之后的层级通过 `ExecutionStatus` 枚举（READY/ERROR/CANCELLED）来判断结束，语义更清晰
 - **单一职责**：哨兵是队列协议的一部分，不应该泄漏到业务层
 
+### 7.6 真实生效链路 vs 预留参数
+
+Magic Kernel 的代码中大量使用了"预留接口"模式——函数签名定义了参数，但当前调用链并不传入。理解哪些是真实生效的、哪些是预留的，对于排查问题至关重要。
+
+#### 真实生效的完整链路
+
+```
+前端 POST /api/code_executions
+    │
+    ▼
+CodeExecutionResource.create()
+    │  message, uuid, message_request_uuid, timestamp
+    ▼
+Kernel.run(message, message_request_uuid, timestamp)
+    │  内部创建 Process 对象
+    ▼
+Process.start(pool, read_queue, stop_event_pool, context)
+    │  6 个参数（无 main_queue）
+    ▼
+pool.apply_async(execute_message, args=[
+    uuid, queue, stop_events, message, process_details, context
+])                                          ← 6 个 args，main_queue 缺省为 None
+    │
+    ▼
+execute_message() → asyncio.run(execute_code_async(...))
+    │  execute_code_async 接收 6 个参数（main_queue=None）
+    ▼
+子进程执行：
+    ├─► read_stdout_continuously(..., main_queue=None)
+    │    （main_queue 判断永远为 False）
+    ├─► exec(compiled_code, exec_globals)
+    ├─► queue.put(ExecutionResult) （6 种状态）
+    └─► queue.put(None) （read_queue 层哨兵）
+    │
+    ▼
+ReaderThread（过滤 None）
+    │  if result is not None: write_queue.put(result)
+    ▼
+write_queue（execution_result_queue[uuid]）
+    │
+    ▼
+EventStreamHandler GET /event-streams/{uuid}
+    │  while True: queue.get_nowait() → EventStream → SSE
+    ▼
+前端 EventSource.onmessage
+```
+
+#### 预留未启用的参数
+
+| 参数 | 定义位置 | 当前状态 | 预留用途推测 |
+|-----|---------|---------|-------------|
+| `main_queue` | `execute_code_async`, `read_stdout_continuously` | ❌ 永远 None | 外部监控 / 日志收集器 |
+| `context` | `execute_code_async` | ✅ 传入但未使用 | 跨进程共享状态（lock/shared_dict） |
+| `message_request_uuid` | `Process.__init__` | ✅ 存储但未用于路由 | 请求级别的精确追踪 |
+
+#### 如何判断"预留 vs 真实"
+
+可以通过两个稳定特征判断：
+
+1. **函数调用参数数量**：检查 `pool.apply_async(..., args=[...])` 的数组长度，如果 args 长度小于函数签名参数数量，缺少的就是预留的
+2. **条件判断包裹**：预留代码通常有 `if xxx is not None:` 判断，且默认值为 `None`
+
 ---
 
 ## 复核说明（稳定复现点）
@@ -735,6 +851,11 @@ client.execute() ──► 完整可执行代码字符串
 3. Magic 路径 `ReaderThread` 桥接 + None 过滤：在 threads/reader.py 中搜索 `read_queue_and_forward_results`，观察 `if result is not None:`
 4. Magic 路径 SSE 推送：在 events/stream.py 中搜索 `EventStreamHandler`
 5. 前端双通道 Hook：在 frontend/utils/server/events/useEventStreams.ts 中搜索 `useEventStreams`
+6. **SSE 地址**：在 frontend/api/utils/url.ts 中搜索 `getEventStreamsUrl`，确认返回 `/event-streams/`
+7. **后端路由**：在 server.py 中搜索 `event-streams`，确认路由正则
+8. **重连公式**：在 useEventStreams.ts 中搜索 `Math.max.*connectionAttemptsRemaining`
+9. **main_queue 未启用**：在 process.py 中搜索 `def execute_message`，检查 args 列表不含 main_queue
+10. **None 哨兵过滤**：在 threads/reader.py 中搜索 `if result is not None`
 
 ### 出错处理
 1. Jupyter 路径 `execute_custom_code.py` 框架代码：文件中搜索 `def execute_custom_code`
