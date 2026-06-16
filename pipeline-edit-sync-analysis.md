@@ -409,3 +409,17 @@ elif extension_uuid:                       # 读函数参数
 3. 上版遗漏了入口 B（同步单区块保存）的完整分析，只关注了 `Pipeline.update()` 内部的调用点，没注意到 `Pipeline.update_block()` 是另一个独立入口，且它**确实使用了 `block_uuid` 精确保存**。
 
 4. "先读后合并"防并发机制在同步路径中**确实生效**，只是在异步路径中不生效。
+
+---
+
+## 九、关键文件速查表
+
+| 文件 | 仓库路径 | 角色 |
+|------|---------|------|
+| `edit.tsx` | `mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx` | 入口 A 发起层：暂存内容、构造 payload、mutation 回调 |
+| `PipelineDetail/index.tsx` | `mage_ai/frontend/components/PipelineDetail/index.tsx` | 入口 A 发起层：快捷键 + 自动保存触发 |
+| `PipelineResource.py` | `mage_ai/api/resources/PipelineResource.py` | 入口 A 承接层：解析 update_content、注册收尾回调 |
+| `pipeline.py` | `mage_ai/data_preparation/models/pipeline.py` | 入口 A 处理层：Pipeline.update + save/save_async 写文件 + 缓存收尾 |
+| `BlockResource.py` | `mage_ai/api/resources/BlockResource.py` | 入口 B 承接层：Block.update 属性变更 |
+| `block/__init__.py` | `mage_ai/data_preparation/models/block/__init__.py` | 入口 B 发起层：Block.update → Pipeline.update_block |
+| `StatusFooter/index.tsx` | `mage_ai/frontend/components/PipelineDetail/StatusFooter/index.tsx` | 展示层：已保存/未保存图标与文案 |

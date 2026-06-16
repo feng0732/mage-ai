@@ -26,8 +26,8 @@
 
 | 触发方式 | 位置 | 触发条件 |
 |---------|------|---------|
-| **自动保存（Autosave）** | [PipelineDetail/index.tsx#L763-L773](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/frontend/components/PipelineDetail/index.tsx#L763-L773) | `setInterval` 每 10 秒检查一次，若 `pipelineContentTouched=true` 且 `!disableAutosave` 则发起 |
-| **快捷键保存** | [PipelineDetail/index.tsx#L647-L652](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/frontend/components/PipelineDetail/index.tsx#L647-L652) | `Ctrl+S` 或 `Cmd+S`，通过 `useKeyboardContext` 的 `registerOnKeyDown` 注册 |
+| **自动保存（Autosave）** | `PipelineDetail/index.tsx` L763-L773 | `setInterval` 每 10 秒检查一次，若 `pipelineContentTouched=true` 且 `!disableAutosave` 则发起 |
+| **快捷键保存** | `PipelineDetail/index.tsx` L647-L652 | `Ctrl+S` 或 `Cmd+S`，通过 `useKeyboardContext` 的 `registerOnKeyDown` 注册 |
 | **显式操作触发** | 多处 UI 交互 | 改 pipeline 名称/类型、增删 block、配置 block、删除 block 等 |
 
 ### 核心发起函数链
@@ -37,7 +37,7 @@
 用户在代码编辑器中输入时，并不会立刻发请求，而是先存到内存 ref 里：
 
 - `onChangeCodeBlock(type, uuid, value)` → 写入 `contentByBlockUUID.current[type][uuid]`，并 `setPipelineContentTouched(true)`
-  - 定义于 [edit.tsx#L714-L734](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L714-L734)
+  - 定义于 `edit.tsx` L714-L734
 - `onChangeCallbackBlock` → 写入 `callbackByBlockUUID.current`（同上文件）
 - `onChangeChartBlock` → 写入 `contentByWidgetUUID.current`（同上文件）
 
@@ -45,7 +45,7 @@
 
 **Step 2：构造全量 Payload（savePipelineContent）**
 
-[savePipelineContent](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L1187-L1446) 是提交前的聚合函数，干了这些事：
+`savePipelineContent`（`edit.tsx` L1187-L1446）是提交前的聚合函数，干了这些事：
 
 1. 遍历 `blocks`（含 callbacks / conditionals / widgets / extensions）
 2. 从 `contentByBlockUUID.current[type][uuid]` 取出内存中最新但未提交的内容；如果没改过则退回 `block.content`
@@ -58,7 +58,7 @@
 
 **Step 3：发送 HTTP 请求（updatePipeline mutation）**
 
-[edit.tsx#L1148-L1181](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L1148-L1181) 定义 mutation：
+`edit.tsx` L1148-L1181 定义 mutation：
 
 ```typescript
 api.pipelines.useUpdate(pipelineUUID, { update_content: true })
@@ -71,7 +71,7 @@ api.pipelines.useUpdate(pipelineUUID, { update_content: true })
 
 ### API 层入口：PipelineResource.update
 
-[PipelineResource.update](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/api/resources/PipelineResource.py#L653-L876) 是后端承接 HTTP 请求的唯一入口，职责非常薄：
+`PipelineResource.update`（`PipelineResource.py` L653-L876）是后端承接 HTTP 请求的唯一入口，职责非常薄：
 
 1. **解析 query 参数**：`update_content = query.get('update_content', [False])` → 决定是否要更新 block 内容文件（而不仅仅是 metadata.yaml）
 2. **处理 LLM payload**：如果带 `llm` 字段，先生成文档 block（`LlmResource.create`），插到 pipeline 里
@@ -86,7 +86,7 @@ api.pipelines.useUpdate(pipelineUUID, { update_content: true })
 
 ### 模型层：Pipeline.update()
 
-[Pipeline.update](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/data_preparation/models/pipeline.py#L1246-L1589) 是核心，流程分两阶段：
+`Pipeline.update`（`pipeline.py` L1246-L1589）是核心，流程分两阶段：
 
 #### 阶段 A：Pipeline 元数据更新（总是执行）
 
@@ -101,7 +101,7 @@ api.pipelines.useUpdate(pipelineUUID, { update_content: true })
 
 #### 阶段 B：Block 内容更新（仅当 update_content=true 时执行）
 
-从 [L1353](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/data_preparation/models/pipeline.py#L1353) 开始遍历 blocks / callbacks / conditionals / widgets / extension_blocks：
+从 `pipeline.py` L1353 开始遍历 blocks / callbacks / conditionals / widgets / extension_blocks：
 
 | 步骤 | 内容 |
 |-----|------|
@@ -121,7 +121,7 @@ api.pipelines.useUpdate(pipelineUUID, { update_content: true })
 
 ### 写文件：Pipeline.save_async()
 
-[Pipeline.save_async](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/data_preparation/models/pipeline.py#L2419-L2495) 是真正写磁盘的地方，有一个关键的"反直觉"设计：
+`Pipeline.save_async`（`pipeline.py` L2419-L2495）是真正写磁盘的地方，有一个关键的"反直觉"设计：
 
 > 🔑 **拧巴点 3：save() 和 save_async() 都有"先读磁盘再合并"的单 block 分支，但只有 save() 的分支被实际使用**
 >
@@ -134,7 +134,7 @@ api.pipelines.useUpdate(pipelineUUID, { update_content: true })
 > - `save(block_uuid=xxx)` **活跃**：`Pipeline.update_block()` 在只改 block 自身属性时，通过 `save_kwargs` 传入 `block_uuid`，走这个精确保存分支
 > - `save_async(block_uuid=xxx)` **死代码**：异步编辑保存路径（Pipeline.update）从不传 `block_uuid`，全部走全量 `self.to_dict()` 写盘
 >
-> 详见 [pipeline-edit-sync-analysis.md](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/pipeline-edit-sync-analysis.md) 第四节。
+> 详见 `pipeline-edit-sync-analysis.md` 第四节。
 
 写完 metadata.yaml 后的额外动作：
 - 写 `.test` 临时文件验证 YAML 合法性，校验不通过抛异常（L2466-L2485）
@@ -148,7 +148,7 @@ api.pipelines.useUpdate(pipelineUUID, { update_content: true })
 
 ### 第 1 层：PipelineResource.on_update_callback（API 层收尾）
 
-定义于 [PipelineResource.py#L850-L874](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/api/resources/PipelineResource.py#L850-L874)，在响应发送给客户端**之前**执行：
+定义于 `PipelineResource.py` L850-L874，在响应发送给客户端**之前**执行：
 
 | 条件 | 收尾动作 |
 |-----|---------|
@@ -168,7 +168,7 @@ api.pipelines.useUpdate(pipelineUUID, { update_content: true })
 
 ### 第 3 层：前端 useMutation 的 onSuccess（UI 层收尾）
 
-定义于 [edit.tsx#L1151-L1173](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L1151-L1173)：
+定义于 `edit.tsx` L1151-L1173：
 
 1. `setPipelineContentTouched(false)` —— 脏标记清掉
 2. `fetchPipeline()` —— 重新拉 GET /pipelines/:uuid，拿到服务端最新状态
@@ -176,9 +176,9 @@ api.pipelines.useUpdate(pipelineUUID, { update_content: true })
 
 ### 第 4 层：UI 副作用刷新
 
-- `pipelineLastSaved` 随 `data.pipeline.updated_at` 更新 [edit.tsx#L607-L617](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L607-L617)
-- `saveStatus` 文本/时间刷新 [edit.tsx#L1448-L1461](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L1448-L1461)
-- StatusFooter 图标从 ⚠️（未保存） 切换为 📄（已保存） [StatusFooter/index.tsx#L181-L199](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/frontend/components/PipelineDetail/StatusFooter/index.tsx#L181-L199)
+- `pipelineLastSaved` 随 `data.pipeline.updated_at` 更新（`edit.tsx` L607-L617）
+- `saveStatus` 文本/时间刷新（`edit.tsx` L1448-L1461）
+- StatusFooter 图标从 ⚠️（未保存） 切换为 📄（已保存）（`StatusFooter/index.tsx` L181-L199）
 
 ---
 
@@ -213,10 +213,10 @@ Pipeline 更新要同时写 PipelineCache（pipeline_uuid → pipeline_dict）�
 
 ## 七、关键文件速查表
 
-| 文件 | 角色 | 关键行 |
-|------|------|--------|
-| [edit.tsx](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx) | 发起层：暂存内容、构造 payload、 mutation 回调 | L714 暂存入口, L1148 useMutation, L1187 savePipelineContent |
-| [PipelineDetail/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/frontend/components/PipelineDetail/index.tsx) | 发起层：快捷键 + 自动保存触发 | L647 Ctrl+S, L763 setInterval 10s |
-| [PipelineResource.py](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/api/resources/PipelineResource.py) | 承接层：解析 update_content、注册收尾回调 | L653 update, L850 on_update_callback |
-| [pipeline.py](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/data_preparation/models/pipeline.py) | 处理层：Pipeline.update 核心流程 + save_async 写文件 + 缓存收尾 | L1246 update(), L1555 BlockCache/TagCache, L2419 save_async() |
-| [StatusFooter/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/frontend/components/PipelineDetail/StatusFooter/index.tsx) | 展示层：已保存/未保存图标与文案 | L181-L199 |
+| 文件 | 仓库路径 | 角色 | 关键行 |
+|------|---------|------|--------|
+| `edit.tsx` | `mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx` | 发起层：暂存内容、构造 payload、 mutation 回调 | L714 暂存入口, L1148 useMutation, L1187 savePipelineContent |
+| `PipelineDetail/index.tsx` | `mage_ai/frontend/components/PipelineDetail/index.tsx` | 发起层：快捷键 + 自动保存触发 | L647 Ctrl+S, L763 setInterval 10s |
+| `PipelineResource.py` | `mage_ai/api/resources/PipelineResource.py` | 承接层：解析 update_content、注册收尾回调 | L653 update, L850 on_update_callback |
+| `pipeline.py` | `mage_ai/data_preparation/models/pipeline.py` | 处理层：Pipeline.update 核心流程 + save/save_async 写文件 + 缓存收尾 | L1246 update(), L1555 BlockCache/TagCache, L2419 save_async() |
+| `StatusFooter/index.tsx` | `mage_ai/frontend/components/PipelineDetail/StatusFooter/index.tsx` | 展示层：已保存/未保存图标与文案 | L181-L199 |
