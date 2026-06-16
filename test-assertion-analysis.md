@@ -131,40 +131,40 @@ AI 生成的测试仅基于：目标文件本身 + 示范样式
 
 #### 完整三方配置对照表（逐字段核准，无遗漏）
 
-对三份 Playwright 配置文件 + `build_and_test.yml` CI 工作流进行**逐字段交叉核准**，共 16 项配置维度：
+对三份 Playwright 配置文件 + `build_and_test.yml` CI 工作流进行**逐字段交叉核准**，共 20 项配置维度：
 
 | 配置维度 | 本地开发 `playwright.config.ts` | Linux CI `playwright.config.ci.ts` | Windows CI `playwright-windows.config.ci.ts` | 差异影响评估 |
 |---------|-------------------------------|-----------------------------------|---------------------------------------------|-------------|
-| **`expect.timeout`** | `45000`（45秒） | `45000`（45秒） | `45000`（45秒） | ✅ 全一致 |
-| **`forbidOnly`** | `!!process.env.CI` | `!!process.env.CI` | `!!process.env.CI` | ✅ 全一致 |
-| **`fullyParallel`** | `true` | `true` | `true` | ✅ 全一致 |
-| **`projects`** | Chromium only | Chromium only | Chromium only | ✅ 全一致 |
-| **`reporter`** | `'html'` | `'html'` | `'html'` | ✅ 全一致 |
-| **`retries`** | `process.env.CI ? 2 : 0` | `process.env.CI ? 2 : 0` | `process.env.CI ? 2 : 0` | ✅ 全一致 |
-| **`timeout`** | `100000`（100秒） | `100000`（100秒） | `100000`（100秒） | ✅ 全一致 |
-| **`workers`** | `process.env.CI ? 1 : undefined` | `process.env.CI ? 1 : undefined` | `process.env.CI ? 1 : undefined` | ✅ 全一致 |
-| **`use.trace`** | `'on'` | `'on'` | `'on'` | ✅ 全一致 |
-| **`webServer.reuseExistingServer`** | `!process.env.CI` | `!process.env.CI` | `!process.env.CI` | ✅ 全一致 |
+| **`expect.timeout`** | `45000`（45秒） | `45000`（45秒） | `45000`（45秒） | ✅ 三平台全一致 |
+| **`forbidOnly`** | `!!process.env.CI` | `!!process.env.CI` | `!!process.env.CI` | ✅ 三平台全一致 |
+| **`fullyParallel`** | `true` | `true` | `true` | ✅ 三平台全一致 |
+| **`projects`** | Chromium only | Chromium only | Chromium only | ✅ 三平台全一致 |
+| **`reporter`** | `'html'` | `'html'` | `'html'` | ✅ 三平台全一致 |
+| **`retries`** | `process.env.CI ? 2 : 0` | `process.env.CI ? 2 : 0` | `process.env.CI ? 2 : 0` | ✅ 三平台全一致 |
+| **`timeout`** | `100000`（100秒） | `100000`（100秒） | `100000`（100秒） | ✅ 三平台全一致 |
+| **`workers`** | `process.env.CI ? 1 : undefined` | `process.env.CI ? 1 : undefined` | `process.env.CI ? 1 : undefined` | ✅ 三平台全一致 |
+| **`use.trace`** | `'on'` | `'on'` | `'on'` | ✅ 三平台全一致 |
+| **`webServer.reuseExistingServer`** | `!process.env.CI` | `!process.env.CI` | `!process.env.CI` | ✅ 三平台全一致 |
+| --- | --- | --- | --- | --- |
+| **`use.baseURL`** 🟡 | `'http://localhost:3000'` | `'http://localhost:6789'` | `'http://localhost:6789'` | CI 间一致，与本地不同 |
+| **`webServer.url`** 🟡 | `'http://localhost:3000'` | `'http://localhost:6789'` | `'http://localhost:6789'` | CI 间一致，与本地不同 |
+| **`webServer.cwd`** 🟡 | 未设置 | `'../../'` | `'../../'` | CI 间一致，与本地不同 |
 | --- | --- | --- | --- | --- |
 | **`testDir`** 🔴 | `'./tests'`（4 spec） | `'./tests'`（4 spec） | `'./tests/basic'`（1 spec） | **Windows 测试集缩减 75%** |
-| **`use.baseURL`** 🔴 | `'http://localhost:3000'` | `'http://localhost:6789'` | `'http://localhost:6789'` | 本地用 Next.js dev，CI 用生产服务 |
 | **`webServer.command`** 🔴 | `'yarn run dev'` | `'python mage_ai/cli/main.py start test_project'` | `'cd venv3/Scripts && activate && cd ../../ && python mage_ai/cli/main.py start test_project'` | Windows 需显式激活 venv |
-| **`webServer.cwd`** 🔴 | 未设置 | `'../../'` | `'../../'` | ✅ CI 间一致，本地不同 |
-| **`webServer.url`** 🔴 | `'http://localhost:3000'` | `'http://localhost:6789'` | `'http://localhost:6789'` | 与 baseURL 对应 |
 | **`webServer.env`** 🔴 | 未设置 env 对象 | `{ PYTHONPATH: '.', REQUIRE_USER_AUTHENTICATION: '1' }` | `{ INSTANCE_TYPE: 'web_server', PYTHONPATH: '.', REQUIRE_USER_AUTHENTICATION: '1' }` | **Windows 多设了 `INSTANCE_TYPE`** |
-| --- | --- | --- | --- | --- |
 | **Node 版本（CI YAML）** 🔴 | N/A | `18.18.0` | `20.15.1` | 前端构建工具链差异 |
-| **Python 版本（CI YAML）** 🔴 | N/A | 矩阵 3.9-3.12，E2E 仅 3.10 | 仅 `3.10` | ✅ E2E Python 一致 |
+| **Python 版本（CI YAML）** 🔴 | N/A | 矩阵 3.9-3.12，E2E 仅 3.10 | 仅 `3.10` | E2E 实际运行版本一致，CI 矩阵配置不同 |
 | **后端单测（CI YAML）** 🔴 | N/A | ✅ `python -m unittest discover -s mage_ai` | ❌ **完全省略** | **Windows 后端零单测覆盖** |
 | **集成单测（CI YAML）** 🔴 | N/A | ✅ `python -m unittest discover mage_integrations.tests` | ❌ **完全省略** | **Windows 集成零单测覆盖** |
 
-#### 配置差异分类统计
-| 分类 | 数量 | 具体维度 |
-|-----|------|---------|
-| ✅ 三平台完全一致 | 10 项 | expect.timeout、forbidOnly、fullyParallel、projects、reporter、retries、timeout、workers、use.trace、webServer.reuseExistingServer |
-| 🔴 CI 间一致，与本地不同 | 4 项 | use.baseURL、webServer.command、webServer.url、webServer.cwd |
-| 🔴 Linux CI vs Windows CI 差异 | 5 项 | testDir、webServer.env(INSTANCE_TYPE)、Node版本、后端单测、集成单测 |
-| **合计** | **19 项** | |
+#### 配置差异分类统计（与上表严格对应）
+| 分类 | 数量 | 具体维度 | 分类规则 |
+|-----|------|---------|---------|
+| ✅ 三平台完全一致 | 10 项 | expect.timeout、forbidOnly、fullyParallel、projects、reporter、retries、timeout、workers、use.trace、webServer.reuseExistingServer | 本地 + Linux CI + Windows CI 三者值完全相同 |
+| 🟡 CI 间一致，与本地不同 | 3 项 | use.baseURL、webServer.url、webServer.cwd | Linux CI 与 Windows CI 值相同，但与本地配置不同 |
+| 🔴 Linux CI vs Windows CI 差异 | 7 项 | testDir、webServer.command、webServer.env、Node版本、Python版本、后端单测、集成单测 | Linux CI 与 Windows CI 值不同 |
+| **合计** | **20 项** | | |
 
 #### 核准的 CI Job 结构证据
 
@@ -281,7 +281,7 @@ Mage AI 前端采用 **Playwright** 作为端到端测试框架，存在三套�
 | [playwright.config.ci.ts](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/mage_ai/frontend/playwright.config.ci.ts) | CI 环境 | `http://localhost:6789` | `python mage_ai/cli/main.py start test_project`（生产模式） | 串行（workers=1） |
 | [playwright-windows.config.ci.ts](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/mage_ai/frontend/playwright-windows.config.ci.ts) | Windows CI | `http://localhost:6789` | `cd venv3/Scripts && activate && cd ../../ && python mage_ai/cli/main.py start test_project`（需显式激活 venv） | 串行（workers=1） |
 
-> **⚠️ 核准提示**：完整的 19 项配置维度三方对比表（含 CI YAML 层面差异）请参考 [第零章 0.2 节](#02-windows-ci-端到端配置差异核准补齐完整表)。
+> **⚠️ 核准提示**：完整的 20 项配置维度三方对比表（含 CI YAML 层面差异）请参考 [第零章 0.2 节](#02-windows-ci-端到端配置差异核准补齐完整表)。
 
 **CI 核心配置特征（Linux CI）**：
 
@@ -316,12 +316,14 @@ Mage AI 前端采用 **Playwright** 作为端到端测试框架，存在三套�
 - **Trace 全开**：失败时可通过 Playwright Trace Viewer 复现完整操作
 - **长超时**：E2E 涉及服务启动、页面渲染、异步加载，超时阈值高
 
-**Windows CI 特有差异（与第零章核准结论统一）**：
+**Windows CI vs Linux CI 差异（共 7 项，与第零章核准结论完全对应）**：
 - 🔴 **测试集缩减**：`testDir: './tests/basic'`，仅运行 `tests/basic/pipelines.spec.ts`，不跑 `pipeline_runs.spec.ts` 等核心流程
+- 🔴 **启动命令差异**：前置 `cd venv3/Scripts && activate && cd ../../` 显式激活 venv
 - 🔴 **环境变量不一致**：额外设置 `INSTANCE_TYPE: 'web_server'`，可能导致与 Linux CI 运行在不同代码分支
 - 🔴 **Node 版本差异**：Node 20.15.1 对比 Linux 的 Node 18.18.0
-- 🔴 **需显式激活 venv**：启动命令前置 `cd venv3/Scripts && activate && cd ../../`
-- 🔴 **后端单测全跳**：CI YAML 中完全省略 `python -m unittest discover` 步骤
+- 🔴 **Python 矩阵差异**：Linux 有 3.9-3.12 矩阵，Windows 仅 3.10（E2E 实际运行版本一致）
+- 🔴 **后端单测全跳**：CI YAML 中完全省略 `python -m unittest discover -s mage_ai` 步骤
+- 🔴 **集成单测全跳**：CI YAML 中完全省略 `python -m unittest discover mage_integrations.tests` 步骤
 
 ### 1.2 测试 Fixture 体系
 
