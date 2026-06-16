@@ -342,46 +342,73 @@ def merge_dict(a: Dict, b: Dict) -> Dict:
 
 **关键语义**：`merge_dict(a, b)` 中 **b 的值覆盖 a 的同名 key**。这是理解所有优先级冲突的核心。
 
-### 7.2 PipelineRun.get_variables() — 完整合并链
+### 7.2 PipelineRun.get_variables() — 完整合并链（按代码实际顺序）
 
-[schedules.py PipelineRun.get_variables()](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/orchestration/db/models/schedules.py#L1534-L1594)：
+[schedules.py PipelineRun.get_variables()](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/orchestration/db/models/schedules.py#L1534-L1660)
+
+**代码实际执行顺序（从先到后，后者覆盖前者）：**
 
 ```python
 def get_variables(self, extra_variables=None, pipeline_uuid=None):
-    pipeline_run_variables = self.variables or {}
-    event_variables = self.event_variables or {}
+    if extra_variables is None:
+        extra_variables = dict()
 
-    # 第 1 层合并: 全局变量 ← 调度器变量
+    # === 第 1 步: 基础三层合并 (merge_dict 覆盖) ===
+    # 全局变量 → 调度器变量 → 运行实例变量
     variables = merge_dict(
         merge_dict(
-            get_global_variables(pipeline_uuid) or {},   # 全局变量 (YAML/磁盘)
-            self.pipeline_schedule.variables or {},       # 调度器变量 (DB JSON)
+            get_global_variables(pipeline_uuid) or {},    # ① Pipeline YAML 全局变量
+            self.pipeline_schedule.variables or {},        # ② Schedule 调度器变量 (覆盖①)
         ),
-        pipeline_run_variables,                           # 本次运行变量 (DB JSON)
+        self.variables or {},                              # ③ PipelineRun 运行实例变量 (覆盖②)
     )
 
-    # 第 2 层: 事件变量 (不覆盖已存在的 key)
-    for k, v in event_variables.items():
+    # === 第 2 步: 事件变量 (填空模式，不覆盖已有 key) ===
+    for k, v in (self.event_variables or {}).items():
         if k not in variables:
             variables[k] = v
 
-    # 第 3 层: 注入系统变量
-    variables['ds'] = execution_date.strftime('%Y-%m-%d')
-    variables['hr'] = execution_date.strftime('%H')
+    # === 第 3 步: 系统注入变量 (直接赋值，覆盖所有前面) ===
+    if self.execution_date:
+        variables['ds'] = self.execution_date.strftime('%Y-%m-%d')
+        variables['hr'] = self.execution_date.strftime('%H')
+
     variables['env'] = ENV_PROD
-    variables['event'] = merge_dict(variables.get('event', {}), event_variables)
+    variables['event'] = merge_dict(variables.get('event', {}), event_variables)  # event 字段内部是覆盖
     variables['execution_date'] = self.execution_date
     variables['execution_partition'] = self.execution_partition
     variables['pipeline_run_id'] = self.id
     variables['trigger_name'] = self.pipeline_schedule.name
 
-    # 第 4 层: 合并 CLI/runtime 传入的额外变量
-    # (由调用方在 execute() 时 merge_dict(global_vars, extra_variables))
+    # === 第 4 步: 时间区间变量 (覆盖系统变量) ===
+    # 根据 schedule_type 和 interval 计算 interval_end_datetime / interval_seconds 等
+    # 同样直接赋值，覆盖前面
+
+    # === 第 5 步 (最后!): extra_variables 额外变量 (覆盖一切!) ===
+    variables.update(extra_variables)   # ← 最后一步，优先级最高
+
+    return variables
 ```
 
-### 7.3 变量合并优先级全景
+**关键发现**：`extra_variables` 在函数**最后一行**通过 `variables.update(extra_variables)` 应用，它可以覆盖 **所有** 前面的变量，包括系统变量 `ds`、`hr`、`env`、`pipeline_run_id` 等。
 
-从低到高，**后者覆盖前者**：
+### 7.3 两种运行时变量机制
+
+Mage 中有 **两套独立的** 运行时变量传递机制：
+
+| 机制 | 存储位置 | 作用时机 | 优先级 |
+|------|---------|---------|--------|
+| `pipeline_run.variables` | DB `pipeline_run.variables` JSON 列 | PipelineRun 创建时写入 | 第 3 级（低） |
+| `extra_variables` | 函数参数，不持久化 | `get_variables()` 调用时传入 | 第 5 级（最高） |
+
+**使用场景：**
+- API 创建 PipelineRun：payload 中的 `variables` 存入 `pipeline_run.variables` → 第 3 级
+- CLI `mage run --runtime-vars`：作为 `extra_variables` 传入 `get_variables()` → 第 5 级（最高）
+- 调度器触发：变量来自 `pipeline_schedule.variables` → 第 2 级
+
+### 7.4 变量合并优先级全景（Pipeline 级别）
+
+从低到高，**后者覆盖前者**（基于代码实际执行顺序验证）：
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
@@ -389,51 +416,85 @@ def get_variables(self, extra_variables=None, pipeline_uuid=None):
 │   来源: pipeline.yaml → variables 字段                             │
 │   读取: get_global_variables(pipeline_uuid)                        │
 │   存储: 与代码同版本控制                                             │
+│   合并: merge_dict 第一层                                           │
 ├────────────────────────────────────────────────────────────────────┤
 │ 优先级 2         PipelineSchedule 调度器变量                        │
 │   来源: DB pipeline_schedule.variables (JSON 列)                   │
 │   读取: self.pipeline_schedule.variables                           │
 │   场景: 同一 pipeline 不同 trigger 可设不同变量                      │
+│   合并: merge_dict 第二层 (覆盖优先级 1)                            │
 ├────────────────────────────────────────────────────────────────────┤
-│ 优先级 3         PipelineRun 运行实例变量                           │
+│ 优先级 3         PipelineRun 运行实例变量 (DB 存储)                 │
 │   来源: DB pipeline_run.variables (JSON 列)                        │
 │   读取: self.variables                                             │
-│   场景: API 触发时传入的变量覆盖                                     │
+│   场景: API 创建 PipelineRun 时 payload.variables 存入 DB            │
+│   合并: merge_dict 第三层 (覆盖优先级 2)                            │
 ├────────────────────────────────────────────────────────────────────┤
-│ 优先级 4         Event 事件变量 (非覆盖模式)                        │
+│ 优先级 4         Event 事件变量 (填空模式)                          │
 │   来源: DB pipeline_run.event_variables (JSON 列)                  │
-│   规则: 仅当 key 不存在时才写入，不覆盖已存在的变量                   │
+│   规则: for k in event_variables: if k not in variables: set       │
+│   特点: 仅补缺失，不覆盖已有 key (唯一例外)                          │
+│   注意: 但 variables['event'] 字段用 merge_dict (event_variables    │
+│         会覆盖 event 字典内部的同名 key)                             │
 ├────────────────────────────────────────────────────────────────────┤
-│ 优先级 5         系统注入变量 (硬编码)                               │
-│   注入: ds, hr, env, event, execution_date,                        │
-│         execution_partition, pipeline_run_id, trigger_name         │
-│   特点: 始终存在，不可被覆盖                                        │
+│ 优先级 5         系统注入变量 (直接赋值)                             │
+│   注入: ds, hr, env, execution_date, execution_partition,          │
+│         pipeline_run_id, trigger_name,                             │
+│         interval_end_datetime, interval_start_datetime,            │
+│         interval_seconds, interval_start_datetime_previous         │
+│   特点: 直接 = 赋值，覆盖优先级 1-4 的同名 key                       │
 ├────────────────────────────────────────────────────────────────────┤
-│ 优先级 6         CLI/触发器 runtime 变量                            │
-│   来源: CLI --runtime-vars / API 触发参数                           │
-│   合并: merge_dict(global_vars, runtime_variables)                 │
-│   特点: 由调用方在 execute() 前合并到 global_vars                    │
-├────────────────────────────────────────────────────────────────────┤
-│ 优先级 7 (最高)  Hook 变量                                          │
-│   来源: block_run.metrics['hook_variables']                        │
-│   合并: merge_dict(global_vars, hook_variables)                    │
-│   特点: 仅在 FeatureUUID.GLOBAL_HOOKS 启用时生效                    │
+│ 优先级 6 (最高)  extra_variables 额外运行时变量                      │
+│   来源: get_variables(extra_variables=...) 函数参数                 │
+│   合并: variables.update(extra_variables) ← 最后一步!               │
+│   场景: CLI --runtime-vars / 运行时动态传入                          │
+│   特点: 不持久化到 DB，仅本次调用生效                                 │
+│  ⚠️ 可以覆盖系统变量! (ds, hr, env, pipeline_run_id 等)               │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.4 优先级冲突示例
+### 7.5 Block 级别变量覆盖（Pipeline 级别之上）
 
-假设同名变量 `key1` 在多层级存在：
+Block 执行时还有 **两层额外覆盖**，在 Pipeline 级 `global_vars` 基础上继续叠加：
 
-| 层级 | 值 | 最终结果 |
-|------|---|---------|
-| Pipeline YAML | `'from_yaml'` | ❌ 被覆盖 |
-| Schedule 变量 | `'from_schedule'` | ❌ 被覆盖 |
-| PipelineRun 变量 | `'from_run'` | ✅ 生效（若无 CLI 覆盖） |
-| Event 变量 | `'from_event'` | ❌ 不覆盖（非覆盖模式） |
-| CLI runtime | `'from_cli'` | ✅ 生效（覆盖 Run 变量） |
+```
+Pipeline 级 global_vars (优先级 1-6 合并结果)
+        ↓
+  ┌──── 优先级 7: Hook 变量 ────┐
+  │ 来源: block_run.metrics['hook_variables']
+  │ 位置: BlockExecutor.execute() 第 178 行
+  │ 合并: global_vars = merge_dict(global_vars, hook_variables)
+  │ 条件: FeatureUUID.GLOBAL_HOOKS 启用
+  └──────────────────────────────┘
+        ↓
+  ┌──── 优先级 8 (最高): 上游 Block kwargs 输出 ────┐
+  │ 来源: 上游 Block 的输出变量中被标记为 kwargs 的部分
+  │ 位置: Block.execute_sync() 第 1904-1908 行
+  │ 合并: for kwargs_var in kwargs_vars:
+  │         global_vars_copy.update(kwargs_var)
+  │ 特点: 每个上游 Block 依次覆盖，后执行的上游优先级更高
+  └──────────────────────────────────────────────┘
+```
 
-**结论**：`merge_dict` 是浅覆盖，后者赢。Event 变量是唯一例外——仅填空不覆盖。
+### 7.6 优先级冲突示例（同名 key `env` 在各层的覆盖）
+
+| 层级 | 值 | 是否生效 | 说明 |
+|------|---|---------|------|
+| Pipeline YAML | `'dev'` | ❌ | 被调度器变量覆盖 |
+| Schedule 变量 | `'staging'` | ❌ | 被 Run 变量覆盖 |
+| PipelineRun 变量 | `'test'` | ❌ | 被系统变量覆盖 |
+| Event 变量 | `'prod_event'` | ❌ | 填空模式，key 已存在不覆盖 |
+| 系统注入 (`env = ENV_PROD`) | `'production'` | ❌ | 被 extra_variables 覆盖 |
+| extra_variables (CLI runtime) | `'custom_env'` | ✅ | 最终生效（优先级 6） |
+| Hook 变量 | `'hook_env'` | ✅ | 如果启用 Hook，覆盖上面所有 |
+| 上游 kwargs 输出 | `'upstream_env'` | ✅ | 最终最终生效（优先级 8） |
+
+**关键结论**：
+1. `merge_dict(a, b)` 和 `dict.update(b)` 都是 **后者赢**（b 覆盖 a）
+2. Event 变量是唯一 **不覆盖** 的（仅填空），但 `event` 字段内部是覆盖模式
+3. 系统变量 **不是** 最高优先级，`extra_variables` 可以覆盖它们
+4. Block 级别还有两层额外覆盖：Hook 变量 → 上游 kwargs 输出
+5. 有 **两套独立的** 运行时变量：`pipeline_run.variables`（DB存，优先级3）和 `extra_variables`（参数传，优先级6）
 
 ---
 
@@ -534,17 +595,17 @@ condition = block_function(*args, **global_vars) if use_global_vars else block_f
 
 ### 10.1 全局变量 vs 调度器变量
 
-```
+```python
 merge_dict(get_global_variables(), pipeline_schedule.variables)
 ```
 → **调度器变量覆盖全局变量**。同一 pipeline 绑定不同 trigger 时，trigger 变量可以覆盖 pipeline 默认值。
 
-### 10.2 调度器变量 vs 运行实例变量
+### 10.2 调度器变量 vs 运行实例变量（DB 存储）
 
-```
+```python
 merge_dict(上面的结果, pipeline_run.variables)
 ```
-→ **运行实例变量覆盖调度器变量**。每次触发运行时传入的变量具有更高优先级。
+→ **运行实例变量覆盖调度器变量**。API 创建 PipelineRun 时传入 `payload.variables` 存入 DB，在 merge_dict 第三层生效。
 
 ### 10.3 运行实例变量 vs 事件变量
 
@@ -555,23 +616,57 @@ for k, v in event_variables.items():
 ```
 → **事件变量不覆盖**。仅当 key 不存在时才写入。这是一种"填空"语义。
 
-### 10.4 系统变量 vs 所有层级
+⚠️ 例外：`variables['event']` 字段内部用 `merge_dict(variables.get('event', {}), event_variables)`，event 字典内部 event_variables 会覆盖。
 
-系统变量（`ds`, `hr`, `env`, `pipeline_run_id`, `execution_partition`, `trigger_name`）在所有层级合并之后才注入，**始终存在且不可被用户变量覆盖**。
+### 10.4 系统变量 vs 前四层
 
-### 10.5 CLI/runtime 变量 vs DB 合并结果
+系统变量（`ds`, `hr`, `env`, `pipeline_run_id`, `execution_partition`, `trigger_name`, `interval_*`）通过直接 `variables['key'] = value` 赋值，**覆盖优先级 1-4 的同名 key**。
 
+### 10.5 extra_variables (runtime) vs 系统变量 ⭐ 最关键
+
+```python
+variables.update(extra_variables)  # 最后一行!
 ```
-merge_dict(pipeline_run.get_variables(), runtime_variables)
-```
-→ **CLI runtime 变量覆盖 DB 合并结果**。这是最高用户可控优先级。
+→ **extra_variables 覆盖一切**，包括系统变量。这是 `get_variables()` 函数的最后一步。
 
-### 10.6 metadata.yaml 模板渲染 vs 全局变量
+常见误解纠正：
+- ❌ 错误：系统变量不可被覆盖
+- ✅ 正确：`extra_variables`（CLI `--runtime-vars`）在系统变量之后应用，可以覆盖 `ds`、`env`、`pipeline_run_id` 等任何系统变量
+
+### 10.6 Hook 变量 vs Pipeline 级全局变量
+
+```python
+# BlockExecutor.execute() 第 178-181 行
+global_vars = merge_dict(global_vars, hook_variables)
+```
+→ **Hook 变量覆盖 pipeline 级所有变量**。在 BlockExecutor 入口处 merge，条件是 FeatureUUID.GLOBAL_HOOKS 启用。
+
+### 10.7 上游 Block kwargs 输出 vs Hook 变量
+
+```python
+# Block.execute_sync() 第 1904-1908 行
+global_vars_copy = global_vars.copy()
+for kwargs_var in kwargs_vars:
+    if kwargs_var:
+        global_vars_copy.update(kwargs_var)
+```
+→ **上游 kwargs 输出覆盖 Hook 变量**。这是 Block 级别最高优先级，每个上游 Block 依次覆盖，后执行的上游优先级更高。
+
+### 10.8 metadata.yaml 模板渲染 vs 全局变量
 
 metadata.yaml 中的 `{{ env_var('KEY') }}` 和 `{{ mage_secret_var('key') }}` 在 RepoConfig 初始化时渲染，**与 pipeline 全局变量是完全独立的体系**：
 - 模板变量用于配置渲染（DB 连接、IO 配置等）
 - 全局变量用于 pipeline 执行时的 `**kwargs` 注入
 - 两者不存在覆盖关系
+
+### 10.9 两套运行时变量机制对比
+
+| 机制 | 存储 | 优先级 | 传递方式 | 典型场景 |
+|------|------|--------|---------|---------|
+| `pipeline_run.variables` | DB JSON 列 | 第 3 级 | API 创建 PipelineRun 时存入 | API 触发、调度器触发 |
+| `extra_variables` | 函数参数（不持久化） | 第 6 级（最高） | `get_variables(extra_variables=...)` | CLI `--runtime-vars`、内部调用 |
+
+如果同时存在两种运行时变量，`extra_variables` 优先级更高，会覆盖 `pipeline_run.variables`。
 
 ---
 
@@ -586,10 +681,15 @@ metadata.yaml 中的 `{{ env_var('KEY') }}` 和 `{{ mage_secret_var('key') }}` �
 | set_global_variable | [variable_manager.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/variable_manager.py#L580-L596) | L580-L596 |
 | delete_global_variable | [variable_manager.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/variable_manager.py#L599-L616) | L599-L616 |
 | Pipeline.update_global_variable | [pipeline.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/pipeline.py#L2209-L2217) | L2209-L2217 |
-| PipelineRun.get_variables | [schedules.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/orchestration/db/models/schedules.py#L1534-L1594) | L1534-L1594 |
+| **PipelineRun.get_variables 完整合并链** | [schedules.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/orchestration/db/models/schedules.py#L1534-L1660) | **L1534-L1660** |
+| **extra_variables 最后 update** | [schedules.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/orchestration/db/models/schedules.py#L1658-L1659) | **L1658** |
+| 事件变量填空模式 | [schedules.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/orchestration/db/models/schedules.py#L1556-L1558) | L1556-L1558 |
 | merge_dict (覆盖语义) | [hash.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/shared/hash.py#L198-L209) | L198-L209 |
 | VariableResource API | [VariableResource.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/api/resources/VariableResource.py) | L1-L190 |
 | get_template_vars | [shared/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/shared/utils.py#L7-L37) | L7-L37 |
 | fetch_input_variables | [block/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/utils.py#L389-L502) | L389-L502 |
 | Block **kwargs 注入 | [block/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L2161-L2171) | L2161-L2171 |
-| CLI run 变量合并 | [cli/main.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/cli/main.py#L227-L243) | L227-L243 |
+| **Hook 变量 merge** | [block_executor.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/executors/block_executor.py#L177-L181) | **L177-L181** |
+| **上游 kwargs 输出 merge** | [block/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1904-L1908) | **L1904-L1908** |
+| CLI run 变量流（两种分支） | [cli/main.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/cli/main.py#L237-L242) | L237-L242 |
+| configure_pipeline_run_payload | [pipeline_scheduler_original.py](file:///d:/fz/0601/solo-dogfeeding/code/324-mage-ai/mage_ai/orchestration/pipeline_scheduler_original.py#L1365-L1394) | L1365-L1394 |
