@@ -291,40 +291,114 @@ def delete_variables(self, variable_uuids=['output_0', 'output_1', 'df'], ...):
 - FAIL 策略：如果 `output_0` 有数据，直接抛异常，`output_1` 和 `df` 都不会被处理
 - APPEND 策略：如果 `output_0` 有数据，直接 `return`，`output_1` 和 `df` 都不会被删除
 
-### 2.5 非输出变量残留的精确说明
+### 2.5 变量残留的精确说明：区分变量名、依附位置和真正残留对象
 
-**什么是非输出变量**：
-- `print_*`：打印变量（通过 `print()` 或 `logger` 生成）
-- `statistics`：数据统计信息（行数、列数等）
-- `insights_*`：数据洞察（数据类型、缺失值等）
-- `suggestions_*`：数据清洗建议
-- `metadata`：元数据
+#### 磁盘目录结构
 
-**这些变量如何产生**：
-- 在 Notebook 模式下运行 Sensor 时，如果 `analyze_outputs=True`，`analyze_outputs` 会为上游数据生成 `statistics`、`insights_*`、`suggestions_*` 等变量
-- 块执行过程中的 `print()` 语句会生成 `print_*` 变量
-- Sensor 自己的轮询输出 `print('Sensor sleeping for 1 minute...')` 会生成 `print_*` 变量
+Mage 变量在磁盘上的组织方式如下：
 
-**这些变量为什么不被清理**：
-- 在 `__store_variables_prepare` 中，判断条件是 `(override and not is_output_var) or (override_outputs and is_output_var)`
-- `override=False`（硬编码），所以 `(override and not is_output_var)` 恒为 False
-- `is_output_var=False`（非输出变量），所以 `(override_outputs and is_output_var)` 也为 False
-- 整个条件为 False → 不会被加入 `removed_variables` → 不会被删除
+```
+{pipeline_uuid}/variables/{execution_partition}/{block_uuid}/
+    ├── output_0/                     ← 输出变量（变量名 = output_0）
+    │   ├── data.parquet              ← 实际数据
+    │   └── metadata.json             ← 变量元数据
+    ├── output_0/                     ← DATAFRAME_ANALYSIS 类型，依附于同一 output_0
+    │   ├── statistics.json           ← 分析数据文件（不是独立变量）
+    │   ├── insights.json             ← 分析数据文件（不是独立变量）
+    │   ├── suggestions.json          ← 分析数据文件（不是独立变量）
+    │   └── metadata.json             ← 分析元数据
+    ├── df/                           ← Spark 样本数据变量（变量名 = df）
+    │   └── data.parquet
+    └── {block_uuid}_0/              ← print 变量（变量名 = {block_uuid}_0）
+        └── data.json                 ← 打印内容
+```
+
+**关键区分**：
+- `statistics.json`、`insights.json`、`suggestions.json` **不是独立的变量名**，而是 `output_0` 变量目录下的 `DATAFRAME_ANALYSIS` 类型附属文件
+- 这些文件由 [Variable.__write_dataframe_analysis](file:///d:/fz/0601/solo-dogfeeding/code/331-mage-ai/mage_ai/data_preparation/models/variable.py#L1508-L1520) 写入
+- 它们的删除由 [Variable.__delete_dataframe_analysis](file:///d:/fz/0601/solo-dogfeeding/code/331-mage-ai/mage_ai/data_preparation/models/variable.py#L953-L960) 处理
+- `is_output_variable` 只识别变量名级别（`output_*`、`df`），不涉及目录内的分析文件
+
+#### 三类对象及其残留条件
+
+**第一类：输出变量（output_*, df）**
+
+变量名由 `is_output_variable` 识别为输出变量。每个变量在磁盘上是一个子目录，包含数据文件和元数据。
+
+产生条件：Sensor 返回非空输出时由 `store_variables` 写入。**Sensor 正常返回 `[]`，不会产生新的输出变量。**
+
+残留条件：
+| 条件 | 是否残留 | 原因 |
+|------|---------|------|
+| 默认（无 write_policy） | ❌ 不残留 | `delete_variables` 逐个 `variable_object.delete()` |
+| FAIL 策略 + 有旧数据 | ✅ 可能残留 | 第一个变量抛异常，后续未处理 |
+| APPEND 策略 + 有旧数据 | ✅ 全部残留 | 第一个变量触发 `return` |
+
+**第二类：分析数据文件（statistics.json, insights.json, suggestions.json, metadata.json）**
+
+这些文件依附在输出变量目录下，不是独立变量。当输出变量被删除时，它们随目录一起被删除。
+
+产生条件：仅当 `analyze_outputs` 处理了非空 DataFrame 输出时，由 [analyze_outputs.L3439-L3451](file:///d:/fz/0601/solo-dogfeeding/code/331-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L3439-L3451) 调用 `variable_manager.add_variable(variable_type=VariableType.DATAFRAME_ANALYSIS)` 写入。**Sensor 的 `variable_mapping = {}`，`analyze_outputs` 的 for 循环不执行，不会产生新的分析文件。**
+
+残留条件：与所属输出变量一致。如果 `output_0` 被删除，其目录下的 `statistics.json` 等文件也一并被删除（[Variable.delete](file:///d:/fz/0601/solo-dogfeeding/code/331-mage-ai/mage_ai/data_preparation/models/variable.py#L282-L297) 中 `DATAFRAME_ANALYSIS` 类型走 `__delete_dataframe_analysis`）。
+
+| 条件 | 分析文件是否残留 | 原因 |
+|------|-----------------|------|
+| 默认（无 write_policy） | ❌ 不残留 | 输出变量被删 → 目录被清 → 分析文件随之删除 |
+| FAIL/APPEND 策略 + 有旧数据 | ✅ 残留 | 输出变量未被删 → 目录保留 → 分析文件保留 |
+
+**第三类：print 变量（{block_uuid}_0 等）**
+
+变量名格式为 `{block_uuid}_{序号}`，由 `__consolidate_variables` 中 [is_valid_print_variable](file:///d:/fz/0601/solo-dogfeeding/code/331-mage-ai/mage_ai/data_preparation/models/block/utils.py#L307-L333) 过滤后存入 `print_variables`，最终合并到 `variable_mapping` 中存储。
+
+产生条件：需要同时满足：
+1. 块代码中有 `print()` 调用
+2. `_redirect_streams` 将 stdout 重定向到捕获容器（`build_block_output_stdout` 不为 None 或 `logger` 不为 None 且 `from_notebook=False`）
+3. 打印内容通过 `is_valid_print_variable` 校验（key 包含 `{block_uuid}_`、value 是字符串、非空 JSON）
+
+**Sensor 的 `print('Sensor sleeping for 1 minute...')` 是否产生 print 变量？**
+
+这个 `print()` 位于 [SensorBlock.execute_block_function.L4303](file:///d:/fz/0601/solo-dogfeeding/code/331-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L4303)，执行时处于 `_redirect_streams` 上下文内。但产生 print 变量取决于：
+
+| 执行环境 | stdout 重定向目标 | 是否产生 print 变量 |
+|---------|-----------------|-------------------|
+| 管道调度 + `build_block_output_stdout` 不为 None | 捕获容器 | ✅ 可能产生 |
+| 管道调度 + `logger` 不为 None + `from_notebook=False` | StreamToLogger | ❌ 不产生（logger 不捕获 print） |
+| 管道调度 + `from_notebook=True` | sys.stdout | ❌ 不产生（直接输出到终端） |
+| Notebook 调试 | sys.stdout | ❌ 不产生 |
+
+**结论**：Sensor 轮询中的 `print()` 不是一定产生 print 变量，只有在 `build_block_output_stdout` 提供了捕获容器时才会产生。
+
+残留条件：
+| 条件 | print 变量是否残留 | 原因 |
+|------|------------------|------|
+| 默认（无 write_policy） | ✅ 残留 | `is_output_variable('{block_uuid}_0')` → False，不在删除列表中 |
+| 任何 write_policy | ✅ 残留 | 同上 |
+
+#### 残留对象总览
+
+| 对象 | 依附位置 | 产生来源 | 默认路径是否残留 | 残留条件 |
+|------|---------|---------|----------------|---------|
+| 输出变量目录 `output_0/` | 独立变量 | `store_variables` 写入 | ❌ 被删 | FAIL/APPEND 策略异常 |
+| 分析文件 `statistics.json` 等 | `output_0/` 目录内 | `analyze_outputs` 写入 | ❌ 随输出变量删除 | FAIL/APPEND 策略异常 |
+| Spark 样本 `df/` | 独立变量 | `store_variables` 写入 | ❌ 被删 | FAIL/APPEND 策略异常 |
+| print 变量 `{block_uuid}_0/` | 独立变量 | `_redirect_streams` + `print()` | ✅ 残留 | 始终残留（不在删除列表中） |
 
 ### 2.6 变量清理场景总结
 
-| 场景 | 旧输出变量 (output_*, df) | 旧非输出变量 (print_*, statistics 等) |
-|------|--------------------------|-------------------------------------|
-| 默认（无 write_policy） | ✅ 被删除 | ❌ 残留 |
-| FAIL 策略（有旧数据） | ❌ 抛异常，终止 | ❌ 残留 |
-| APPEND 策略（有旧数据） | ❌ 第一个变量触发 return，后续都不删 | ❌ 残留 |
-| Notebook 模式（from_notebook=True） | ✅ 被删除（走基类逻辑） | ❌ 残留（同样不满足删除条件） |
-| 动态子块（is_dynamic_child=True） | ❌ 不调用 delete_variables（[L3823](file:///d:/fz/0601/solo-dogfeeding/code/331-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L3823)） | ❌ 残留 |
+| 场景 | 输出变量 (output_*, df) | 分析文件 (statistics.json 等) | print 变量 ({block_uuid}_*) |
+|------|------------------------|------------------------------|---------------------------|
+| 默认（无 write_policy） | ✅ 被删除 | ✅ 随输出变量删除 | ❌ 残留 |
+| FAIL 策略（有旧数据） | ❌ 抛异常，终止 | ❌ 随输出变量保留 | ❌ 残留 |
+| APPEND 策略（有旧数据） | ❌ return，全部保留 | ❌ 随输出变量保留 | ❌ 残留 |
+| Notebook 模式（from_notebook=True） | ✅ 被删除 | ✅ 随输出变量删除 | ❌ 残留 |
+| 动态子块（is_dynamic_child=True） | ❌ 不调用 delete_variables | — | ❌ 残留 |
 
 **代码事实**：
-1. **空输出会清旧输出变量**——这是之前分析的错误。当 `override_outputs=True`（默认）时，旧的输出变量会被清理
-2. **非输出变量始终残留**——因为 `override=False` 硬编码，非输出变量永远不会被 `__store_variables_prepare` 选中删除
-3. **APPEND 策略有 bug 级行为**——遇到第一个有数据的变量就 `return`，导致列表后续变量都不被删除
+1. **默认路径下输出变量及其分析文件都会被清理**——`delete_variables` 逐个删除输出变量，`Variable.delete` 对 `DATAFRAME_ANALYSIS` 类型调用 `__delete_dataframe_analysis` 清理分析文件
+2. **分析文件不是独立变量**——`statistics.json` 等依附在 `output_0/` 目录内，不单独出现在 `variable_uuids` 列表中，其生命周期与所属输出变量绑定
+3. **print 变量是唯一默认残留的对象**——因为它不被 `is_output_variable` 识别，也不在 `removed_variables` 列表中
+4. **Sensor 的 `print()` 不一定产生 print 变量**——取决于 stdout 重定向方式，仅在 `build_block_output_stdout` 提供捕获容器时才可能产生
 
 ---
 
@@ -409,19 +483,20 @@ def aggregate_summary_info(self, execution_partition=None):
 
 #### Sensor 场景下的精确行为
 
-不同写入策略下，`aggregate_summary_info` 扫描到的变量不同：
+不同写入策略下，`aggregate_summary_info` 扫描到的对象不同：
 
-| 写入策略 | 输出变量 (output_*, df) | 非输出变量 (print_*, statistics 等) | 汇总数据状态 |
-|---------|------------------------|-------------------------------------|-------------|
-| 默认（无策略） | ❌ 已被 `store_variables` 删除 | ✅ 仍存在（从未被清理） | 输出变量缺失，非输出变量过时 |
-| FAIL（有旧数据） | ❌ 第一个变量抛异常，后续状态不确定 | ✅ 仍存在 | 不一致（取决于异常发生位置） |
-| APPEND（有旧数据） | ✅ 第一个变量触发 return，全部残留 | ✅ 仍存在 | 全部过时 |
-| 动态子块 | — | — | `aggregate_summary_info` 不被调用 [L1642] |
+| 写入策略 | 输出变量目录 (output_0/) | 分析文件 (statistics.json 等) | print 变量 ({block_uuid}_*) | 汇总数据状态 |
+|---------|------------------------|------------------------------|---------------------------|-------------|
+| 默认（无策略） | ❌ 已被 `store_variables` 删除 | ✅ 随输出变量删除 | ✅ 仍存在 | 仅 print 变量过时 |
+| FAIL（有旧数据） | ✅ 可能残留 | ✅ 随输出变量保留 | ✅ 仍存在 | 输出变量和分析文件过时 |
+| APPEND（有旧数据） | ✅ 全部残留 | ✅ 随输出变量保留 | ✅ 仍存在 | 全部过时 |
+| 动态子块 | — | — | — | `aggregate_summary_info` 不被调用 [L1642] |
 
 **关键结论**：
-- **默认路径下输出变量不会造成过时汇总**——因为 `store_variables` 已先将其删除
-- **非输出变量始终造成过时汇总**——因为它们从未被 `__store_variables_prepare` 选中删除
-- **只有写入策略异常时输出变量才可能残留**——FAIL 抛异常终止、APPEND 直接 return 都会导致输出变量未被删除
+- **默认路径下输出变量和分析文件都不会造成过时汇总**——因为 `store_variables` 已先将输出变量删除，分析文件随之删除
+- **print 变量是唯一默认残留并造成过时汇总的对象**——如果存在的话
+- **Sensor 的 `print()` 不一定产生 print 变量**——取决于 `_redirect_streams` 的 stdout 重定向方式（见 2.5 节第三类）
+- **只有写入策略异常时输出变量和分析文件才可能残留**——FAIL 抛异常终止、APPEND 直接 return 都会导致输出变量未被删除
 
 ### 3.4 _outputs 缓存重置
 
@@ -535,12 +610,14 @@ return __execute()
 │   → __store_variables_prepare → removed_variables=[output_*]│
 │   → delete_variables(variable_uuids=[output_*])      │
 │   → ✅ 旧输出变量被删除                               │
-│   → ❌ 非输出变量残留                                 │
+│   → ✅ 分析文件随输出变量删除                         │
+│   → ❌ print 变量残留（不在删除列表中）               │
 │                                                       │
 │  aggregate_summary_info()                             │
 │   → 扫描磁盘变量目录（在 store_variables 之后）       │
-│   → 默认：输出变量已被删，只剩非输出变量过时数据       │
-│   → FAIL/APPEND策略：输出变量也可能残留，全部过时     │
+│   → 默认：输出变量和分析文件已被删                     │
+│   → 仅 print 变量可能残留（取决于 stdout 重定向）     │
+│   → FAIL/APPEND策略：输出变量和分析文件也可能残留     │
 │                                                       │
 │  analyze_outputs({})                                  │
 │   → for 循环不执行 → 空操作                           │
@@ -561,7 +638,8 @@ return __execute()
 | **`from_notebook` 语义误导** | 实际含义是"是否轮询"，由 `not run_sensors` 推导 | 代码可读性差，容易误解为"来自 Notebook" |
 | **默认路径空输出会清旧输出变量** | `override_outputs=True`（默认）+ `__store_variables_prepare` 判断逻辑 + `delete_variables` 正常执行 | 默认无写策略时，旧的 `output_*` 和 `df` 变量会被删除 |
 | **输出变量残留有条件** | 仅 FAIL 抛异常、APPEND 提前 return 时，输出变量才可能未被删除 | 默认路径下输出变量不会残留，只有写入策略异常时才会残留 |
-| **非输出变量始终残留** | `override=False` 硬编码 + `is_output_variable` 过滤逻辑 | `print_*`、`statistics`、`insights_*` 等非输出变量永远不会被清理 |
+| **非输出变量始终残留** | `override=False` 硬编码 + `is_output_variable` 过滤逻辑 | 仅 print 变量（`{block_uuid}_*`）始终残留；分析文件随输出变量删除 |
+| **Sensor 的 print() 不一定产生 print 变量** | 取决于 `_redirect_streams` 的 stdout 重定向方式 | 仅 `build_block_output_stdout` 提供捕获容器时才产生，logger 模式和 Notebook 模式下不产生 |
 | **APPEND 策略的异常行为** | `delete_variables` 遇到第一个有数据的变量就 `return` | 后续变量（即使在删除列表中）都不会被删除，批量删除失效 |
 | **aggregate_summary_info 与变量清理联动** | 调用顺序在 `store_variables` 之后 | 默认路径下输出变量已被删，汇总不会包含过时输出变量；但非输出变量仍会造成过时汇总 |
 | **轮询路径无内存跟踪** | `SensorBlock.execute_block_function` 重写跳过 `execute_with_memory_tracking` | `self.resource_usage = None`，长时间轮询的内存消耗不可观测 |
