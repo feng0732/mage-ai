@@ -167,7 +167,53 @@ const { data: dataPipelineRuns } = api.pipeline_runs.list(
 3. pipeline_runs 每 60 秒自动轮询一次
 4. **注意**：monitor_stats 本身不自动轮询，依赖手动调用
 
-### 2.3 系统状态延迟配置核对
+#### 2.2.1 管理概览页（manage/overview）
+
+管理概览页位于 `mage_ai/frontend/pages/manage/overview/index.tsx`。
+
+**共享配置**：与概览页完全一致
+
+```typescript
+const SHARED_FETCH_OPTIONS = {
+  refreshInterval: 60000,      // 60 秒
+  revalidateOnFocus: false,    // 聚焦时不刷新
+};
+```
+
+**monitor_stats 查询**：同样使用 `useMutation` 手动模式，**不走 SWR 自动轮询**
+
+```typescript
+const [fetchMonitorStats, { isLoading: isValidatingMonitorStats }] = useMutation(
+  () => api.monitor_stats?.detailAsync(MonitorStatsEnum.PIPELINE_RUN_COUNT, monitorStatsQueryParams, {
+    signal: abortRef?.current?.signal,
+  }),
+  {
+    onSuccess: (response: any) =>
+      onSuccess(response, {
+        callback: ({ monitor_stat: { stats } }) => {
+          setMonitorStats(stats);
+        },
+      }),
+  },
+);
+```
+
+**刷新触发时机**：与概览页完全一致
+1. 组件首次挂载时调用 `fetchMonitorStats()`
+2. 切换时间周期 tab 时调用 `fetchMonitorStats()`
+3. pipeline_runs 每 60 秒自动轮询一次
+4. monitor_stats 本身不自动轮询
+
+**两页面对比**：
+
+| 页面 | monitor_stats 模式 | pipeline_runs 轮询 | 时间周期切换 |
+|-----|-------------------|-------------------|-------------|
+| overview/index.tsx | useMutation 手动 | 60s SWR 轮询 | ✅ 触发刷新 |
+| manage/overview/index.tsx | useMutation 手动 | 60s SWR 轮询 | ✅ 触发刷新 |
+
+**结论**：两个概览页的 monitor_stats 刷新机制完全一致，均为手动触发模式。
+
+### 2.3 系统状态延迟配置深入分析
 
 #### 2.3.1 默认值链路
 
@@ -235,13 +281,138 @@ const { status } = useStatus();  // 不传入参数，使用默认 7 秒
 
 **其他使用场景**（Header、PipelineDetail 等）：均为默认配置调用
 
-#### 2.3.3 延迟配置总结
+#### 2.3.3 全局入口状态请求的暂停条件详解
+
+**暂停条件逻辑**（`_app.tsx`）：
+
+```typescript
+const val = Cookies.get(REQUIRE_USER_AUTHENTICATION_COOKIE_KEY);
+const noValue = typeof val === 'undefined' || val === null || !REQUIRE_USER_AUTHENTICATION();
+
+const valPermissions = Cookies.get(REQUIRE_USER_PERMISSIONS_COOKIE_KEY);
+const noValuePermissions =
+  typeof valPermissions === 'undefined' || valPermissions === null || !REQUIRE_USER_PERMISSIONS();
+
+const { status } = useStatus({
+  delay: 3000,
+  pauseFetch: !noValue && !noValuePermissions,
+});
+```
+
+**noValue 的含义**：
+
+`noValue` 为 `true` 的情况：
+1. Cookie 中不存在 `REQUIRE_USER_AUTHENTICATION` 键
+2. Cookie 值为 `null`
+3. Cookie 值为 `false` 或 `0`（通过 `REQUIRE_USER_AUTHENTICATION()` 函数判断）
+
+反之，`noValue` 为 `false` 表示：Cookie 中存在该键且值为真值（`true` 或非 `0`）。
+
+**pauseFetch 的逻辑推导**：
+
+```
+pauseFetch = !noValue && !noValuePermissions
+```
+
+| 场景 | noValue | noValuePermissions | pauseFetch | 是否请求 status |
+|-----|---------|-------------------|------------|----------------|
+| 两个 Cookie 都不存在 | true | true | false | ✅ 请求 |
+| 认证 Cookie 不存在，权限 Cookie 存在且为真 | true | false | false | ✅ 请求 |
+| 认证 Cookie 存在且为真，权限 Cookie 不存在 | false | true | false | ✅ 请求 |
+| 两个 Cookie 都存在且都为真 | false | false | true | ❌ 暂停 |
+
+**结论**：只有当认证配置和权限配置**都已存在于 Cookie 中且都为真值**时，才会暂停 status 请求。
+
+#### 2.3.4 认证权限信息的作用
+
+**Cookie 配置来源**（`mage_ai/frontend/utils/session.ts`）：
+
+认证和权限配置以 Cookie 形式存储，有效期 1 天：
+
+```typescript
+export const REQUIRE_USER_AUTHENTICATION_COOKIE_PROPERTIES = {
+  ...SHARED_COOKIE_PROPERTIES,
+  expires: 1,  // 1 天过期
+};
+```
+
+**配置的作用链路**：
+
+```
+status API 返回配置
+   │
+   ▼
+写入 Cookie（_app.tsx 的 useEffect）
+   │
+   ▼
+各页面通过 REQUIRE_USER_AUTHENTICATION() 读取
+   │
+   ├─ 判断是否显示登录页面
+   ├─ 判断是否需要权限检查
+   └─ 控制 status 请求是否暂停（pauseFetch）
+```
+
+**具体用途**：
+
+1. **登录页面判断**：
+   - `requireUserAuthentication && !loggedIn` → 重定向到 `/sign-in`
+   - 用于保护需要认证的路由
+
+2. **权限检查**：
+   - `requireUserPermissions` 用于判断是否启用权限系统
+   - 影响 UI 元素的显示/隐藏
+
+3. **status 请求优化**：
+   - 如果 Cookie 中已有配置，就跳过 status 请求
+   - 避免页面初始化时重复请求相对静态的配置数据
+
+#### 2.3.5 与默认延迟值的联系
+
+**delay 与 pauseFetch 是两个独立的机制**：
+
+```
+页面加载
+   │
+   ├─ pauseFetch = true  → 完全不请求，跳过整个流程
+   │
+   └─ pauseFetch = false → 进入延迟等待
+        │
+        ├─ delay ms 后检查 condition
+        │    ├─ condition 满足 → 开始 SWR 请求
+        │    └─ condition 不满足 → 继续递归等待
+        │
+        └─ 最终：调用真实的 API
+```
+
+**两者的区别**：
+
+| 维度 | delay（延迟） | pauseFetch（暂停） |
+|-----|--------------|-------------------|
+| 作用 | 控制"何时开始"请求 | 控制"是否开始"请求 |
+| 机制 | setTimeout 延时 | 直接阻断 SWR key |
+| 可逆性 | 延迟后必然开始（除非 condition 不满足） | 一直暂停，直到依赖变化 |
+| 数据新鲜度 | 延迟后获取最新数据 | 不获取数据，使用旧值或无值 |
+| 适用场景 | 非关键路径，错开请求高峰 | 已有缓存数据，无需重复请求 |
+
+**_app.tsx 中的协作**：
+
+1. 页面首次加载时，Cookie 中无配置 → `pauseFetch = false` → 延迟 3 秒后请求 status
+2. 获取到 status 后，将配置写入 Cookie
+3. 用户刷新页面或再次访问 → Cookie 中已有配置 → `pauseFetch = true` → 不请求 status
+4. 1 天后 Cookie 过期 → 重新触发请求
+
+**潜在问题**：
+- 服务器端配置变更后，前端最长需要 1 天才能感知到（Cookie 过期）
+- 没有主动刷新机制来检测配置变更
+- 对于认证配置这种低频变化的数据，这种权衡是可接受的
+
+#### 2.3.6 延迟配置总结
 
 | 使用位置 | delay 值 | pauseFetch | refreshInterval | 说明 |
 |---------|----------|------------|-----------------|------|
 | useDelayFetch 默认 | 3000ms | - | - | 底层默认 |
 | useStatus 默认 | 7000ms | 通过 condition 控制 | 未设置（默认 0） | 覆盖底层默认 |
-| _app.tsx（全局） | 3000ms | 有权限才开始 | 未设置 | 全局状态栏，3 秒延迟 |
+| _app.tsx（全局） | 3000ms | 两个 Cookie 都为真时暂停 | 未设置 | 全局状态栏，3 秒延迟 + Cookie 缓存 |
 | edit.tsx（编辑页） | 7000ms（默认） | 未设置 | 未设置 | 使用默认值 |
 | 其他页面 | 7000ms（默认） | 未设置 | 未设置 | 大部分场景 |
 
@@ -264,9 +435,13 @@ const { status } = useStatus();  // 不传入参数，使用默认 7 秒
 ```
 页面加载
    │
-   ├─ 概览页
-   │    ├─ monitor_stats: 手动触发（首次 + tab 切换）
-   │    └─ pipeline_runs: SWR 60s 轮询 + 聚焦不刷新
+   ├─ 概览页（2 个）
+   │    ├─ overview/index.tsx
+   │    │    ├─ monitor_stats: 手动触发（首次 + tab 切换）
+   │    │    └─ pipeline_runs: SWR 60s 轮询 + 聚焦不刷新
+   │    └─ manage/overview/index.tsx
+   │         ├─ monitor_stats: 手动触发（首次 + tab 切换）
+   │         └─ pipeline_runs: SWR 60s 轮询 + 聚焦不刷新
    │
    ├─ 监控详情页（3 个）
    │    └─ monitor_stats: 首次加载 + 窗口聚焦（SWR 默认）
@@ -280,9 +455,78 @@ const { status } = useStatus();  // 不传入参数，使用默认 7 秒
    │    └─ pipeline_runs: 5s 轮询 + 聚焦不刷新
    │
    └─ 系统状态
-        ├─ _app.tsx: 延迟 3s 后开始 + 无轮询
+        ├─ _app.tsx: 延迟 3s 后开始 + Cookie 缓存控制 + 无轮询
         └─ edit.tsx: 延迟 7s 后开始 + 无轮询
 ```
+
+### 2.6 Stats 监控刷新时机冲突检查
+
+#### 2.6.1 冲突检查维度
+
+| 检查项 | 状态 | 说明 |
+|-------|------|------|
+| SWR 缓存键冲突 | ❌ 无冲突 | 各页面查询参数不同（pipeline_uuid、start_time 等），缓存 key 不同 |
+| 手动刷新 vs 自动轮询 | ❌ 无冲突 | monitor_stats 页面无自动轮询，仅手动刷新，不会冲突 |
+| 多页面数据一致性 | ⚠️ 潜在不一致 | 不同页面的 monitor_stats 数据可能不同步，因刷新时机不同 |
+| WebSocket 推送 vs 轮询 | ❌ 无冲突 | WebSocket 不推送 monitor_stats 数据，仅推送执行输出 |
+| SSE 事件 vs 轮询 | ❌ 无冲突 | SSE 仅用于执行结果流，与 monitor_stats 无关 |
+| Cookie 缓存 vs 实时性 | ⚠️ 潜在陈旧 | status 配置通过 Cookie 缓存 1 天，配置变更不实时 |
+
+#### 2.6.2 详细分析
+
+**1. SWR 缓存键分析**
+
+各 monitor_stats 查询的 URL 组成：
+- 概览页：`/api/monitor_stats/pipeline_run_count?start_time=xxx`
+- 管道运行监控：`/api/monitor_stats/pipeline_run_count?pipeline_uuid=xxx`
+- 块运行监控：`/api/monitor_stats/block_run_count?pipeline_uuid=xxx&pipeline_schedule_id=xxx`
+- 块运行时间监控：`/api/monitor_stats/block_run_time?pipeline_uuid=xxx&pipeline_schedule_id=xxx`
+
+**结论**：查询参数组合不同，SWR 缓存 key 不同，**无缓存冲突**。
+
+**2. 两个概览页的关系**
+
+`overview/index.tsx` 和 `manage/overview/index.tsx`：
+- 使用相同的 API 端点（`monitor_stats/pipeline_run_count`）
+- 查询参数相同（均为 `start_time`）
+- 但属于不同页面，用户不会同时访问
+- SWR 缓存会共享（同域名下），但因不同时访问，**无实际冲突**
+
+**3. 监控详情页与运行页的关系**
+
+- 监控详情页展示历史统计数据，刷新频率低（无自动轮询）
+- 运行详情页展示单个运行的实时状态，刷新频率高（3s 轮询）
+- 数据维度不同：统计聚合 vs 单个运行详情
+- **无数据冲突**
+
+**4. 潜在的不一致问题**
+
+虽然没有直接的刷新冲突，但存在数据一致性问题：
+
+| 场景 | 问题 | 影响程度 |
+|-----|------|---------|
+| 管道运行中打开监控页 | 监控数据不包含正在运行的管道，需手动刷新 | 低 |
+| 切换 tab 后返回 | SWR 可能展示旧数据，需等待聚焦重验证 | 低 |
+| 多用户同时操作 | 各用户看到的数据可能有时间差 | 低 |
+| status 配置变更 | Cookie 缓存 1 天，前端感知延迟 | 极低 |
+
+**5. 与 WebSocket/SSE 的界限检查**
+
+- **WebSocket**：仅用于交互式执行（块执行、管道执行、终端），不涉及 monitor_stats 统计数据推送
+- **SSE**：仅用于代码执行输出流，与 monitor_stats 完全无关
+- **结论**：实时通信机制与统计轮询机制职责清晰，**无重叠、无冲突**
+
+#### 2.6.3 冲突检查总结
+
+**总体结论：Stats 监控刷新时机无实质性冲突**。
+
+各机制职责划分清晰：
+- **SWR 轮询**：负责历史统计数据的拉取刷新
+- **手动刷新**：用户主动触发，与自动轮询不重叠
+- **WebSocket/SSE**：负责执行时的实时数据推送，与统计数据无关
+- **Cookie 缓存**：仅用于低频变化的系统配置，与运行时数据无关
+
+唯一需要注意的是**数据新鲜度**问题：监控页面的数据可能滞后于实际运行状态，但这是设计上的权衡（统计数据不需要毫秒级实时性），而非冲突。
 
 ---
 
@@ -370,14 +614,16 @@ const [fetchMonitorStats, { isLoading: isValidatingMonitorStats }] = useMutation
 
 | 页面 | 资源 | refreshInterval | revalidateOnFocus | 说明 |
 |-----|------|-----------------|-------------------|------|
-| 概览页 | monitor_stats | ❌ 无（useMutation 手动） | - | 手动触发，非 SWR 自动 |
-| 概览页 | pipeline_runs（失败列表） | 60000ms | false | SWR 自动轮询 |
+| 概览页（overview） | monitor_stats | ❌ 无（useMutation 手动） | - | 手动触发，非 SWR 自动 |
+| 概览页（overview） | pipeline_runs（失败列表） | 60000ms | false | SWR 自动轮询 |
+| 管理概览页（manage/overview） | monitor_stats | ❌ 无（useMutation 手动） | - | 手动触发，非 SWR 自动 |
+| 管理概览页（manage/overview） | pipeline_runs（失败列表） | 60000ms | false | SWR 自动轮询 |
 | 管道监控页-管道运行 | monitor_stats | 未设置（默认 0） | monitor_stats: 未设置（默认 true）<br>pipelines: false | 仅首次加载 + 聚焦 |
 | 管道监控页-块运行 | monitor_stats | 未设置（默认 0） | 未设置（默认 true） | 首次 + 聚焦 + 切换调度 |
 | 管道监控页-块运行时间 | monitor_stats | 未设置（默认 0） | 未设置（默认 true） | 首次 + 聚焦 + 切换调度 |
 | 管道运行详情页 | pipeline_runs | 非 idle 时 3000ms | true | 运行中高频轮询，空闲时停止 |
 | 管道运行列表页 | pipeline_runs | 5000ms | false | 固定频率轮询 |
-| 系统状态（_app） | statuses | 未设置（默认 0） | 未设置 | 延迟 3000ms 后开始 |
+| 系统状态（_app） | statuses | 未设置（默认 0） | 未设置 | 延迟 3000ms 后开始 + Cookie 缓存控制 |
 | 系统状态（edit） | statuses | 未设置（默认 0） | 未设置 | 延迟 7000ms 后开始 |
 
 ### 4.3 延迟拉取机制
