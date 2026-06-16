@@ -384,13 +384,15 @@ def get_variables(self, extra_variables=None, pipeline_uuid=None):
     # 根据 schedule_type 和 interval 计算 interval_end_datetime / interval_seconds 等
     # 同样直接赋值，覆盖前面
 
-    # === 第 5 步 (最后!): extra_variables 额外变量 (覆盖一切!) ===
-    variables.update(extra_variables)   # ← 最后一步，优先级最高
+    # === 第 5 步 (最后!): extra_variables 额外变量 (Pipeline 级最高!) ===
+    variables.update(extra_variables)   # ← get_variables 函数最后一步，Pipeline 级优先级最高
 
     return variables
 ```
 
-**关键发现**：`extra_variables` 在函数**最后一行**通过 `variables.update(extra_variables)` 应用，它可以覆盖 **所有** 前面的变量，包括系统变量 `ds`、`hr`、`env`、`pipeline_run_id` 等。
+**关键发现**：`extra_variables` 在函数**最后一行**通过 `variables.update(extra_variables)` 应用，在 `get_variables()` 函数内部，它可以覆盖所有前面的变量，包括系统变量 `ds`、`hr`、`env`、`pipeline_run_id` 等。
+
+⚠️ **注意**：以上是 `get_variables()` 函数内部的优先级。在 Block 执行时，还有 hook_variables 和 kwargs_vars 两层额外覆盖（详见 7.9 节）。
 
 ### 7.3 两种运行时变量机制
 
@@ -399,16 +401,16 @@ Mage 中有 **两套独立的** 运行时变量传递机制：
 | 机制 | 存储位置 | 作用时机 | 优先级 |
 |------|---------|---------|--------|
 | `pipeline_run.variables` | DB `pipeline_run.variables` JSON 列 | PipelineRun 创建时写入 | 第 3 级（低） |
-| `extra_variables` | 函数参数，不持久化 | `get_variables()` 调用时传入 | 第 5 级（最高） |
+| `extra_variables` | 函数参数，不持久化 | `get_variables()` 调用时传入 | 第 6 级（Pipeline 级最高） |
 
 **使用场景：**
 - API 创建 PipelineRun：payload 中的 `variables` 存入 `pipeline_run.variables` → 第 3 级
-- CLI `mage run --runtime-vars`：作为 `extra_variables` 传入 `get_variables()` → 第 5 级（最高）
+- CLI `mage run --runtime-vars`：作为 `extra_variables` 传入 `get_variables()` → 第 6 级（Pipeline 级最高）
 - 调度器触发：变量来自 `pipeline_schedule.variables` → 第 2 级
 
 ### 7.4 变量合并优先级全景（Pipeline 级别）
 
-从低到高，**后者覆盖前者**（基于代码实际执行顺序验证）：
+`PipelineRun.get_variables()` 函数内部的合并顺序（从低到高，**后者覆盖前者**）：
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
@@ -444,14 +446,16 @@ Mage 中有 **两套独立的** 运行时变量传递机制：
 │         interval_seconds, interval_start_datetime_previous         │
 │   特点: 直接 = 赋值，覆盖优先级 1-4 的同名 key                       │
 ├────────────────────────────────────────────────────────────────────┤
-│ 优先级 6 (最高)  extra_variables 额外运行时变量                      │
+│ 优先级 6 (Pipeline 级最高)  extra_variables 额外运行时变量          │
 │   来源: get_variables(extra_variables=...) 函数参数                 │
-│   合并: variables.update(extra_variables) ← 最后一步!               │
+│   合并: variables.update(extra_variables) ← get_variables 最后一步  │
 │   场景: CLI --runtime-vars / 运行时动态传入                          │
 │   特点: 不持久化到 DB，仅本次调用生效                                 │
 │  ⚠️ 可以覆盖系统变量! (ds, hr, env, pipeline_run_id 等)               │
 └────────────────────────────────────────────────────────────────────┘
 ```
+
+**注意**：以上是 `get_variables()` 函数内部的 6 级合并。在 Block 执行时，还有 **2 级额外覆盖**（详见 7.9 节）。
 
 ### 7.5 Hook 变量的完整生命周期
 
@@ -692,6 +696,7 @@ BlockExecutor.execute(global_vars)
 │   来源:                                                            │
 │     8a: GLOBAL_DATA_PRODUCT 上游 → 所有 dict 输出变量 merge        │
 │     8b: Dynamic Block 上游 → output_1 (metadata dict)              │
+│     ❌ 普通 Block 上游 → 不产生 kwargs_vars（仅进入 input_vars）     │
 │   合并: for kwargs_var in kwargs_vars:                             │
 │           global_vars_copy.update(kwargs_var)                      │
 │   遍历顺序: 按 upstream_block_uuids 列表顺序                        │
@@ -706,27 +711,49 @@ BlockExecutor.execute(global_vars)
 
 ### 7.10 同名 key 冲突示例
 
-假设 `api_key` 在各层都有值：
+#### 示例 1: 自定义变量 `api_key`（仅存在于 Pipeline 级 1-3 和 6 层）
+
+`api_key` 是用户自定义变量，**不会出现在 hook_variables 和 kwargs_vars 中**（hook_variables 只有固定的几个 key，kwargs_vars 只有 GDP/Dynamic Block 的输出 key）。
 
 | 优先级 | 层级 | 值 | 是否生效 | 说明 |
 |--------|------|---|---------|------|
 | 1 | Pipeline YAML | `'yaml_key'` | ❌ | 被 schedule 覆盖 |
 | 2 | Schedule 变量 | `'schedule_key'` | ❌ | 被 run 变量覆盖 |
-| 3 | PipelineRun 变量 | `'run_key'` | ❌ | 被系统变量覆盖 |
+| 3 | PipelineRun 变量 | `'run_key'` | ❌ | 被 extra_variables 覆盖 |
 | 4 | Event 变量 | `'event_key'` | ❌ | 填空模式，key 已存在 |
-| 5 | 系统变量 | N/A | — | `api_key` 非系统变量 |
-| 6 | extra_variables | `'runtime_key'` | ❌ | 被 hook_variables 覆盖 |
-| 7 | hook_variables | `'hook_key'` | ❌ | 被 kwargs_vars 覆盖 |
-| 8 | kwargs_vars (上游 GDP) | `'gdp_key'` | ✅ | 最终生效（最高） |
+| 5 | 系统变量 | N/A | — | 系统变量无 `api_key` |
+| 6 | extra_variables (CLI) | `'runtime_key'` | ✅ | Pipeline 级最高，最终生效 |
+| 7 | hook_variables | N/A | — | hook_variables 无 `api_key` 这个 key |
+| 8 | kwargs_vars | N/A | — | 取决于上游 GDP/Dynamic Block 的输出 key |
 
-**特殊情况**：如果 `api_key` 是系统变量名（如 `env`）：
+#### 示例 2: 系统变量 `env`（存在于 5-8 层）
 
-| 优先级 | 层级 | 值 | 是否生效 |
-|--------|------|---|---------|
-| 5 | 系统注入 `env = ENV_PROD` | `'production'` | ❌ |
-| 6 | extra_variables `env = 'custom'` | `'custom'` | ❌ |
-| 7 | hook_variables `env = 'hook'` | `'hook'` | ❌ |
-| 8 | kwargs_vars `env = 'upstream'` | `'upstream'` | ✅ |
+`env` 是系统变量，但也可能被 extra_variables、hook_variables、kwargs_vars 依次覆盖。
+
+| 优先级 | 层级 | 值 | 是否生效 | 说明 |
+|--------|------|---|---------|------|
+| 1-4 | 前面 4 层 | 各层值 | ❌ | 被系统变量覆盖 |
+| 5 | 系统注入 `env = ENV_PROD` | `'production'` | ❌ | 被 extra_variables 覆盖 |
+| 6 | extra_variables `env = 'custom'` | `'custom'` | ❌ | 被 hook_variables 覆盖（如果有） |
+| 7 | hook_variables | N/A | — | hook_variables 默认无 `env` key |
+| 8 | kwargs_vars (上游 GDP) `env = 'gdp_env'` | `'gdp_env'` | ✅ | Block 级最高，最终生效 |
+
+⚠️ **重要边界**：
+- hook_variables 默认只有 `operation_resource`、`payload`、`resource`、`resource_id` 这几个固定 key，**不会覆盖** `env`、`ds`、`api_key` 等变量
+- kwargs_vars 的 key 取决于上游 GDP/Dynamic Block 的具体输出，**不是所有变量都能被覆盖**
+- 普通 Block 上游不产生 kwargs_vars，**不会覆盖任何 global_vars key**
+
+#### 示例 3: `resource_id` 变量（hook_variables 特有 key）
+
+`resource_id` 是 hook_variables 的固定 key，只在 hook 存在时才出现。
+
+| 优先级 | 层级 | 值 | 是否生效 | 说明 |
+|--------|------|---|---------|------|
+| 1-4 | 前面 4 层 | （假设不存在） | — | 无此 key |
+| 5 | 系统变量 | N/A | — | 系统变量无 `resource_id` |
+| 6 | extra_variables | （假设不存在） | — | 无此 key |
+| 7 | hook_variables | `'pipeline_uuid_123'` | ✅ | hook 存在时，这是唯一来源 |
+| 8 | kwargs_vars | （取决于上游） | 可能覆盖 | 如果上游 GDP 输出了 `resource_id` key，会覆盖 hook 的值 |
 
 ### 7.11 三条路径的变量边界总结
 
@@ -869,7 +896,7 @@ for k, v in event_variables.items():
 ```python
 variables.update(extra_variables)  # 最后一行!
 ```
-→ **extra_variables 覆盖一切**，包括系统变量。这是 `get_variables()` 函数的最后一步。
+→ **extra_variables 是 `get_variables()` 函数内部的最后一步**，可以覆盖该函数内所有前面的变量，包括系统变量。但注意：Block 执行时还有 hook_variables 和 kwargs_vars 两层额外覆盖（详见 7.9 节）。
 
 常见误解纠正：
 - ❌ 错误：系统变量不可被覆盖
@@ -878,12 +905,20 @@ variables.update(extra_variables)  # 最后一行!
 ### 10.6 Hook 变量 vs Pipeline 级全局变量
 
 ```python
-# BlockExecutor.execute() 第 178-181 行
-global_vars = merge_dict(global_vars, hook_variables)
+# BlockExecutor.execute() 第 177-181 行
+if block_run.metrics.get('hook_variables'):
+    global_vars = merge_dict(global_vars, block_run.metrics.get('hook_variables') or {})
 ```
-→ **Hook 变量覆盖 pipeline 级所有变量**。在 BlockExecutor 入口处 merge，条件是 FeatureUUID.GLOBAL_HOOKS 启用。
 
-### 10.7 上游 Block kwargs 输出 vs Hook 变量
+→ **hook_variables 会覆盖 pipeline 级 global_vars 中同名的 key**，但 hook_variables 的 key 是**固定且有限的**：
+- `operation_resource`：当前操作的资源对象（如 pipeline_run.to_dict()）
+- `payload`：负载信息（block_runs、pipeline_schedule 等）
+- `resource`：资源对象（如 pipeline.to_dict()）
+- `resource_id`：资源 ID（如 pipeline.uuid）
+
+⚠️ **边界**：hook_variables 是**操作上下文信息**，不是 Hook 自身 pipeline 的执行输出。它不会凭空产生 `env`、`ds`、`api_key` 等变量——只有当这些 key 恰好和 hook_variables 的固定 key 同名时才会被覆盖。
+
+### 10.7 kwargs_vars (上游 metadata) vs Hook 变量
 
 ```python
 # Block.execute_sync() 第 1904-1908 行
@@ -892,7 +927,17 @@ for kwargs_var in kwargs_vars:
     if kwargs_var:
         global_vars_copy.update(kwargs_var)
 ```
-→ **上游 kwargs 输出覆盖 Hook 变量**。这是 Block 级别最高优先级，每个上游 Block 依次覆盖，后执行的上游优先级更高。
+
+→ **kwargs_vars 会覆盖 hook_variables 的同名 key**，但有两个重要边界：
+
+1. **只有特定上游类型才产生 kwargs_vars**：
+   - ✅ GLOBAL_DATA_PRODUCT 上游：所有 dict 类型的输出变量 merge 成一个 kwargs_var
+   - ✅ Dynamic Block 上游：`output_1`（metadata dict）作为 kwargs_var
+   - ❌ 普通 Block 上游：**不产生 kwargs_vars**，输出仅进入 `input_vars`（位置参数）
+
+2. **kwargs_vars 的 key 取决于上游输出**：
+   - 不是"所有变量都能被覆盖"，只有上游 GDP/Dynamic Block 实际输出的 dict key 才会覆盖
+   - 多个上游 Block 按 `upstream_block_uuids` 顺序遍历，后遍历的覆盖先遍历的
 
 ### 10.8 metadata.yaml 模板渲染 vs 全局变量
 
@@ -906,9 +951,31 @@ metadata.yaml 中的 `{{ env_var('KEY') }}` 和 `{{ mage_secret_var('key') }}` �
 | 机制 | 存储 | 优先级 | 传递方式 | 典型场景 |
 |------|------|--------|---------|---------|
 | `pipeline_run.variables` | DB JSON 列 | 第 3 级 | API 创建 PipelineRun 时存入 | API 触发、调度器触发 |
-| `extra_variables` | 函数参数（不持久化） | 第 6 级（最高） | `get_variables(extra_variables=...)` | CLI `--runtime-vars`、内部调用 |
+| `extra_variables` | 函数参数（不持久化） | 第 6 级（Pipeline 级最高） | `get_variables(extra_variables=...)` | CLI `--runtime-vars`、内部调用 |
 
-如果同时存在两种运行时变量，`extra_variables` 优先级更高，会覆盖 `pipeline_run.variables`。
+如果同时存在两种运行时变量，`extra_variables` 优先级更高，会覆盖 `pipeline_run.variables` 的同名 key。
+
+### 10.10 最终统一结论
+
+**关于优先级的最终口径（全文统一）：**
+
+| 级别 | 优先级 | 名称 | 能否覆盖同名 key | 边界说明 |
+|------|--------|------|----------------|---------|
+| Pipeline 级 | 1 (最低) | Pipeline YAML 全局变量 | — | 基础层 |
+| Pipeline 级 | 2 | PipelineSchedule 调度器变量 | ✅ 覆盖 1 | 同一 pipeline 不同 trigger |
+| Pipeline 级 | 3 | PipelineRun.variables (DB) | ✅ 覆盖 2 | API 创建时存入 |
+| Pipeline 级 | 4 | Event 事件变量 | ⚠️ 仅填空，不覆盖 | 唯一例外 |
+| Pipeline 级 | 5 | 系统注入变量 | ✅ 覆盖 1-4 | ds, hr, env, pipeline_run_id 等 |
+| Pipeline 级 | **6 (Pipeline 级最高)** | extra_variables | ✅ 覆盖 1-5 | `get_variables()` 最后一步 |
+| Block 级 | 7 | hook_variables | ✅ 覆盖 1-6 | key 固定有限 (operation_resource, payload, resource, resource_id) |
+| Block 级 | **8 (Block 级最高)** | kwargs_vars | ✅ 覆盖 1-7 | 仅 GDP 和 Dynamic Block 上游产生 |
+
+**关键边界提醒：**
+1. **不是每个 key 都会在所有层级出现**。例如 `api_key` 通常只在 1、2、3、6 层出现，不会在 hook_variables（第 7 层）中出现
+2. **hook_variables 的 key 是固定的**：只有 `operation_resource`、`payload`、`resource`、`resource_id` 这几个操作上下文字段
+3. **kwargs_vars 不是每个上游都有**：只有 GDP 和 Dynamic Block 类型的上游才产生，普通 Block 上游不产生
+4. **普通 Block 的输出永远不会覆盖 global_vars**：它们的输出只进入 `input_vars`（位置参数）
+5. **"优先级更高"只意味着同名 key 时后者赢**，不代表更高优先级的层会产生更多 key
 
 ---
 
