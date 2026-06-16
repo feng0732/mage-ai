@@ -6,10 +6,10 @@ Mage AI 实际存在 **两套内核**，通过环境变量 `KERNEL_MANAGER` 选�
 
 | 环境变量值 | 内核 | 代码入口 |
 |-----------|------|---------|
-| `default`（默认） | **Jupyter Kernel**（ipykernel） | [active_kernel.py](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/server/active_kernel.py) → `client.execute(code)` |
-| `magic` | **Magic Kernel**（自研多进程池） | [CodeExecutionResource.py](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/api/resources/CodeExecutionResource.py) → `KernelManager.get_kernel().run(message)` |
+| `default`（默认） | **Jupyter Kernel**（ipykernel） | `mage_ai/server/active_kernel.py` → `client.execute(code)` |
+| `magic` | **Magic Kernel**（自研多进程池） | `mage_ai/api/resources/CodeExecutionResource.py` → `KernelManager.get_kernel().run(message)` |
 
-判断逻辑定义在 [server.py#L245](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/settings/server.py#L245)：
+判断逻辑定义在 `mage_ai/settings/server.py`：
 
 ```python
 KERNEL_MAGIC = os.getenv('KERNEL_MANAGER', 'default') == 'magic'
@@ -33,13 +33,13 @@ BlockResource.create()
     │
     ▼
 Block.create(name, block_type, repo_path, config, language, pipeline)
-    │  [block/__init__.py#L1046-L1165]
+    │  见 mage_ai/data_preparation/models/block/__init__.py
     │
     ├─► 计算文件路径：{repo_path}/{block_directory}/{uuid}.{ext}
     │     例：/repo/data_loaders/load_users.py
     │
     ├─► 文件不存在 → load_template(block_type, config, file_path, language, pipeline_type)
-    │     [template.py#L121-L134]
+    │     见 mage_ai/data_preparation/templates/template.py
     │     │
     │     ├─► fetch_template_source() → Jinja2 渲染出代码字符串
     │     └─► write_template(template_source, dest_path) → 写入 .py 文件
@@ -47,7 +47,7 @@ Block.create(name, block_type, repo_path, config, language, pipeline)
     └─► 文件已存在 → 跳过模板写入（保留已有代码）
 ```
 
-关键代码在 [block/__init__.py#L1145-L1152](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1145-L1152)：
+关键代码（Block.create 内部）：
 
 ```python
 load_template(
@@ -63,7 +63,7 @@ load_template(
 
 ### 2.2 Block 执行时读取代码
 
-Block 的 `content` 属性是获取代码的入口，定义在 [block/__init__.py#L499-L510](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L499-L510)：
+Block 的 `content` 属性是获取代码的入口（定义于 Block 类中）：
 
 ```python
 @property
@@ -85,11 +85,11 @@ def content(self) -> str:
 
 ### 3.1 主路径：WebSocket → Jupyter Kernel
 
-核心逻辑在 [websocket_server.py#L401-L543](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/server/websocket_server.py#L401-L543) 的 `__execute_block` 方法。
+核心逻辑在 `mage_ai/server/websocket_server.py` 的 `__execute_block` 异步方法中。
 
 #### 3.1.1 代码预处理三步曲
 
-**第 1 步：获取代码**（[websocket_server.py#L410-L437](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/server/websocket_server.py#L410-L437)）
+**第 1 步：获取代码**
 
 ```python
 custom_code = message.get('code')   # 前端传入的编辑器代码
@@ -97,7 +97,7 @@ block = pipeline.get_block(block_uuid)
 code = custom_code                   # 默认使用前端传入代码
 ```
 
-**第 2 步：包装执行框架**（[websocket_server.py#L480-L515](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/server/websocket_server.py#L480-L515)）
+**第 2 步：包装执行框架**
 
 对于 `CUSTOM_EXECUTION_BLOCK_TYPES`（data_loader/transformer/data_exporter/sensor 等），调用 `add_execution_code()`：
 
@@ -112,7 +112,7 @@ code = add_execution_code(
 )
 ```
 
-`add_execution_code`（[output_display.py#L209-L300](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/server/utils/output_display.py#L209-L300)）将用户代码嵌入模板 [execute_custom_code.py](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/server/utils/execute_custom_code.py)：
+`add_execution_code`（定义于 `mage_ai/server/utils/output_display.py`）将用户代码嵌入模板 `mage_ai/server/utils/execute_custom_code.py`：
 
 ```
 最终代码结构：
@@ -128,7 +128,7 @@ code = add_execution_code(
 └──────────────────────────────────────────┘
 ```
 
-**第 3 步：追加输出处理**（[websocket_server.py#L524-L531](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/server/websocket_server.py#L524-L531)）
+**第 3 步：追加输出处理**
 
 ```python
 msg_id = client.execute(
@@ -136,7 +136,7 @@ msg_id = client.execute(
 )
 ```
 
-`add_internal_output_info`（[output_display.py#L96-L187](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/server/utils/output_display.py#L96-L187)）在代码末尾追加 `custom_output.py` 的内容，用于：
+`add_internal_output_info`（定义于 `mage_ai/server/utils/output_display.py`）在代码末尾追加 `custom_output.py` 的内容，用于：
 - 捕获最后一条表达式的值
 - 将 DataFrame / dict / list 等序列化为 JSON
 - 通过 `print()` 输出到 stdout，由 Jupyter kernel 捕获
@@ -153,7 +153,7 @@ WebSocketServer.running_executions_mapping[msg_id] = value  # 记录 block_uuid 
 
 ### 3.2 新路径：REST API → Magic Kernel
 
-核心逻辑在 [CodeExecutionResource.py](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/api/resources/CodeExecutionResource.py)：
+核心逻辑在 `mage_ai/api/resources/CodeExecutionResource.py`：
 
 ```python
 class CodeExecutionResource(GenericResource):
@@ -198,23 +198,24 @@ Jupyter Kernel 的 iopub channel
     │
     │ client.get_iopub_msg(timeout=1)
     ▼
-subscriber.py: get_messages(callback)        [server.py#L745-L749]
+mage_ai/server/subscriber.py: get_messages(callback)
     │
-    │ parse_output_message(message)           [kernel_output_parser.py#L25-L86]
+    │ parse_output_message(message)
+    │ 定义于 mage_ai/server/kernel_output_parser.py
     │ 将 Jupyter 消息格式转为统一 dict:
     │   { data, error, execution_state, msg_id, msg_type, type }
     ▼
-WebSocketServer.send_message(message_dict)    [websocket_server.py#L312-L399]
+WebSocketServer.send_message(message_dict)
     │
     │ 1. 查 running_executions_mapping[msg_id] 获取 block_uuid/pipeline_uuid
     │ 2. 有 error → format_error() 过滤 Mage 内部堆栈
     │ 3. filter_out_sensitive_data() 过滤环境变量
     │ 4. merge_dict(message, {block_type, pipeline_uuid, uuid})
     ▼
-client.write_message(json.dumps(message_final))  ← SSE/WebSocket 推送到浏览器
+client.write_message(json.dumps(message_final))  ← WebSocket 推送到浏览器
 ```
 
-**消息格式解析**（[kernel_output_parser.py#L25-L86](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/server/kernel_output_parser.py#L25-L86)）：
+**消息格式解析**（定义于 `mage_ai/server/kernel_output_parser.py`）：
 
 | Jupyter msg_type | 处理方式 | DataType |
 |-----------------|---------|----------|
@@ -243,10 +244,13 @@ client.write_message(json.dumps(message_final))  ← SSE/WebSocket 推送到浏�
 ReaderThread（主进程 daemon 线程）
     │
     │ read_queue.get() → write_queue.put()
+    │ 定义于 mage_ai/kernels/magic/threads/reader.py
     ▼
-全局 execution_result_queue[uuid]      [queues/manager.py]
+全局 execution_result_queue[uuid]
+    │ 定义于 mage_ai/kernels/magic/queues/manager.py
     │
-    │ EventStreamHandler.get(uuid)          [events/stream.py#L28-L59]
+    │ EventStreamHandler.get(uuid)
+    │ 定义于 mage_ai/server/events/stream.py
     │ SSE (Server-Sent Events) 长轮询：
     │   while True:
     │     queue.get_nowait() → EventStream.load(...) → self.write(f'data: {json}\n\n')
@@ -303,7 +307,6 @@ kernel_output_parser.py: 提取 traceback → error 字段
     ▼
 WebSocketServer.send_message():
     │ error 不为 None → format_error(error, block_uuid)
-    │   [websocket_server.py#L647-L711]
     │
     │ format_error 做了什么：
     │ 1. 找到 "execute_custom_code()" 在 traceback 中的行号 → 初始截断点
@@ -315,9 +318,28 @@ WebSocketServer.send_message():
 前端收到格式化后的错误消息，显示在 Block 输出面板
 ```
 
+`format_error` 核心逻辑（定义于 `mage_ai/server/websocket_server.py`）：
+
+```python
+initial_regex = r'.*execute_custom_code\(\).*'
+end_search_string = block_uuid if block_uuid else 'execute_block_function'
+end_regex = r'.*' + re.escape(end_search_string) + r'.*'
+
+# 遍历 traceback 行，找到初始截断点和结束截断点
+for idx, line in enumerate(error):
+    if re.match(initial_regex, line_without_ansi) and not initial_idx:
+        initial_idx = idx
+    if re.match(end_regex, line_without_ansi):
+        end_idx = idx
+
+# 删除中间行，只保留用户代码相关部分
+if initial_idx and end_idx:
+    return error[: initial_idx - 1] + error[end_idx:]
+```
+
 #### 5.1.2 上游 Block 未执行
 
-在 `__execute_block` 触发前，`Block.execute_sync` 检查上游状态（[block/__init__.py#L1499-L1518](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/data_preparation/models/block/__init__.py#L1499-L1518)）：
+在 `__execute_block` 触发前，`Block.execute_sync` 检查上游状态（定义于 Block 类）：
 
 ```python
 not_executed_upstream_blocks = list(
@@ -334,7 +356,7 @@ if len(not_executed_upstream_blocks) > 0:
 
 #### 5.1.3 Pipeline 执行错误
 
-在 `__execute_pipeline` 的子进程模式中（[websocket_server.py#L117-L135](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/server/websocket_server.py#L117-L135)）：
+在 `__execute_pipeline` 的子进程模式中（定义于 `mage_ai/server/websocket_server.py`）：
 
 ```python
 try:
@@ -348,7 +370,7 @@ except Exception:
 
 #### 5.1.4 认证/权限错误
 
-在 `on_message` 入口（[websocket_server.py#L213-L250](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/server/websocket_server.py#L213-L250)）：
+在 `on_message` 入口（定义于 `mage_ai/server/websocket_server.py`）：
 
 ```python
 if not valid or DISABLE_NOTEBOOK_EDIT_ACCESS == 1:
@@ -363,6 +385,49 @@ if not valid or DISABLE_NOTEBOOK_EDIT_ACCESS == 1:
 
 #### 5.2.1 代码执行层（execution.py）
 
+核心逻辑在 `mage_ai/kernels/magic/execution.py` 的 `execute_code_async` 函数：
+
+```python
+try:
+    async with context:
+        await self.__execute_code_async(...)
+        queue.put(
+            ExecutionResult.load(
+                process=process,
+                status=ExecutionStatus.READY,
+                type=ResultType.STATUS,
+                uuid=uuid,
+            )
+        )
+except StopAsyncIteration as err:
+    # 用户主动中断
+    queue.put(
+        ExecutionResult.load(
+            error=ErrorDetails.from_current_error(err),
+            process=process,
+            status=ExecutionStatus.CANCELLED,
+            type=ResultType.STATUS,
+            uuid=uuid,
+        )
+    )
+except Exception as err:
+    # 执行异常
+    queue.put(
+        ExecutionResult.load(
+            error=ErrorDetails.from_current_error(err),
+            process=process,
+            status=ExecutionStatus.ERROR,
+            type=ResultType.STATUS,
+            uuid=uuid,
+        )
+    )
+finally:
+    # 无论成功失败，通知消费端
+    if main_queue is not None:
+        main_queue.put(uuid)
+    queue.put(None)  # 哨兵值，标记输出结束
+```
+
 | 异常类型 | 状态 | 错误回传 |
 |---------|------|---------|
 | `StopAsyncIteration`（用户中断） | `CANCELLED` | `ErrorDetails.from_current_error(err)` |
@@ -374,14 +439,21 @@ if not valid or DISABLE_NOTEBOOK_EDIT_ACCESS == 1:
 ```python
 def execute_message(...):
     try:
-        asyncio.run(execute_code_async(...))
+        asyncio.run(execute_code_async(...))  # 子进程内跑 asyncio 事件循环
     except Exception as err:
-        print(f'[Process.execute_code:{uuid}] Error: {err}')  # 兜底日志
+        print(f'[Process.execute_code:{uuid}] Error: {err}')  # 极端兜底：子进程内异常只打印日志
 ```
 
-#### 5.2.3 ReaderThread 桥接层
+这是最外层的「防御式打印」，理论上不会触发（因为 execute_code_async 内部已全量捕获），但防止 asyncio.run 本身抛错导致 worker 进程无声崩溃。
+
+#### 5.2.3 ReaderThread 桥接层（threads/reader.py）
 
 ```python
+try:
+    while not stop_event.is_set():
+        result = read_queue.get(timeout=0.1)
+        if result is not None:
+            write_queue.put(result)
 except Empty:
     pass                              # 空队列正常
 except Exception as err:
@@ -400,10 +472,10 @@ except Exception as err:
 
 ### 5.3 execute_custom_code 内部的错误处理
 
-[execute_custom_code.py](file:///d:/fz/0601/solo-dogfeeding/code/329-mage-ai/mage_ai/server/utils/execute_custom_code.py) 是运行在 Jupyter Kernel 内部的框架代码，其错误处理：
+`mage_ai/server/utils/execute_custom_code.py` 是运行在 Jupyter Kernel 内部的框架代码，其错误处理：
 
 1. **`block.execute_with_callback(**options)`**：内部调用 `Block.execute_sync`，该方法对上游未执行、动态块计算等场景抛出异常
-2. **动态子块执行**（`run_tasks`）：每个子块独立执行，通过 `send_status_update` 报告进度（如 "3 of 10 dynamic child blocks completed."），任何子块异常都会中断后续子块
+2. **动态子块执行**（`run_tasks`）：每个子块独立执行，通过 `send_status_update` 报告进度，任何子块异常都会中断后续子块
 3. **输出序列化**：`simplejson.dumps(..., default=encode_complex, ignore_nan=True)` 处理不可序列化类型
 
 ---
@@ -507,3 +579,25 @@ client.execute() ──► 完整可执行代码字符串
 **Jupyter**：通过 `msg_id` 关联，`running_executions_mapping[msg_id] = {block_uuid, block_type}`，确保多次执行的输出不会混淆。
 
 **Magic**：通过 `uuid`（kernel ID）分区，`execution_result_queue[uuid]` 是每个 kernel 独立的 `FasterQueue`，`EventStreamHandler` 按 URL 中的 uuid 取对应队列。`None` 哨兵标记单次执行流的结束。
+
+---
+
+## 复核说明（稳定复现点）
+
+以下内容均可通过代码搜索稳定复核：
+
+### 入口衔接
+1. `Block.create` 中 `load_template` 调用：搜索 `load_template(` 定位到 Block 类方法
+2. `block.content` 属性：搜索 `def content(` 在 Block 类定义中
+3. `__execute_block` 中 `add_execution_code` + `add_internal_output_info` 调用：在 websocket_server.py 中搜索函数名
+
+### 状态回传
+1. Jupyter 路径 `format_error` 逻辑：搜索 `def format_error(`
+2. Jupyter 路径 `parse_output_message`：在 kernel_output_parser.py 中搜索函数名
+3. Magic 路径 `ReaderThread` 桥接：在 threads/reader.py 中搜索 `read_queue_and_forward_results`
+4. Magic 路径 SSE 推送：在 events/stream.py 中搜索 `EventStreamHandler`
+
+### 出错处理
+1. Jupyter 路径 `execute_custom_code.py` 框架代码：文件中搜索 `def execute_custom_code`
+2. Magic 路径 `execute_code_async` 的 try/except/finally：在 execution.py 中搜索 `except StopAsyncIteration`
+3. Magic 路径 `None` 哨兵：在 execution.py 末尾搜索 `queue.put(None)`
