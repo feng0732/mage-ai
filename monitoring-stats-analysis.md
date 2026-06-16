@@ -2,110 +2,101 @@
 
 ## 一、体系架构总览
 
-Mage AI 的监控与状态同步体系由三层机制组成，各自承担不同的职责边界：
+Mage AI 的监控与状态同步体系由四层机制组成，各自承担不同的职责边界：
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        前端应用层 (Next.js)                        │
-│                                                                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │  HTTP + SWR  │  │  WebSocket   │  │  SSE (EventSource)   │  │
-│  │  轮询拉取    │  │  双向通信    │  │  单向数据流          │  │
-│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘  │
-│         │                 │                       │              │
-└─────────┼─────────────────┼───────────────────────┼──────────────┘
-          │                 │                       │
-          │ HTTP API        │ ws://                 │ http://
-          │                 │                       │
-┌─────────▼─────────────────▼───────────────────────▼──────────────┐
-│                        服务端 (Tornado)                           │
-│                                                                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ REST API     │  │ WebSocket    │  │ SSE Handler          │  │
-│  │ MonitorStat  │  │ Server       │  │ EventStreamHandler   │  │
-│  │ Resource     │  │              │  │                      │  │
-│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘  │
-│         │                 │                       │              │
-│  ┌──────▼───────┐  ┌──────▼───────┐  ┌──────────▼───────────┐  │
-│  │ 数据库       │  │ Jupyter      │  │ 执行结果队列         │  │
-│  │ PipelineRun  │  │ Kernel       │  │ (faster_fifo Queue)  │  │
-│  │ BlockRun     │  │              │  │                      │  │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                        前端应用层 (Next.js)                          │
+│                                                                     │
+│  ┌────────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
+│  │ 前端轮询机制   │  │  WebSocket   │  │  SSE (EventSource)   │  │
+│  │ (HTTP + SWR)   │  │  双向通信    │  │  单向数据流          │  │
+│  └───────┬────────┘  └──────┬───────┘  └──────────┬───────────┘  │
+│          │                  │                       │              │
+│  ┌───────▼────────┐         │                       │              │
+│  │ 数据请求缓存   │         │                       │              │
+│  │  (SWR Cache)   │         │                       │              │
+│  └────────────────┘         │                       │              │
+└───────────┬──────────────────┼───────────────────────┼──────────────┘
+            │ HTTP API        │ ws://                 │ http://
+            │                 │                       │
+┌───────────▼──────────────────▼───────────────────────▼──────────────┐
+│                        服务端 (Tornado)                              │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐     │
+│  │ REST API     │  │ WebSocket    │  │ SSE Handler          │     │
+│  │ MonitorStat  │  │ Server       │  │ EventStreamHandler   │     │
+│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘     │
+│         │                 │                       │                 │
+│  ┌──────▼───────┐  ┌──────▼───────┐  ┌──────────▼───────────┐     │
+│  │ 数据库       │  │ Jupyter      │  │ 执行结果队列         │     │
+│  │ PipelineRun  │  │ Kernel       │  │ (faster_fifo Queue)  │     │
+│  │ BlockRun     │  │              │  │                      │     │
+│  └──────────────┘  └──────────────┘  └──────────────────────┘     │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-三种状态同步机制的核心区别：
+四种状态同步机制的核心区别：
 
-| 维度 | HTTP + SWR 轮询 | WebSocket | SSE 事件流 |
-|-----|----------------|-----------|-----------|
-| 通信方向 | 单向（客户端拉取） | 双向 | 单向（服务端推送） |
-| 实时性 | 延迟 = 轮询间隔 | 近实时 | 近实时（~0.1s） |
-| 适用数据 | 历史统计、低频数据 | 交互式执行、控制指令 | 执行结果流、输出流 |
-| 状态管理 | SWR 全局缓存 | 客户端本地状态 | 客户端本地状态 |
-| 重连机制 | 自动（SWR 内置） | 自动（10次/3s） | 自动（指数退避） |
+| 维度 | 前端轮询 | 数据请求缓存 | WebSocket | SSE 事件流 |
+|-----|---------|-------------|-----------|-----------|
+| 通信方向 | 单向（客户端拉取） | 本地读写 | 双向 | 单向（服务端推送） |
+| 实时性 | 延迟 = 轮询间隔 | 瞬时（本地缓存） | 近实时 | 近实时（~0.1s） |
+| 数据范围 | 历史统计、列表数据 | 已请求过的数据 | 交互式执行输出 | 执行结果流 |
+| 状态所有者 | 服务端数据库 | 前端内存 | 服务端内存 | 服务端队列 |
+| 持久化 | 持久化 | 不持久化 | 不持久化 | 不持久化 |
+| 重连/失效 | 自动重新验证 | 组件卸载后保留 | 自动重连（10次/3s） | 自动重连（指数退避） |
+| 适用场景 | 统计图表、历史列表 | 重复查询优化 | 块执行、管道执行、终端 | 代码执行输出流 |
 
 ---
 
-## 二、前端轮询与 SWR 缓存机制
+## 二、前端轮询机制
 
-### 2.1 SWR 核心架构
+### 2.1 轮询架构与实现
 
-**基础封装**：[use.ts](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/api/utils/use.ts)
+前端轮询基于 **SWR (stale-while-revalidate)** 库实现，通过封装统一的 API Hook 提供给各页面使用。
 
-前端 API 层统一封装了 SWR（stale-while-revalidate），所有资源类型通过 `RESOURCES_PAIRS_ARRAY` 配置自动生成 API 方法。
+**核心实现文件**：
+- `mage_ai/frontend/api/utils/use.ts` — SWR Hook 封装
+- `mage_ai/frontend/api/index.ts` — API 资源自动生成器
 
 **关键封装函数**：
+- `useDetail()` — 详情查询，SWR key 为资源 URL
+- `useList()` — 列表查询，SWR key 为列表 URL
+- `useDetailWithParent()` — 带父资源的详情查询
+- `useListWithParent()` — 带父资源的列表查询
 
-- `useDetail()` - 详情查询，SWR key 为资源 URL
-- `useList()` - 列表查询，SWR key 为列表 URL
-- `useDetailWithParent()` - 带父资源的详情查询
-- `useListWithParent()` - 带父资源的列表查询
-
-### 2.2 SWR 缓存键策略
-
-缓存 key 直接由 URL 构成（[use.ts#L106](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/api/utils/use.ts#L106)）：
-
-```typescript
-const url = validateID(id) ? buildUrl(resource, id) : null;
-const key = url && keyInit ? keyInit : url;
-```
-
-**特点**：
-- 默认 key = API 端点 URL（含查询参数）
-- 支持自定义 key（`customOptions.key`）
-- `pauseFetch` 为 true 时返回 null，SWR 跳过请求
-
-### 2.3 轮询间隔配置
+### 2.2 轮询间隔配置
 
 监控相关页面的轮询间隔配置：
 
-| 页面 | 资源 | refreshInterval | revalidateOnFocus | 文件 |
+| 页面 | 资源 | refreshInterval | revalidateOnFocus | 说明 |
 |-----|------|-----------------|-------------------|------|
-| 概览页 | monitor_stats (pipeline_run_count) | 60000ms (1分钟) | false | [overview/index.tsx#L93-L96](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/overview/index.tsx#L93-L96) |
-| 概览页 | pipeline_runs (失败列表) | 60000ms | false | [overview/index.tsx#L197](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/overview/index.tsx#L197) |
-| 管道监控页-管道运行 | monitor_stats | 未设置（SWR 默认） | false | [monitors/index.tsx#L66](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/monitors/index.tsx#L66) |
-| 管道监控页-块运行 | monitor_stats | 未设置（SWR 默认） | false | [block-runs.tsx#L44](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/monitors/block-runs.tsx#L44) |
-| 管道监控页-块运行时间 | monitor_stats | 未设置（SWR 默认） | false | [block-runtime.tsx#L43](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/monitors/block-runtime.tsx#L43) |
-| 管道运行详情页 | pipeline_runs | 非空闲时 3000ms | true | [runs/[run]/index.tsx#L96-L97](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/runs/[run]/index.tsx#L96-L97) |
-| 管道运行列表页 | pipeline_runs | 5000ms | false | [runs/index.tsx#L209](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/runs/index.tsx#L209) |
-| 系统状态 | statuses | 延迟 7000ms 后开始 | - | [useStatus.ts#L7-L24](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/utils/models/status/useStatus.ts#L7-L24) |
+| 概览页 | monitor_stats (pipeline_run_count) | 60000ms (1分钟) | false | 使用 useMutation 手动触发，非 SWR 自动 |
+| 概览页 | pipeline_runs（失败列表） | 60000ms | false | SWR 自动轮询 |
+| 管道监控页-管道运行 | monitor_stats | 未设置（SWR 默认） | false | 仅首次加载 + 焦点重验证 |
+| 管道监控页-块运行 | monitor_stats | 未设置（SWR 默认） | false | 仅首次加载 + 焦点重验证 |
+| 管道监控页-块运行时间 | monitor_stats | 未设置（SWR 默认） | false | 仅首次加载 + 焦点重验证 |
+| 管道运行详情页 | pipeline_runs | 非空闲时 3000ms | true | 运行中高频轮询，空闲时停止 |
+| 管道运行列表页 | pipeline_runs | 5000ms | false | 固定频率轮询 |
+| 系统状态 | statuses | - | - | 延迟 7000ms 后开始，无固定间隔 |
 
-**重要发现**：
-1. **监控页面（monitors）没有设置 `refreshInterval`** - 意味着只有首次加载和焦点重获时才会刷新
-2. **概览页 monitor_stats 使用 `useMutation` 手动触发**，而非 SWR 自动轮询
-3. **`revalidateOnFocus: false` 是普遍配置**，避免窗口切换时频繁刷新
+**关键发现**：
+1. **监控详情页（monitors/）无自动刷新** — 三个监控页面都没有设置 `refreshInterval`，只有首次加载和窗口聚焦时才会刷新数据
+2. **概览页使用 useMutation 手动模式** — 概览页的 monitor_stats 不使用 SWR 自动管理，而是用 `useMutation` 手动调用
+3. **运行详情页动态调速** — 管道运行中 3s 轮询，空闲时停止，节省资源
 
-### 2.4 延迟拉取机制（useDelayFetch）
+### 2.3 延迟拉取机制
 
-**文件**：[useDelayFetch.ts](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/api/utils/useDelayFetch.ts)
+**文件**：`mage_ai/frontend/api/utils/useDelayFetch.ts`
 
-用于非关键路径的数据延迟加载，避免页面初始化时请求过多：
+用于非关键路径的数据延迟加载，避免页面初始化时请求风暴：
 
 ```
 页面加载
    │
    ▼
-延迟等待 (delay ms)
+延迟等待 (delay ms, 默认 3000ms)
    │
    ├─ condition 满足 → 开始 SWR 请求
    └─ condition 不满足 → 继续等待，递归检查
@@ -113,23 +104,66 @@ const key = url && keyInit ? keyInit : url;
 
 **应用场景**：系统状态（useStatus）、内核列表（useKernel）、文件组件等。
 
-### 2.5 缓存策略与边界
+### 2.4 轮询的状态同步边界
 
-**SWR 缓存特性**：
+**轮询机制的边界**：
+
+| 边界项 | 说明 |
+|-------|------|
+| **数据新鲜度** | 最差情况 = 轮询间隔，期间数据可能已变化 |
+| **状态一致性** | 最终一致，轮询间隔内可能存在窗口不一致 |
+| **连接断开** | 请求失败时 SWR 自动重试，但不保证数据连续 |
+| **实时性上限** | 受限于轮询频率，无法实现真正的实时更新 |
+| **服务端压力** | 客户端数 × 轮询频率 = 请求量，高频轮询压力大 |
+| **无效请求** | 数据无变化时，轮询请求是浪费的 |
+
+---
+
+## 三、数据请求缓存机制
+
+### 3.1 SWR 缓存架构
+
+SWR 缓存是前端轮询的配套机制，负责缓存已请求过的数据，减少重复请求。
+
+**缓存键策略**（`mage_ai/frontend/api/utils/use.ts`）：
+
+```typescript
+const url = validateID(id) ? buildUrl(resource, id) : null;
+const key = url && keyInit ? keyInit : url;
+```
+
+- 默认 key = API 端点 URL（含查询参数）
+- 支持自定义 key（`customOptions.key`）
+- `pauseFetch` 为 true 时返回 null，SWR 跳过请求
+
+### 3.2 缓存特性矩阵
 
 | 特性 | 状态 | 说明 |
 |-----|------|------|
-| 全局缓存 | ✅ | 相同 URL 的组件共享同一份缓存 |
-| 去重请求 | ✅ | SWR 内置 dedupingInterval（默认 2000ms） |
+| 全局共享缓存 | ✅ | 相同 URL 的组件共享同一份缓存 |
+| 请求去重 | ✅ | SWR 内置 dedupingInterval（默认 2000ms） |
 | 焦点重验证 | 配置化 | 监控页关闭，运行详情页开启 |
-| 窗口聚焦刷新 | 配置化 | 多数页面关闭 |
-| 数据突变（mutate） | ✅ | 支持手动刷新缓存 |
+| 窗口聚焦刷新 | 配置化 | 多数监控页面关闭 |
+| 手动突变（mutate） | ✅ | 支持手动触发刷新缓存 |
 | 持久化缓存 | ❌ | 仅内存缓存，刷新页面后丢失 |
-| 缓存失效策略 | ❌ | 无 TTL 配置，依赖重新验证 |
+| 缓存 TTL | ❌ | 无过期时间配置，依赖重新验证 |
+| 缓存淘汰策略 | ❌ | 无 LRU/LFU 等淘汰机制 |
+| 乐观更新 | ❌ | 未使用 mutate 的乐观更新能力 |
 
-**监控页面的特殊模式**：
+### 3.3 缓存的状态同步边界
 
-概览页采用 `useMutation` + 手动调用的模式（[overview/index.tsx#L132-L145](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/overview/index.tsx#L132-L145)），而非 SWR 的自动管理：
+| 边界项 | 说明 |
+|-------|------|
+| **缓存生命周期** | 随页面刷新重置，无持久化 |
+| **数据一致性** | 依赖重新验证，验证前可能展示旧数据 |
+| **跨页面共享** | 同域名下共享，不同标签页不共享 |
+| **内存占用** | 无限增长，无淘汰策略，长期使用可能内存膨胀 |
+| **并发请求** | 同一 key 的并发请求会被去重合并 |
+| **错误缓存** | 请求失败时保留旧数据（stale） |
+
+### 3.4 监控页面的特殊模式
+
+概览页的 monitor_stats 采用 `useMutation` + 手动调用的模式（`mage_ai/frontend/pages/overview/index.tsx`），而非 SWR 自动管理：
 
 ```typescript
 const [fetchMonitorStats, { isLoading: isValidatingMonitorStats }] = useMutation(
@@ -141,19 +175,21 @@ const [fetchMonitorStats, { isLoading: isValidatingMonitorStats }] = useMutation
 **原因分析**：
 - 时间范围切换时需要 AbortController 取消请求
 - 需要更精细的加载状态控制
-- 60秒的低频刷新下，手动控制更简单
+- 60 秒的低频刷新下，手动控制更简单
+
+**代价**：失去了 SWR 的全局缓存、自动去重、后台重新验证等能力
 
 ---
 
-## 三、WebSocket 状态同步机制
+## 四、WebSocket 状态同步机制
 
-### 3.1 WebSocket 服务端架构
+### 4.1 WebSocket 服务端架构
 
-**核心文件**：[websocket_server.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py)
+**核心文件**：`mage_ai/server/websocket_server.py`
 
 基于 Tornado 的 `WebSocketHandler` 实现，采用类级别的状态管理。
 
-### 3.2 连接生命周期
+### 4.2 连接生命周期
 
 ```
 客户端连接
@@ -175,9 +211,9 @@ send_message → 广播给所有客户端
 on_close → 从 clients 移除
 ```
 
-### 3.3 核心状态映射
+### 4.3 核心状态映射
 
-**running_executions_mapping**（[websocket_server.py#L168](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py#L168)）：
+**running_executions_mapping**（`mage_ai/server/websocket_server.py`）：
 
 维护正在执行的消息 ID 到元数据的映射：
 
@@ -192,16 +228,16 @@ WebSocketServer.running_executions_mapping = {
 }
 ```
 
-**作用**：Jupyter Kernel 的异步输出通过 `msg_id` 回调，需要此映射来关联对应的块元数据，才能在前端正确定位到哪个块的输出。
+**作用**：Jupyter Kernel 的异步输出通过 `msg_id` 回调，需要此映射来关联对应的块元数据，前端才能正确定位到哪个块的输出。
 
 **写入时机**：
-- 执行单个块前（[websocket_server.py#L297](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py#L297)）
-- 执行管道块前（[websocket_server.py#L533](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py#L533)）
-- 管道整体执行时（[websocket_server.py#L585](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py#L585)）
+- 执行单个块前
+- 执行管道块前
+- 管道整体执行时
 
-### 3.4 消息处理流程
+### 4.4 消息处理流程
 
-**入站消息处理**（[websocket_server.py#L185-L294](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py#L185-L294)）：
+**入站消息处理**：
 
 ```
 收到原始消息
@@ -221,7 +257,7 @@ JSON 解析 → Message 对象
    └─ terminal → 终端消息转发
 ```
 
-**出站消息广播**（[websocket_server.py#L313-L399](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py#L313-L399)）：
+**出站消息广播**：
 
 ```
 消息生成
@@ -244,9 +280,9 @@ filter_out_sensitive_data() → 环境变量脱敏
 遍历所有 clients → 发送消息
 ```
 
-### 3.5 管道执行的状态同步
+### 4.5 管道执行的状态同步
 
-**多进程架构**（[websocket_server.py#L73-L140](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py#L73-L140)）：
+**多进程架构**（`mage_ai/server/websocket_server.py` & `mage_ai/server/execution_manager.py`）：
 
 ```
 主进程 (WebSocket)
@@ -267,49 +303,52 @@ filter_out_sensitive_data() → 环境变量脱敏
 - 通过 `queue.put()` 发送状态消息
 - 包含执行状态、输出、错误等
 
-### 3.6 前端 WebSocket 客户端
+### 4.6 前端 WebSocket 客户端
 
-**实现方式**：`react-use-websocket` 库（[edit.tsx#L2427-L2502](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L2427-L2502)）
+**实现方式**：`react-use-websocket` 库（`mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx`）
 
 **配置**：
-- `reconnectAttempts: 10` - 最多重连 10 次
-- `reconnectInterval: 3000` - 重连间隔 3 秒
-- `shouldReconnect: () => true` - 总是尝试重连
+- `reconnectAttempts: 10` — 最多重连 10 次
+- `reconnectInterval: 3000` — 重连间隔 3 秒
+- `shouldReconnect: () => true` — 总是尝试重连
 
-**前端状态管理**（本地 state）：
-- `messages` - 各块的输出消息字典（`{ [uuid]: Message[] }`）
-- `pipelineMessages` - 管道执行消息数组
-- `runningBlocks` - 当前运行中的块列表
-- `isPipelineExecuting` - 管道是否在执行中
+**前端状态管理**（组件本地 state）：
+- `messages` — 各块的输出消息字典 `{ [uuid]: Message[] }`
+- `pipelineMessages` — 管道执行消息数组
+- `runningBlocks` — 当前运行中的块列表
+- `isPipelineExecuting` — 管道是否在执行中
 
 **状态更新逻辑**：
 - `execution_state === 'busy'` → 块加入 runningBlocks
 - `execution_state === 'idle'` → 块移除 runningBlocks，管道执行结束时刷新管道数据
 
-### 3.7 WebSocket 边界条件
+### 4.7 WebSocket 的状态同步边界
 
-| 边界 | 处理方式 | 位置 |
-|-----|---------|------|
-| 空消息 | 过滤不发送 | [websocket_server.py#L314-L332](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py#L314-L332) |
-| Jupyter Widget | 过滤不渲染 | [websocket_server.py#L380-L387](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py#L380-L387) |
-| 敏感数据 | 环境变量值脱敏 | [websocket_server.py#L334-L355](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py#L334-L355) |
-| 错误堆栈 | 简化，移除内部方法 | [websocket_server.py#L357-L368](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py#L357-L368) |
-| 连接断开 | 自动重连（10次/3s） | 前端 edit.tsx |
-| 认证失败 | 返回 UNAUTHORIZED_ACCESS 错误 | [websockets/utils.py#L42-L57](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websockets/utils.py#L42-L57) |
+| 边界项 | 说明 |
+|-------|------|
+| **状态所有权** | 服务端内存中的运行时状态，不持久化 |
+| **连接状态丢失** | 刷新页面/重连后，所有执行状态丢失 |
+| **消息可靠性** | 无确认机制，网络不稳定时可能丢消息 |
+| **广播范围** | 所有连接的客户端都收到所有消息，无房间隔离 |
+| **消息顺序** | 依赖 TCP 保证顺序，应用层无序号 |
+| **心跳检测** | 无 ping/pong，死连接可能长时间不察觉 |
+| **状态恢复** | 重连后无法恢复历史消息和执行状态 |
+| **连接数限制** | 无最大连接数控制 |
+| **消息限流** | 无限速，高频输出可能阻塞 |
 
 ---
 
-## 四、SSE 事件流机制
+## 五、SSE 事件流机制
 
-### 4.1 SSE 服务端架构
+### 5.1 SSE 服务端架构
 
-**核心文件**：[stream.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/events/stream.py)
+**核心文件**：`mage_ai/server/events/stream.py`
 
 基于 Tornado 的异步 RequestHandler 实现 SSE（Server-Sent Events）。
 
-### 4.2 核心实现机制
+### 5.2 核心实现机制
 
-**EventStreamHandler**（[stream.py#L20-L63](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/events/stream.py#L20-L63)）：
+**EventStreamHandler**：
 
 ```
 客户端 GET /event-streams/{uuid}
@@ -336,12 +375,12 @@ filter_out_sensitive_data() → 环境变量脱敏
 ```
 
 **关键参数**：
-- `SLEEP_SECONDS = 0.1` - 轮询间隔 100ms
+- `SLEEP_SECONDS = 0.1` — 轮询间隔 100ms
 - 使用 `faster_fifo.Queue` 作为高性能队列（可选，回退到 `multiprocessing.Queue`）
 
-### 4.3 队列管理
+### 5.3 队列管理
 
-**核心文件**：[queues/manager.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/kernels/magic/queues/manager.py)
+**核心文件**：`mage_ai/kernels/magic/queues/manager.py`
 
 全局执行结果队列：
 
@@ -354,9 +393,9 @@ execution_result_queue = defaultdict(FasterQueue)  # { uuid: Queue }
 - 使用 `spawn` 启动方式（跨平台兼容）
 - 支持同步和异步两种获取方式
 
-### 4.4 前端 SSE 客户端
+### 5.4 前端 SSE 客户端
 
-**Hook 实现**：[useEventStreams.ts](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/utils/server/events/useEventStreams.ts)
+**Hook 实现**：`mage_ai/frontend/utils/server/events/useEventStreams.ts`
 
 **核心功能**：
 
@@ -368,19 +407,19 @@ execution_result_queue = defaultdict(FasterQueue)  # { uuid: Queue }
 | 发送消息 | 通过 HTTP POST /code_executions 发送 |
 | 状态追踪 | CONNECTING / OPEN / RECONNECTING / CLOSED |
 
-**重连策略**（[useEventStreams.ts#L142-L160](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/utils/server/events/useEventStreams.ts#L142-L160)）：
+**重连策略**（指数退避）：
 
 ```
-第1次重连 → 等待 1 秒
-第2次重连 → 等待 2 秒
-第3次重连 → 等待 3 秒
+第 1 次重连 → 等待 1 秒
+第 2 次重连 → 等待 2 秒
+第 3 次重连 → 等待 3 秒
 ...
-第10次后 → 停止
+第 10 次后 → 停止
 ```
 
-### 4.5 消息类型
+### 5.5 消息类型
 
-**EventStreamTypeEnum**（[EventStreamType.ts#L15-L20](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/interfaces/EventStreamType.ts#L15-L20)）：
+**EventStreamTypeEnum**（`mage_ai/frontend/interfaces/EventStreamType.ts`）：
 
 | 类型 | 说明 |
 |-----|------|
@@ -390,258 +429,258 @@ execution_result_queue = defaultdict(FasterQueue)  # { uuid: Queue }
 | `task_status` | 任务状态 |
 
 **ExecutionStatusEnum**：
-- `RUNNING` - 运行中
-- `SUCCESS` - 成功
-- `FAILURE` - 失败
-- `ERROR` - 错误
+- `RUNNING` — 运行中
+- `SUCCESS` — 成功
+- `FAILURE` — 失败
+- `ERROR` — 错误
 
-### 4.6 SSE 边界条件
+### 5.6 SSE 的状态同步边界
 
-| 边界 | 处理方式 |
-|-----|---------|
-| 队列为空 | 非阻塞 get，跳过本次循环 |
-| 连接断开 | 前端自动重连（指数退避） |
-| UUID 不匹配 | 前端过滤，只处理 uuid 匹配的消息 |
-| 大数据量 | 逐行流式传输，无批量优化 |
+| 边界项 | 说明 |
+|-------|------|
+| **数据缓冲** | 队列中待消费的消息，消费后即丢弃 |
+| **消息 ID** | 无 `Last-Event-ID` 支持，重连后无法续传 |
+| **事件类型** | 所有消息都是默认事件类型，前端无法按类型订阅 |
+| **重试间隔** | 未设置 retry 字段，依赖浏览器默认值 |
+| **队列溢出** | 无队列长度限制，消费不及时可能内存溢出 |
+| **多路复用** | 一个 uuid 一个连接，多流时连接数多 |
+| **结束标记** | 流无明确结束信号，前端不知道何时完成 |
+| **活跃连接管理** | active_connections 已定义但未使用 |
+| **空载优化** | consecutive_sleep_count 已定义但未使用 |
 
 ---
 
-## 五、三者界限与分工
+## 六、四者界限与分工
 
-### 5.1 功能界限矩阵
+### 6.1 功能界限矩阵
 
-| 功能场景 | HTTP + SWR | WebSocket | SSE |
-|---------|-----------|-----------|-----|
-| MonitorStats 统计图表 | ✅ 主力 | ❌ 不使用 | ❌ 不使用 |
-| PipelineRun 历史列表 | ✅ 主力 | ❌ 不使用 | ❌ 不使用 |
-| BlockRun 历史列表 | ✅ 主力 | ❌ 不使用 | ❌ 不使用 |
-| 交互式块执行 | ❌ 不使用 | ✅ 主力 | ❌ 不使用 |
-| 管道执行（UI 触发） | ❌ 不使用 | ✅ 主力 | ❌ 不使用 |
-| 代码执行输出流 | ❌ 不使用 | ❌ 不使用 | ✅ 主力 |
-| 系统状态监控 | ✅ 辅助 | ❌ 不使用 | ❌ 不使用 |
-| 终端仿真 | ❌ 不使用 | ✅ 主力 | ❌ 不使用 |
-| 运行中状态刷新 | ✅ 轮询辅助 | ✅ 实时推送 | ❌ 不使用 |
+| 功能场景 | 前端轮询 | 数据请求缓存 | WebSocket | SSE |
+|---------|---------|-------------|-----------|-----|
+| MonitorStats 统计图表 | ✅ 主力 | ✅ 辅助缓存 | ❌ 不使用 | ❌ 不使用 |
+| PipelineRun 历史列表 | ✅ 主力 | ✅ 辅助缓存 | ❌ 不使用 | ❌ 不使用 |
+| BlockRun 历史列表 | ✅ 主力 | ✅ 辅助缓存 | ❌ 不使用 | ❌ 不使用 |
+| 交互式块执行 | ❌ 不使用 | ❌ 不相关 | ✅ 主力 | ❌ 不使用 |
+| 管道执行（UI 触发） | ❌ 不使用 | ❌ 不相关 | ✅ 主力 | ❌ 不使用 |
+| 代码执行输出流 | ❌ 不使用 | ❌ 不相关 | ❌ 不使用 | ✅ 主力 |
+| 系统状态监控 | ✅ 辅助 | ✅ 辅助缓存 | ❌ 不使用 | ❌ 不使用 |
+| 终端仿真 | ❌ 不使用 | ❌ 不相关 | ✅ 主力 | ❌ 不使用 |
+| 运行中状态刷新 | ✅ 轮询辅助 | ✅ 缓存展示 | ✅ 实时推送 | ❌ 不使用 |
+| 数据去重合并 | ❌ 不适用 | ✅ 主力 | ❌ 不适用 | ❌ 不适用 |
 
-### 5.2 数据类型与实时性要求
+### 6.2 数据类型与实时性要求
 
 | 数据类型 | 实时性要求 | 同步机制 | 延迟 |
 |---------|-----------|---------|------|
-| 历史运行统计 | 低（分钟级） | HTTP 轮询 | 60s / 无轮询 |
-| 运行详情状态 | 中（秒级） | HTTP 轮询 | 3-5s |
+| 历史运行统计 | 低（分钟级） | HTTP 轮询 + 缓存 | 60s / 无轮询 |
+| 运行详情状态 | 中（秒级） | HTTP 轮询 + 缓存 | 3-5s |
 | 块执行输出 | 高（毫秒级） | WebSocket | 近实时 |
 | 管道执行状态 | 高（毫秒级） | WebSocket | 近实时 |
 | 代码执行结果流 | 高（毫秒级） | SSE | ~0.1s |
 | 系统状态 | 低（秒级） | HTTP 延迟轮询 | 7s 延迟 + 轮询 |
+| 重复查询缓存 | 瞬时 | SWR 缓存 | 0ms（本地读取） |
 
-### 5.3 状态所有权划分
+### 6.3 状态所有权划分
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        数据所有权模型                               │
-├──────────────┬──────────────┬──────────────┬───────────────────────┤
-│ 机制         │ 状态所有者   │ 数据持久化   │ 前端缓存策略          │
-├──────────────┼──────────────┼──────────────┼───────────────────────┤
-│ HTTP + SWR   │ 服务端数据库 │ 持久化存储   │ SWR 全局内存缓存      │
-│              │ (单一真相源) │              │ URL 为 key           │
-│              │              │              │ 轮询刷新              │
-├──────────────┼──────────────┼──────────────┼───────────────────────┤
-│ WebSocket    │ 服务端内存   │ 不持久化     │ 组件本地 state        │
-│              │ (运行时状态) │              │ 消息追加模式          │
-│              │              │              │ 连接重建后丢失        │
-├──────────────┼──────────────┼──────────────┼───────────────────────┤
-│ SSE          │ 服务端队列   │ 不持久化     │ 组件本地 state        │
-│              │ (缓冲队列)   │              │ 事件追加模式          │
-│              │              │              │ 消费后即丢弃          │
-└──────────────┴──────────────┴──────────────┴───────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           数据所有权模型                                │
+├───────────────┬──────────────┬──────────────┬───────────────────────────┤
+│ 机制          │ 状态所有者   │ 数据持久化   │ 前端缓存策略              │
+├───────────────┼──────────────┼──────────────┼───────────────────────────┤
+│ 前端轮询      │ 服务端数据库 │ 持久化存储   │ SWR 全局内存缓存          │
+│ (HTTP + SWR)  │ (单一真相源) │              │ URL 为 key               │
+│               │              │              │ 轮询刷新                  │
+├───────────────┼──────────────┼──────────────┼───────────────────────────┤
+│ 数据请求缓存  │ 前端内存     │ 不持久化     │ 直接读写缓存              │
+│ (SWR Cache)   │ (缓存副本)   │              │ 随页面刷新重置            │
+├───────────────┼──────────────┼──────────────┼───────────────────────────┤
+│ WebSocket     │ 服务端内存   │ 不持久化     │ 组件本地 state            │
+│               │ (运行时状态) │              │ 消息追加模式              │
+│               │              │              │ 连接重建后丢失            │
+├───────────────┼──────────────┼──────────────┼───────────────────────────┤
+│ SSE           │ 服务端队列   │ 不持久化     │ 组件本地 state            │
+│               │ (缓冲队列)   │              │ 事件追加模式              │
+│               │              │              │ 消费后即丢弃              │
+└───────────────┴──────────────┴──────────────┴───────────────────────────┘
 ```
 
-### 5.4 互补与协作
+### 6.4 互补与协作
 
-**管道运行详情页的双机制协作**：
+**管道运行详情页的多机制协作**：
 
-在管道运行详情页（`pipelines/[pipeline]/runs/[run]`），存在两种机制的协作：
+在管道运行详情页（`pipelines/[pipeline]/runs/[run]`），存在三种机制的协作：
 
-1. **WebSocket** - 如果用户在编辑页面触发执行，实时状态通过 WebSocket 推送
-2. **HTTP 轮询** - 如果用户直接访问运行详情页，通过 SWR 轮询获取状态
+1. **SWR 缓存** — 提供快速的初始数据展示（如果之前请求过）
+2. **HTTP 轮询** — 定期刷新运行状态和日志
+3. **WebSocket** — 如果用户在编辑页面触发执行，实时状态通过 WebSocket 推送
 
 **关键协作点**：
 - WebSocket 连接断开时，HTTP 轮询作为保底机制
 - 管道执行结束（idle 状态）时，前端触发 `fetchPipeline()` 刷新完整数据
 - 轮询间隔动态调整：运行中 3s，空闲时停止
+- SWR 缓存提供毫秒级的初始渲染，轮询在后台更新
 
 ---
 
-## 六、未涵盖的功能点与边界
+## 七、未覆盖的功能与能力边界
 
-### 6.1 MonitorStats 相关
+### 7.1 前端轮询未覆盖能力
 
-**已实现**：
-- ✅ 4 种统计类型（管道次数、管道时长、块次数、块时长）
-- ✅ 时间范围过滤
-- ✅ 按调度 ID 分组
-- ✅ 按管道类型分组
-- ✅ 多数据库支持（PostgreSQL / SQLite）
+| 功能点 | 当前状态 | 影响 |
+|-------|---------|------|
+| **自适应轮询** | ❌ 固定间隔，不根据数据变化频率调整 | 数据变化慢时浪费请求，变化快时不及时 |
+| **后台同步** | ❌ 标签页不可见时仍在轮询（部分浏览器会节流） | 资源浪费 / 后台数据不更新 |
+| **批量查询** | ❌ 每个资源独立请求，无批量合并 | 请求数多，首屏加载慢 |
+| **增量更新** | ❌ 每次全量拉取 | 数据量大时浪费带宽 |
+| **断点续传** | ❌ 无 ETag / Last-Modified 支持 | 重复传输相同数据 |
+| **离线队列** | ❌ 离线时请求直接失败 | 离线状态下无数据 |
+| **数据订阅** | ❌ 轮询即订阅，无法取消 | 后台页面持续消耗资源 |
 
-**未实现 / 待完善**：
+### 7.2 数据请求缓存未覆盖能力
 
-| 功能点 | 说明 | 影响 |
-|-------|------|------|
-| **实时性差** | 监控页无自动刷新，需手动刷新页面 | 用户看到的可能是过时数据 |
-| **无数据分页** | 一次性返回所有数据 | 大量块/调度时性能差 |
-| **无服务端缓存** | 每次请求都查数据库 | 数据库压力大 |
-| **无告警配置** | 无法设置阈值告警 | 纯展示，无主动通知 |
-| **无数据导出** | 无法导出 CSV/Excel | 数据只能在 UI 查看 |
-| **粒度单一** | 仅支持按日聚合 | 无法看小时级/周级趋势 |
-| **无同比环比** | 没有对比分析 | 无法判断趋势好坏 |
-| **错误仅 print** | 无日志系统集成 | 排障困难 |
-| **无权限控制** | 所有用户看到相同数据 | 多租户下数据隔离问题 |
+| 功能点 | 当前状态 | 影响 |
+|-------|---------|------|
+| **缓存持久化** | ❌ 仅内存缓存 | 刷新页面后全部丢失 |
+| **缓存 TTL** | ❌ 无过期时间配置 | 数据可能长时间不刷新 |
+| **缓存淘汰** | ❌ 无 LRU/LFU 策略 | 长期使用内存膨胀 |
+| **乐观更新** | ❌ 未使用 mutate 的乐观更新能力 | 用户操作后有延迟感 |
+| **缓存失效联动** | ❌ 相关资源修改后不联动失效 | 列表和详情可能不一致 |
+| **部分缓存** | ❌ 整个响应作为缓存单元 | 无法利用部分缓存 |
+| **缓存预热** | ❌ 无预加载机制 | 首次访问慢 |
 
-### 6.2 WebSocket 相关
+### 7.3 WebSocket 未覆盖能力
 
-**已实现**：
-- ✅ 双向通信
-- ✅ 自动重连
-- ✅ 多客户端广播
-- ✅ OAuth 认证
-- ✅ 敏感数据过滤
-- ✅ 管道/块执行控制
+| 功能点 | 当前状态 | 影响 |
+|-------|---------|------|
+| **消息确认机制** | ❌ 发送后不验证客户端是否收到 | 网络不稳定时可能丢消息 |
+| **消息持久化** | ❌ 连接期间的消息不保存 | 重连后丢失历史 |
+| **连接数限制** | ❌ 无最大连接数控制 | 大量连接可能耗尽资源 |
+| **消息限流** | ❌ 无限速 | 高频输出可能阻塞 |
+| **房间/频道机制** | ❌ 所有客户端都收到所有消息 | 隐私和性能问题 |
+| **心跳检测** | ❌ 无 ping/pong 机制 | 死连接可能长时间不察觉 |
+| **消息顺序保证** | ❌ 依赖 TCP 但无应用层序号 | 极端情况可能乱序 |
+| **单用户多连接** | ❌ 无法识别同一用户的多个连接 | 无法定向推送 |
+| **执行状态恢复** | ❌ 刷新页面后执行状态丢失 | 用户体验中断 |
+| **消息压缩** | ❌ 未使用压缩 | 大数据量时带宽浪费 |
+| **二进制支持** | ❌ 仅文本消息 | 无法传输二进制数据 |
+| **重连状态同步** | ❌ 重连后不补历史消息 | 可能错过关键状态 |
 
-**未实现 / 待完善**：
+### 7.4 SSE 未覆盖能力
 
-| 功能点 | 说明 | 影响 |
-|-------|------|------|
-| **消息确认机制** | 发送后不验证客户端是否收到 | 网络不稳定时可能丢消息 |
-| **消息持久化** | 连接期间的消息不保存 | 重连后丢失历史 |
-| **连接数限制** | 无最大连接数控制 | 大量连接可能耗尽资源 |
-| **消息限流** | 无速率控制 | 高频输出可能阻塞 |
-| **房间/频道机制** | 所有客户端都收到所有消息 | 隐私和性能问题 |
-| **心跳检测** | 无 ping/pong 机制 | 死连接可能长时间不察觉 |
-| **消息顺序保证** | 依赖 TCP 但无应用层序号 | 极端情况可能乱序 |
-| **单用户多连接** | 无法识别同一用户的多个连接 | 无法定向推送 |
-| **执行状态恢复** | 刷新页面后执行状态丢失 | 用户体验中断 |
+| 功能点 | 当前状态 | 影响 |
+|-------|---------|------|
+| **消息 ID** | ❌ 无 Last-Event-ID 支持 | 重连后无法续传 |
+| **事件类型** | ❌ 所有消息都是默认事件类型 | 前端无法按类型订阅 |
+| **重试间隔** | ❌ 未设置 retry 字段 | 依赖浏览器默认值 |
+| **队列溢出保护** | ❌ 无队列长度限制 | 消费不及时可能内存溢出 |
+| **多路复用** | ❌ 一个 uuid 一个连接 | 多流时连接数多 |
+| **结束标记** | ❌ 流无明确结束信号 | 前端不知道何时完成 |
+| **活跃连接管理** | ❌ active_connections 定义但未使用 | 无法管理和监控连接 |
+| **空载优化** | ❌ consecutive_sleep_count 定义但未使用 | 空转时 CPU 浪费 |
+| **双向通信** | ❌ SSE 本身仅服务端推送，发送走 HTTP | 发送延迟高，需单独鉴权 |
+| **二进制数据** | ❌ SSE 仅支持文本 | 无法传输二进制流 |
 
-### 6.3 SSE 相关
-
-**已实现**：
-- ✅ 服务端主动推送
-- ✅ 自动重连（指数退避）
-- ✅ 队列缓冲
-- ✅ 非阻塞读取
-
-**未实现 / 待完善**：
-
-| 功能点 | 说明 | 影响 |
-|-------|------|------|
-| **消息 ID** | 无 Last-Event-ID 支持 | 重连后无法续传 |
-| **事件类型** | 所有消息都是默认事件类型 | 前端无法按类型分发 |
-| **重试间隔** | 未设置 retry 字段 | 依赖浏览器默认值 |
-| **队列溢出** | 无队列长度限制 | 消费不及时可能内存溢出 |
-| **无多路复用** | 一个 uuid 一个连接 | 多流时连接数多 |
-| **无结束标记** | 流无明确结束信号 | 前端不知道何时完成 |
-| **活跃连接追踪** | active_connections 定义但未使用 | 无法管理连接 |
-| **consecutive_sleep_count** | 定义但未使用 | 无空载优化 |
-
-### 6.4 系统监控相关
-
-**已实现**：
-- ✅ 内存使用监控
-- ✅ 日志文件持久化
-- ✅ Polars 聚合分析
-- ✅ 同步/异步上下文管理器
-
-**未实现 / 待完善**：
-
-| 功能点 | 说明 | 影响 |
-|-------|------|------|
-| **CPU 监控** | 只监控内存，不监控 CPU | 系统视图不完整 |
-| **磁盘 IO 监控** | 无磁盘读写统计 | 无法定位 IO 瓶颈 |
-| **网络监控** | 无网络流量统计 | 无法分析网络问题 |
-| **实时告警** | 无阈值告警机制 | 异常不能及时发现 |
-| **日志自动清理** | 日志文件无限增长 | 磁盘空间耗尽风险 |
-| **分布式聚合** | 单机监控，不支持集群 | 多节点部署时无法统一视图 |
-| **前端展示** | 系统监控数据无 UI 页面 | 用户看不到实时系统状态 |
-| **进程关联** | 内存日志与管道/块关联但无 UI 整合 | 数据孤立 |
-
-### 6.5 状态同步整体边界
+### 7.5 状态同步整体边界
 
 | 维度 | 当前状态 | 理想状态 |
 |-----|---------|---------|
-| **一致性模型** | 最终一致（轮询间隔内可能不一致） | 可选择强一致/最终一致 |
+| **一致性模型** | 最终一致（轮询间隔内可能不一致） | 可选择强一致 / 最终一致 |
 | **离线支持** | 无任何离线能力 | 离线缓存 + 上线同步 |
 | **状态冲突** | 无冲突检测，最后写入生效 | 冲突检测 + 解决策略 |
 | **部分失败** | 单点失败（如 WebSocket 断了就没实时数据） | 多通道冗余 + 优雅降级 |
 | **可观测性** | 无内部监控 | 自监控（连接数、消息量、延迟） |
-| **扩展性** | 单实例内存状态 | 支持集群/分布式部署 |
+| **扩展性** | 单实例内存状态 | 支持集群 / 分布式部署 |
+| **统一状态层** | 各机制独立管理状态 | 统一状态管理层，多通道同步 |
+
+### 7.6 MonitorStats 业务统计未覆盖能力
+
+| 功能点 | 当前状态 | 影响 |
+|-------|---------|------|
+| **实时性** | ❌ 监控页无自动刷新 | 用户看到的可能是过时数据 |
+| **数据分页** | ❌ 一次性返回所有数据 | 大量块 / 调度时性能差 |
+| **服务端缓存** | ❌ 每次请求都查数据库 | 数据库压力大 |
+| **告警配置** | ❌ 无法设置阈值告警 | 纯展示，无主动通知 |
+| **数据导出** | ❌ 无法导出 CSV / Excel | 数据只能在 UI 查看 |
+| **聚合粒度** | ❌ 仅支持按日聚合 | 无法看小时级 / 周级趋势 |
+| **对比分析** | ❌ 无同比环比 | 无法判断趋势好坏 |
+| **错误处理** | ❌ 错误仅 print | 排障困难 |
+| **权限控制** | ❌ 所有用户看到相同数据 | 多租户下数据隔离问题 |
 
 ---
 
-## 七、关键代码索引
+## 八、关键代码索引
 
-### 7.1 前端轮询 & SWR
+### 8.1 前端轮询 & 数据请求缓存
 
-| 文件 | 说明 |
-|------|------|
-| [api/utils/use.ts](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/api/utils/use.ts) | SWR 封装核心 |
-| [api/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/api/index.ts) | API 资源自动生成 |
-| [api/utils/useDelayFetch.ts](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/api/utils/useDelayFetch.ts) | 延迟拉取 Hook |
-| [overview/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/overview/index.tsx) | 概览页（60s 轮询） |
-| [monitors/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/monitors/index.tsx) | 管道运行监控页 |
-| [monitors/block-runs.tsx](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/monitors/block-runs.tsx) | 块运行监控页 |
-| [monitors/block-runtime.tsx](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/monitors/block-runtime.tsx) | 块运行时间监控页 |
+| 文件路径（相对仓库根） | 说明 |
+|----------------------|------|
+| `mage_ai/frontend/api/utils/use.ts` | SWR 封装核心，useDetail/useList 等 Hook |
+| `mage_ai/frontend/api/index.ts` | API 资源自动生成器，RESOURCES_PAIRS_ARRAY 配置 |
+| `mage_ai/frontend/api/utils/useDelayFetch.ts` | 延迟拉取 Hook，非关键路径数据延迟加载 |
+| `mage_ai/frontend/pages/overview/index.tsx` | 概览页，60s 手动轮询 monitor_stats |
+| `mage_ai/frontend/pages/pipelines/[pipeline]/monitors/index.tsx` | 管道运行监控页，monitor_stats 展示 |
+| `mage_ai/frontend/pages/pipelines/[pipeline]/monitors/block-runs.tsx` | 块运行监控页 |
+| `mage_ai/frontend/pages/pipelines/[pipeline]/monitors/block-runtime.tsx` | 块运行时间监控页 |
+| `mage_ai/frontend/utils/models/status/useStatus.ts` | 系统状态 Hook，延迟拉取 |
 
-### 7.2 WebSocket
+### 8.2 WebSocket
 
-| 文件 | 说明 |
-|------|------|
-| [server/websocket_server.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websocket_server.py) | WebSocket 服务端核心 |
-| [server/websockets/models.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websockets/models.py) | 消息/客户端模型 |
-| [server/websockets/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websockets/utils.py) | 消息处理工具 |
-| [server/websockets/constants.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/websockets/constants.py) | 常量定义 |
-| [server/execution_manager.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/execution_manager.py) | 管道执行管理 |
-| [api/utils/url.ts](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/api/utils/url.ts) | WebSocket URL 构建 |
-| [pages/pipelines/[pipeline]/edit.tsx](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx) | 前端 WebSocket 使用 |
+| 文件路径（相对仓库根） | 说明 |
+|----------------------|------|
+| `mage_ai/server/websocket_server.py` | WebSocket 服务端核心，连接管理和消息分发 |
+| `mage_ai/server/websockets/models.py` | 消息模型、客户端模型、错误模型 |
+| `mage_ai/server/websockets/utils.py` | 消息处理工具，认证、过滤、脱敏 |
+| `mage_ai/server/websockets/constants.py` | 常量定义（Channel、ExecutionState、MessageType） |
+| `mage_ai/server/execution_manager.py` | 管道执行管理，多进程执行和状态同步 |
+| `mage_ai/frontend/api/utils/url.ts` | WebSocket / SSE URL 构建函数 |
+| `mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx` | 管道编辑页，WebSocket 主使用场景 |
 
-### 7.3 SSE 事件流
+### 8.3 SSE 事件流
 
-| 文件 | 说明 |
-|------|------|
-| [server/events/stream.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/server/events/stream.py) | SSE 服务端 |
-| [kernels/magic/queues/manager.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/kernels/magic/queues/manager.py) | 执行结果队列管理 |
-| [shared/queues.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/shared/queues.py) | 队列抽象层 |
-| [utils/server/events/useEventStreams.ts](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/utils/server/events/useEventStreams.ts) | 前端 SSE Hook |
-| [interfaces/EventStreamType.ts](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/frontend/interfaces/EventStreamType.ts) | SSE 类型定义 |
+| 文件路径（相对仓库根） | 说明 |
+|----------------------|------|
+| `mage_ai/server/events/stream.py` | SSE 服务端，EventStreamHandler 实现 |
+| `mage_ai/kernels/magic/queues/manager.py` | 执行结果队列管理，全局队列单例 |
+| `mage_ai/shared/queues.py` | 队列抽象层，faster_fifo / multiprocessing 适配 |
+| `mage_ai/frontend/utils/server/events/useEventStreams.ts` | 前端 SSE Hook，连接管理和重连逻辑 |
+| `mage_ai/frontend/interfaces/EventStreamType.ts` | SSE 类型定义，事件类型和状态枚举 |
 
-### 7.4 业务统计后端
+### 8.4 业务统计后端
 
-| 文件 | 说明 |
-|------|------|
-| [orchestration/monitor/monitor_stats.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/orchestration/monitor/monitor_stats.py) | MonitorStats 核心 |
-| [api/resources/MonitorStatResource.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/api/resources/MonitorStatResource.py) | API 资源层 |
-| [system/memory/manager.py](file:///d:/fz/0601/solo-dogfeeding/code/327-mage-ai/mage_ai/system/memory/manager.py) | 内存监控管理器 |
+| 文件路径（相对仓库根） | 说明 |
+|----------------------|------|
+| `mage_ai/orchestration/monitor/monitor_stats.py` | MonitorStats 核心类，4 种统计类型实现 |
+| `mage_ai/api/resources/MonitorStatResource.py` | API 资源层，REST 接口封装 |
+| `mage_ai/system/memory/manager.py` | 内存监控管理器，上下文管理器模式 |
+| `mage_ai/api/resources/StatusResource.py` | 系统状态 API 资源 |
 
 ---
 
-## 八、总结
+## 九、总结
 
-### 8.1 设计亮点
+### 9.1 设计亮点
 
-1. **分层清晰**：三种机制各司其职，历史统计用 HTTP 轮询、交互式执行用 WebSocket、结果流用 SSE
-2. **SWR 全局缓存**：避免重复请求，提升用户体验
-3. **自动重连**：WebSocket 和 SSE 都有重连机制，增强可靠性
-4. **安全考虑**：敏感数据过滤、OAuth 认证、权限校验
-5. **跨平台兼容**：队列层抽象（faster_fifo / multiprocessing）、数据库层抽象
+1. **分层清晰** — 四种机制各司其职：历史统计用 HTTP 轮询、缓存加速用 SWR、交互式执行用 WebSocket、结果流用 SSE
+2. **SWR 全局缓存** — 避免重复请求，提升用户体验，相同 URL 的组件共享数据
+3. **自动重连** — WebSocket 和 SSE 都有重连机制，增强可靠性
+4. **安全考虑** — 敏感数据过滤、OAuth 认证、权限校验层层把关
+5. **跨平台兼容** — 队列层抽象（faster_fifo / multiprocessing）、数据库层抽象（PostgreSQL / SQLite）
+6. **动态调速** — 运行详情页根据状态动态调整轮询频率，节省资源
 
-### 8.2 主要不足
+### 9.2 主要不足
 
-1. **监控页实时性弱**：监控统计页面无自动刷新，与"监控"的定位不符
-2. **状态不同步**：HTTP 轮询和 WebSocket 推送之间可能存在状态不一致
-3. **无持久化消息**：WebSocket 和 SSE 的消息都是瞬时的，刷新即丢失
-4. **可扩展性差**：所有状态都在单进程内存中，无法水平扩展
-5. **缺少可观测性**：监控系统本身没有自监控能力
+1. **监控页实时性弱** — 监控统计页面无自动刷新，与"监控"的定位存在落差
+2. **状态孤岛** — HTTP 轮询、WebSocket、SSE 各管各的状态，没有统一的状态管理层
+3. **无持久化消息** — WebSocket 和 SSE 的消息都是瞬时的，刷新即丢失
+4. **可扩展性差** — 所有状态都在单进程内存中，无法水平扩展
+5. **缺少自监控** — 监控系统本身没有自监控能力（连接数、消息量、延迟等指标）
+6. **缓存策略简陋** — SWR 缓存无 TTL、无淘汰、无持久化，长期使用可能内存膨胀
 
-### 8.3 潜在风险
+### 9.3 潜在风险
 
-1. **WebSocket 广播风暴**：所有客户端收到所有消息，客户端数 × 消息数 = O(n²)
-2. **SSE 队列内存溢出**：无队列长度限制，消费不及时可能导致内存泄漏
-3. **数据库压力**：MonitorStats 每次都查全量数据，高并发下可能成为瓶颈
-4. **状态丢失**：WebSocket 断开期间的执行状态无法恢复，用户体验中断
+1. **WebSocket 广播风暴** — 所有客户端收到所有消息，客户端数 × 消息数 = O(n²) 复杂度
+2. **SSE 队列内存溢出** — 无队列长度限制，消费不及时可能导致内存泄漏
+3. **数据库压力** — MonitorStats 每次都查全量数据，高并发下可能成为瓶颈
+4. **状态丢失** — WebSocket 断开期间的执行状态无法恢复，用户体验中断
+5. **缓存不一致** — SWR 缓存和 WebSocket 实时数据之间可能出现短暂不一致
+6. **轮询浪费** — 固定频率轮询在数据无变化时造成不必要的服务器压力
