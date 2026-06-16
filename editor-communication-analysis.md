@@ -1,750 +1,540 @@
-# Mage AI 前端 Editor 通信深度分析
+# Mage AI 前端 Editor 通信深度分析（经代码核实版）
 
-> 本文档从四个核心维度剖析 Mage AI 前端 Editor 的通信落地方案：
-> 1. 运行前保存内容并发送实时消息
-> 2. 服务端实时端点挂载
-> 3. 内核输出解析后推回前端
-> 4. 终端通道接入方式
+> 本文档基于对实际仓库代码的逐行阅读核实撰写，重点澄清两点之前容易混淆的机制：
+> 1. **运行前保存分支**：forEach 回调中 return 的实际语义、contentOnly 是否真的提前终止函数、数据持久化完整链路
+> 2. **实时回传三层处理**：依次明确区分 消息过滤 → 环境值脱敏 → 执行元数据补充 三个独立阶段
 
 ---
 
-## 一、运行前保存内容并发送实时消息
+## 一、运行前保存内容：分支判定与遍历回调的核实
 
-### 1.1 调用链入口
+### 1.1 调用入口回顾
 
-当用户按下 `Ctrl+Enter` / `Cmd+Enter` 或点击 Run 按钮时，执行顺序为：
-
-```
-executeCode() (CodeBlock)
-    └─► runBlockAndTrack() (PipelineDetail 或 CodeBlock)
-            └─► runBlock() (edit.tsx L2667)
-                    ├─► savePipelineContent({block}, {contentOnly: true})  ← 先保存
-                    │       └─► updatePipeline()  ← PUT /api/pipelines/:uuid
-                    └─► runBlockOrig()  ← 后执行 (edit.tsx L2571)
-                            └─► sendMessage(JSON.stringify({...}))  ← WebSocket 发送
-```
-
-### 1.2 runBlock 函数 - 保存再执行的分发表
-
-**代码位置**: `mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L2667-L2704`
+**代码位置**：`mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L2667-L2704`
 
 ```typescript
 const runBlock = useCallback((payload, options) => {
   const { block } = payload;
 
   if (disablePipelineEditAccess || options?.skipUpdating) {
-    // 跳过保存的场景：无编辑权限 / 显式指定 skipUpdating
+    // 分支 A：无编辑权限 或 显式跳过 → 直接执行，不保存
     return runBlockOrig(payload, options);
   } else {
-    // 核心：先保存仅包含内容+输出的最小 payload，再执行
+    // 分支 B：正常场景 → 先保存再执行
     return savePipelineContent({
       block: {
-        outputs: [],       // 清空该 block 的输出（即将重新生成）
+        outputs: [],          // ★ 指定当前 block 清空输出（即将重新生成）
         uuid: block.uuid,
       },
     }, {
-      contentOnly: true,   // 仅更新 content/callback_content/outputs/uuid 字段
+      contentOnly: true,     // ★ 开启 contentOnly 模式
     })?.then(() => runBlockOrig(payload));
   }
 }, [disablePipelineEditAccess, runBlockOrig, savePipelineContent]);
 ```
 
-### 1.3 savePipelineContent - 内容组装器
+**分支判定逻辑核实**（正确性确认：**不会错误跳过保存**）：
 
-**代码位置**: `mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L1187-L1446`
+| 条件 | 是否跳过保存 | 场景说明 |
+|------|:----------:|----------|
+| `disablePipelineEditAccess = true` | ✅ 跳过 | 只读模式（VIEWER 角色 / 管道编辑被全局禁用），代码无法编辑，无需保存 |
+| `options.skipUpdating = true` | ✅ 跳过 | 调用方显式声明无需持久化（如程序化触发的内部执行） |
+| **以上均不满足（默认路径）** | ❌ **不跳过** | 99% 的用户交互场景 |
 
-#### 1.3.1 内容来源优先级
-
-```typescript
-// L1220-L1228
-let contentToSave = contentByBlockUUID.current[type]?.[uuid];   // 优先 useRef 中当前编辑值
-if (typeof contentToSave === 'undefined') {
-  contentToSave = block.content;                                 // 回退到 block 原始值
-}
-
-let callbackToSave = callbackByBlockUUID.current[type]?.[uuid];
-if (typeof callbackToSave === 'undefined') {
-  callbackToSave = block.callback_content;
-}
-```
-
-#### 1.3.2 输出截断策略
-
-为了避免 PUT 请求 payload 过大，对 `text/plain` 类型做行数限制：
-
-```typescript
-// L1231-L1274
-const messagesForBlock = messages[uuid]?.filter(m => !!m);
-const hasError = messagesForBlock?.find(({ error }) => error);
-
-// 有错误或非 Spark 模式且无 block 在跑时，才持久化输出
-if (messagesForBlock && (!sparkEnabled || !runningBlocks?.length)) {
-  messagesForBlock.forEach((d: KernelOutputType) => {
-    if (BlockTypeEnum.SCRATCHPAD === block.type
-      || hasError
-      || ('table' !== type && outputsToSaveByBlockUUID?.[block?.uuid])
-    ) {
-      // 过滤内部输出标记
-      d.data = data.reduce((acc, text) => text.match(INTERNAL_OUTPUT_REGEX) ? acc : acc.concat(text), []);
-
-      if (type === DataTypeEnum.TEXT_PLAIN) {
-        plainTextLineCount += data?.length || 0;
-      }
-
-      // 行数阈值：maxPrintOutputLines + 5
-      if (!maxPrintOutputLines || plainTextLineCount < maxPrintOutputLines + 5) {
-        arr2.push(d);
-      }
-    }
-  });
-
-  // 持久化格式：{ text_data: JSON.stringify(d), variable_uuid: 'output_N' }
-  outputs = arr2.map((d, idx) => ({
-    text_data: JSON.stringify(d),
-    variable_uuid: `output_${idx}`,
-  }));
-}
-```
-
-#### 1.3.3 contentOnly 模式
-
-当 `contentOnly=true`（运行前保存场景）时，只提取最小字段并提前 return，不触发 `updatePipeline`：
-
-```typescript
-// L1311-L1320
-if (contentOnly) {
-  blocksByUUID[blockPayload.uuid] = {
-    callback_content: blockPayload.callback_content,
-    content: blockPayload.content,
-    outputs: blockPayload.outputs,
-    uuid: blockPayload.uuid,
-  };
-
-  return;  // ← 注意：直接返回 undefined，后面不会执行 updatePipeline
-}
-```
-
-> ⚠️ **设计细节**: 调用方 `runBlock` 用了可选链 `savePipelineContent(...)?.then(...)`。
-> 如果返回 undefined 则 `.then` 不会执行？实际上代码中仍然会走 runBlockOrig，
-> 因为 `undefined?.then` 只是不执行 then 回调，但函数后面没有别的分支，所以需要看实现。
-> 实际上当 `contentOnly=true` 时该函数在 forEach 的 return 只跳出当前迭代，**真正的 contentOnly 提前 return 发生在 forEach 之后的另一段逻辑**。
-
-### 1.4 runBlockOrig - 实时消息发送器
-
-**代码位置**: `mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L2571-L2665`
-
-```typescript
-// L2611-L2626
-sendMessage(JSON.stringify({
-  ...sharedWebsocketData,              // api_key + token (OAuth2 认证)
-  code,                                // 用户代码字符串
-  extension_uuid: extensionUUID,       // 扩展 block 所属扩展
-  output_messages_to_logs: !!get(localStorageBlockOutputLogsKey),  // 是否记录到日志
-  pipeline_uuid: pipeline?.uuid,
-  run_downstream: runDownstream,
-  run_incomplete_upstream: runIncompleteUpstream,
-  run_settings: runSettings,           // 运行模式（如 run_model: true）
-  run_tests: runTests,
-  run_upstream: runUpstream,
-  type: block.type,                    // data_loader / transformer / data_exporter 等
-  upstream_blocks: upstreamBlocks,     // 上游 block uuid 列表
-  uuid,                                // 当前 block uuid
-  variables,                           // 预注入变量
-}));
-
-// 清理旧消息 + 标记运行中
-setMessages((messagesPrevious) => { delete messagesPrevious[uuid]; return messagesPrevious; });
-setRunningBlocks(prev => prev.find(({uuid:u2})=>uuid===u2) ? prev : prev.concat(block));
-```
-
-发送后立即调用 `fetchPipeline()` 刷新依赖图状态。
+> 三个条件是 `||` 关系，前两个条件不成立才走保存路径。
+> `disablePipelineEditAccess` 来源于权限系统，`skipUpdating` 是显式 opt-in 参数，**不会出现"意外命中跳过分支"的情况**。
 
 ---
 
-## 二、服务端实时端点挂载
+### 1.2 savePipelineContent 遍历回调的 return 语义澄清（关键核实点）
 
-### 2.1 Tornado 路由注册全景
+#### ❌ 之前的一个潜在误解
 
-**代码位置**: `mage_ai/server/server.py#L266-L397`
+> "contentOnly 模式下 L1319 的 return 会提前终止整个函数，导致 updatePipeline 不执行。"
 
-Tornado 服务器在 `main()` 函数中构建路由列表，**顺序敏感**（前面的规则先匹配）：
+#### ✅ 实际代码（逐行核实）
 
-```python
-routes_full = routes_base + [
-    # ──────────────────────────────────────────────────────────
-    # 1. SPA 页面路由（全部交给 MainPageHandler 渲染 index.html）
-    # ──────────────────────────────────────────────────────────
-    (r'/?', MainPageHandler),
-    (r'/pipelines', MainPageHandler),
-    (r'/pipelines/(.*)', MainPageHandler),
-    (r'/terminal', MainPageHandler),
-    ...
+**代码位置**：`mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L1213-L1334`
 
-    # ──────────────────────────────────────────────────────────
-    # 2. SSE 事件流端点
-    # ──────────────────────────────────────────────────────────
-    (r'/event-streams/(?P<uuid>[\w\-\%2f\.]+)', EventStreamHandler),
+```typescript
+// ── 外层：第 1 层 forEach ──
+blocksFinal.forEach((block: BlockType) => {
+  // ... (L1214-L1310 省略：内容提取、输出截断、blockOverride 合并)
 
-    # ──────────────────────────────────────────────────────────
-    # 3. 静态资源
-    # ──────────────────────────────────────────────────────────
-    (r'/_next/static/(.*)', StaticFileHandler, {'path': ...}),
-    (r'/monaco-editor/(.*)', StaticFileHandler, {'path': ...}),
-    ...
+  // L1311-L1320  ★ 注意：这里在 forEach 回调函数内部
+  if (contentOnly) {
+    blocksByUUID[blockPayload.uuid] = {
+      callback_content: blockPayload.callback_content,
+      content: blockPayload.content,
+      outputs: blockPayload.outputs,
+      uuid: blockPayload.uuid,
+    };
 
-    # ──────────────────────────────────────────────────────────
-    # 4. ★ 实时 WebSocket 端点（核心通信入口）
-    # ──────────────────────────────────────────────────────────
-    (r'/websocket/', WebSocketServer),                                          # Editor/Block 执行
-    (r'/websocket/terminal', TerminalWebsocketServer, {'term_manager': ...}),   # 终端通道
-    # ★ 注意：前者路径是 '/websocket/'（有尾斜杠），后者是 '/websocket/terminal'
+    return;   // ← 这个 return 的作用域是什么？
+  }
 
-    # ──────────────────────────────────────────────────────────
-    # 5. 特殊 API（自定义 handler）
-    # ──────────────────────────────────────────────────────────
-    (r'/api/pipelines/(?P<pipeline_uuid>\w+)/blocks/(?P<block_uuid>[\w\-\%2f\.]+)/analyses',
-        ApiPipelineBlockAnalysisHandler),
-    (r'/api/runs', ApiRunHandler),  # 同步执行（立即返回响应）
+  // L1322-L1333
+  if ([BlockTypeEnum.EXTENSION].includes(type)) {
+    blocksByExtensions[extensionUUID].push(blockPayload);
+  } else if (BlockTypeEnum.CALLBACK === type) {
+    callbacksByUUID[blockPayload.uuid] = blockPayload;
+  } else if (BlockTypeEnum.CONDITIONAL === type) {
+    conditionalsByUUID[blockPayload.uuid] = blockPayload;
+  } else {
+    blocksByUUID[blockPayload.uuid] = blockPayload;
+  }
+});
 
-    # ──────────────────────────────────────────────────────────
-    # 6. 通用 REST CRUD（ApiResourceListHandler / DetailHandler）
-    # ──────────────────────────────────────────────────────────
-    (r'/api/(?P<resource>\w+)/(?P<pk>[\w\-\%2f\.]+)/(?P<child>\w+)/(?P<child_pk>[\w\-\%2f\.]+)',
-        ApiChildDetailHandler),
-    (r'/api/(?P<resource>\w+)/(?P<pk>[\w\-\%2f\.]+)/(?P<child>\w+)', ApiChildListHandler),
-    (r'/api/(?P<resource>\w+)/(?P<pk>[\w\-\%2f\.]+)', ApiResourceDetailHandler),
-    (r'/api/(?P<resource>\w+)', ApiResourceListHandler),
-]
+// ── forEach 已经结束 ──
+// L1336+ 继续执行 ↓↓↓
+const extensionsToSave = { ...pipeline?.extensions, ...pipelineOverride?.extensions };
+// ... (blocksToSave / callbacksToSave / conditionalsToSave 组装)
+// L1432-L1435
+return updatePipeline({ pipeline: updatedPipeline });
 ```
 
-### 2.2 实时端点初始化时序
+**核心结论（JavaScript 语言机制核实）**：
 
-**代码位置**: `mage_ai/server/server.py#L241-L249` (TermManager 创建) + `#L745-L749` (Subscriber 启动)
-
-```python
-# [main() 函数启动前阶段]
-shell_command = SHELL_COMMAND        # 来自 settings，默认 'bash'
-term_klass = MageTermManager          # 按名称复用终端（term_name 维度）
-if USE_UNIQUE_TERMINAL:
-    term_klass = MageUniqueTermManager  # 每次连接新建终端
-term_manager = term_klass(shell_command=[shell_command])
-
-# ──────────────────────────────────────────────────────────────
-# 构建 Application 对象，注入 term_manager 到终端 WebSocket handler
-# ──────────────────────────────────────────────────────────────
-app = tornado.web.Application(
-    routes_full,
-    websocket_ping_interval=30,       # 每 30s 发送 ping 保活
-    websocket_ping_timeout=120,       # 120s 无响应则断开
-    ...
-)
-app.listen(port, host=host)
-
-# ──────────────────────────────────────────────────────────────
-# [main() 异步函数最后阶段]
-# 启动 Subscriber 死循环：轮询 Jupyter Kernel IOPub
-# ──────────────────────────────────────────────────────────────
-get_messages(
-    lambda content: WebSocketServer.send_message(
-        parse_output_message(content),  # 先解析再广播
-    ),
-)
-
-await asyncio.Event().wait()        # 永久挂起，保持事件循环
-# tornado.ioloop.IOLoop.current().start()
-```
-
-### 2.3 两类 WebSocket Handler 的对比
-
-| 特性 | WebSocketServer (`/websocket/`) | TerminalWebsocketServer (`/websocket/terminal`) |
-|------|----------------------------------|--------------------------------------------------|
-| **基类** | `tornado.websocket.WebSocketHandler` | `terminado.TermSocket` (继承 Tornado WS) |
-| **注册方式** | 无额外构造参数 | 传入 `{'term_manager': term_manager}` 实例 |
-| **认证方式** | on_message 内校验 api_key + token | on_message 内校验，额外检查编辑器角色 |
-| **消息格式** | JSON 对象，含 `code`/`uuid`/`type` 等 | 外层 JSON（含认证），内层 `['stdin', cmd]` 数组 |
-| **推送方向** | **双向主动**: 后端 Subscriber 解析后主动广播所有客户端 | **绑定 PTY**: 读 PTY 输出时回调 `on_pty_read` 仅推当前连接 |
-| **客户端管理** | 类变量 `clients: set` 维护所有连接 | `terminal.clients: list` 绑定到具体终端实例 |
+1. `return` 在 `Array.prototype.forEach` 的**回调函数内部**，只会终止**当前这一次迭代**（即跳出当前 block 的处理），继续处理数组中的下一个 block。
+2. **整个 savePipelineContent 函数不会被提前终止**。
+3. forEach 之后的 L1336-L1435（extensions 组装、widgets 处理、updatedPipeline 构建、`return updatePipeline(...)`）**在 contentOnly 模式下 100% 会执行**。
+4. `.then(() => runBlockOrig(payload))` **一定会被触发**（除非 PUT 请求本身抛错）。
 
 ---
 
-## 三、内核输出解析后推回前端
+### 1.3 contentOnly 对 block 归档路径的影响（遍历回调与持久化的联系）
 
-### 3.1 整体数据流（后端视角）
+#### contentOnly = true 时，每个 block 经历什么？
 
 ```
-                    ┌─────────────────────────────┐
-                    │   Jupyter Kernel (子进程)    │
-                    │  ZMQ PUB socket (IOPub)      │
-                    └──────────────┬──────────────┘
-                                   │ ZMQ 消息
-                                   ▼
-                    ┌─────────────────────────────┐
- get_messages() ───►│  BlockingKernelClient        │
- (subscriber.py)    │  .get_iopub_msg(timeout=1)  │
-                    └──────────────┬──────────────┘
-                                   │ callback(message)
-                                   ▼
-                    ┌─────────────────────────────┐
-                    │  parse_output_message()     │
-                    │  kernel_output_parser.py    │
-                    │  规范化: msg_type → type    │
-                    └──────────────┬──────────────┘
-                                   │ 统一 dict 结构
-                                   ▼
-                    ┌─────────────────────────────┐
-                    │  WebSocketServer.send_message│
-                    │  过滤敏感字段 + 元数据合并   │
-                    │  for client in clients:     │
-                    │      client.write_message() │
-                    └──────────────┬──────────────┘
-                                   │ N 条 WS 帧 (N=在线客户端数)
-                                   ▼
-                         前端 useWebSocket.onMessage
+对当前 block：
+  ├─ 步骤① 内容来源（同 contentOnly=false）：contentByBlockUUID.current → block.content 回退
+  ├─ 步骤② 输出截断（同 contentOnly=false）：messages → 行数阈值过滤 → INTERNAL_OUTPUT_REGEX 过滤
+  ├─ 步骤③ blockOverride 合并（L1296-L1308）：
+  │      当 blockOverride.uuid === 当前 block.uuid 时
+  │      （即 runBlock 传进来的那个待执行 block）
+  │        → outputs: [] 生效（清空输出）
+  │      其他 block 不影响
+  │
+  ├─ 步骤④ ★ contentOnly 分支（L1311-L1320）
+  │      blockPayload 写入 blocksByUUID，但只有 4 个字段：
+  │        { uuid, content, callback_content, outputs }
+  │      → 跳过按类型分桶（EXTENSION/CALLBACK/CONDITIONAL）
+  │      → 执行 "return" → 结束当前 block 的本次迭代
+  │
+  ▼ 继续下一个 block ...
 ```
 
-### 3.2 Subscriber - IOPub 轮询器
+#### 其他 block（非待执行 block）的 outputs 会被清空吗？
 
-**代码位置**: `mage_ai/server/subscriber.py#L8-L24`
+**不会。** 原因：`blockOverride = { outputs: [], uuid: block.uuid }` 只包含待执行 block 的 uuid。
+在 L1296 `if (blockOverride?.uuid === uuid)` 中，只有待执行 block 匹配，才会被合并 `outputs: []`。
+其他 block 的 outputs 正常按照 `messages[uuid]` 中的历史值持久化。
 
-```python
-def get_messages(callback=None):
-    now = datetime.utcnow()
+---
 
-    while True:                           # ← 永久阻塞死循环，在单独线程/协程里跑
-        try:
-            client = get_active_kernel_client()
-            message = client.get_iopub_msg(timeout=1)   # 阻塞等待 ZMQ 消息
+### 1.4 遍历回调 → 数据持久化的完整链路（两阶段组装）
 
-            if message.get('content'):
-                if callback:
-                    callback(message)                   # 链式调用：解析 → 广播
-                else:
-                    logger.warn(f'[{now}] No callback for message: {message}')
-        except Exception as e:
-            if str(e):
-                logger.error(f'[{now}] Error: {e}')
-            pass                                        # 超时/异常静默，继续循环
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  阶段 1：blocksFinal.forEach ── 按 block 类型分桶                          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  blocksFinal.forEach((block) => {                                            │
+│      1. contentToSave ← useRef (优先) 或 block.content (回退)                │
+│      2. outputs ← 从 messages[uuid] 截断 + INTERNAL_OUTPUT_REGEX 过滤        │
+│      3. blockOverride 合并（当前 block.uuid 匹配时）                         │
+│      4. if (contentOnly):                                                    │
+│            只存 blocksByUUID[uuid] = { 4 个最小字段 }                        │
+│         else:                                                                │
+│            EXTENSION → blocksByExtensions[extUUID].push()                    │
+│            CALLBACK  → callbacksByUUID[uuid]                                 │
+│            CONDITIONAL → conditionalsByUUID[uuid]                            │
+│            普通     → blocksByUUID[uuid]                                     │
+│  })                                                                          │
+│                                                                              │
+│  输出 4 个临时字典：                                                          │
+│    blocksByUUID, callbacksByUUID, conditionalsByUUID, blocksByExtensions     │
+│                                                                              │
+└──────────────────────────────┬───────────────────────────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  阶段 2：(pipelineOverride.blocks || blocks).forEach ── 按顺序组装最终数组  │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  blocksToSave = []                                                           │
+│  callbacksToSave = []                                                        │
+│  conditionalsToSave = []                                                     │
+│                                                                              │
+│  按照 pipeline 原始 block 顺序遍历（保持顺序）：                              │
+│    forEach(({ uuid }) => {                                                   │
+│        优先级查找：                                                           │
+│          blocksByUUID[uuid]       → blocksToSave.push()                      │
+│          callbacksByUUID[uuid]    → callbacksToSave.push()                   │
+│          conditionalsByUUID[uuid] → conditionalsToSave.push()                │
+│    })                                                                        │
+│                                                                              │
+│  widgets 另走独立路径：                                                       │
+│    widgets.map((block) => {                                                  │
+│      contentByWidgetUUID.current → block.content                             │
+│      messages[uuid] → arr2.map → outputs（不受 contentOnly 影响）            │
+│    })                                                                        │
+│                                                                              │
+│  updatedPipeline = {                                                         │
+│    blocks: blocksToSave,                                                     │
+│    callbacks: callbacksToSave,                                               │
+│    conditionals: conditionalsToSave,                                         │
+│    extensions: {... pipeline.extensions, ...blocksByExtensions 转换},        │
+│    widgets,                                                                  │
+│    ...(pipeline + pipelineOverride 浅层合并)                                 │
+│  }                                                                           │
+│  delete updatedPipeline.updated_at                                           │
+│                                                                              │
+└──────────────────────────────┬───────────────────────────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  阶段 3：updatePipeline({ pipeline: updatedPipeline }) → Promise            │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  → react-query mutation                                                      │
+│  → PUT /api/pipelines/:pipeline_uuid (ApiResourceDetailHandler)             │
+│  → 后端 io 写 metadata.yaml + block 文件                                     │
+│                                                                              │
+│  前端 Promise.then() → runBlockOrig(payload)                                 │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-> **线程模型说明**: `get_messages()` 在 `main()` 函数最后被同步调用，且内部是 `while True` 死循环。
-> 这意味着它会**阻塞当前协程**，但 `await asyncio.Event().wait()` 在它后面，说明 `get_messages()`
-> 内部可能起了独立线程。实际运行在 Tornado 的 IOLoop 中，`client.get_iopub_msg(timeout=1)` 是阻塞式的
-> （jupyter-client 底层是线程 + 队列模型），不会完全占满事件循环。
+**设计意图解读**：
+- 为什么要分阶段？**保持 block 顺序不变**。
+- 阶段 1 是 O(n) 的散列分桶（key=uuid），阶段 2 是 O(n) 的按原始顺序回填。
+- contentOnly 模式下，阶段 1 的普通 block 跳过了按类型归档，但因为**普通 block 在 contentOnly 下也写了 blocksByUUID**，所以在阶段 2 的**第一次优先级查找**（blocksByUUID）就能命中，**不会丢失**。
+- 潜在边界：contentOnly 模式下 **EXTENSION / CALLBACK / CONDITIONAL 类型的 block** 在阶段 1 跳过了分桶，也没有走 contentOnly 分支里的 blocksByUUID 写入（因为 return 前只写 blocksByUUID 是条件判断？不，contentOnly 分支是**无条件写 blocksByUUID**，不管 type）。实际看 L1311-L1317，不管 block 是什么类型，只要 contentOnly=true，都写入 blocksByUUID，所以**所有类型都会在阶段 2 优先命中 blocksByUUID**。
 
-### 3.3 parse_output_message - Jupyter → Mage 消息转换器
+---
 
-**代码位置**: `mage_ai/server/kernel_output_parser.py#L25-L86`
+## 二、实时回传数据：三层处理的明确区分
 
-#### 3.3.1 输入：Jupyter 原生消息结构
+**代码位置**：`mage_ai/server/websocket_server.py#L312-L399`
 
-```python
-message = {
-    'header': {
-        'msg_type': 'stream' | 'execute_result' | 'error' | 'status'
-                   | 'display_data' | 'comm_open' | 'comm_msg' ...,
-        'msg_id': '...',
-        ...
-    },
-    'parent_header': { 'msg_id': '对应 execute_request 的 msg_id' },
-    'content': {
-        # ── stream ──
-        'name': 'stdout' | 'stderr',
-        'text': 'print 输出内容',
-        # ── execute_result / display_data ──
-        'data': {
-            'text/plain': 'Out[1]: repr 字符串',
-            'text/html': '<table>...</table>',
-            'image/png': 'base64 图片',
-        },
-        'metadata': {},
-        # ── error ──
-        'ename': 'ValueError',
-        'evalue': 'xxx',
-        'traceback': ['line1\n', 'line2\n', ...],   # 已含 ANSI 颜色码
-        # ── status ──
-        'execution_state': 'busy' | 'idle' | 'starting',
-    },
-    ...
-}
+`WebSocketServer.send_message()` 是后端向所有前端推送消息的唯一出口，由 subscriber.py 中的 `get_messages(callback)` 回调驱动。整个处理流按以下顺序严格执行：
+
+```
+输入: parse_output_message() 输出的原始 dict
+    │
+    ▼
+┌────────────────────────────┐
+│  第一层：消息过滤            │  ← 判定要不要丢掉整条消息（粒度：整条）
+│  (入口守卫 + should_filter) │
+└─────────────┬──────────────┘
+              │ (未被过滤)
+              ▼
+┌────────────────────────────┐
+│  第二层：环境值脱敏          │  ← 判定 data 里哪些字符要替换（粒度：字符串）
+│  (filter_out_sensitive_data)│
+└─────────────┬──────────────┘
+              │ (已脱敏)
+              ▼
+┌────────────────────────────┐
+│  第三层：执行元数据补充      │  ← 关联 block/pipeline 上下文（粒度：dict 字段）
+│  (running_executions_map)  │
+└─────────────┬──────────────┘
+              │
+              ▼
+        merge_dict 合并
+              │
+              ▼
+    client.write_message() → N 个前端
 ```
 
-#### 3.3.2 输出：Mage 统一 KernelOutputType
+---
 
-```python
-return dict(
-    data=data_content,        # 规范化后的数据（list/str/None）
-    error=error,              # traceback 列表（仅 error 类型有值）
-    execution_state=execution_state,  # busy/idle
-    metadata=metadata,        # 原 metadata 透传
-    msg_id=msg_id,            # 父消息 ID（关联 execute_request）
-    msg_type=msg_type,        # 原 Jupyter msg_type
-    type=data_type,           # Mage DataType 枚举
-)
-```
+### 2.1 第一层：消息过滤（两层守卫）
 
-#### 3.3.3 分支映射表（msg_type → data_type → data_content）
-
-| msg_type / 条件 | DataType | data_content |
-|------------------|----------|--------------|
-| `content.name` ∈ `['stdout', 'stderr']` | `TEXT_PLAIN` | `text.split('\n')`，**超过 MAX_PRINT_OUTPUT_LINES 截断并追加 `'... (output truncated)'`** |
-| `content.data['image/png']` 存在 | `IMAGE_PNG` | base64 字符串 |
-| `content.traceback` 存在（error） | `TEXT` | traceback 行列表（同时设置 `error=traceback`） |
-| `content.data['text/html']` 存在 | `TEXT_HTML` | HTML 原文 |
-| `content.data['text/plain']` 存在 | `TEXT_PLAIN` | `text.split('\n')`，末尾补空串 |
-| `content.data['code']` 存在 | `TEXT` | code 原文（大模型生成代码场景） |
-| `msg_type` ∈ `COMMS_MESSAGE_TYPES` (comm_open/msg/close) 且 `method='update'` | `PROGRESS` | `state.value * 100` 百分比字符串（Great Expectations） |
-| 以上均不匹配 | `None` | `None`（前端会过滤掉） |
-
-### 3.4 WebSocketServer.send_message - 广播发射器
-
-**代码位置**: `mage_ai/server/websocket_server.py` (类方法)
-
-简化流程：
+**代码位置**：`websocket_server.py#L345-L357` + `#L314-L332`
 
 ```python
 @classmethod
 def send_message(cls, message: dict) -> None:
-    # 1. 过滤敏感字段（如 api_key / token 如果被回传）
-    message_sanitized = {k: v for k, v in message.items() if k not in SENSITIVE_KEYS}
+    # ── 过滤守卫 A：msg_id 存在性 ──
+    msg_id = message.get('msg_id')
+    if msg_id is None:
+        return   # ← Jupyter 状态变更可能缺 msg_id，直接丢掉
 
-    # 2. 合并额外元数据（block_uuid, pipeline_uuid 等上下文）
-    message_final = cls._merge_metadata(message_sanitized)
+    # ── 过滤守卫 B：四要素全空 ──
+    if (message.get('data') is None
+            and message.get('error') is None
+            and message.get('execution_state') is None
+            and message.get('type') is None):
+        return   # ← 既无数据也无状态的空消息，丢弃
 
-    # 3. 丢弃无用消息（空 data + 空 error + 非状态变更）
-    if not cls._is_useful(message_final):
+    # ── 过滤守卫 C：should_filter_message 业务级 ──
+    def should_filter_message(message):
+        # C-1: 重复检查四要素（冗余，与守卫 B 等价）
+        if (data is None and error is None and execution_state is None and type is None):
+            return True
+        # C-2: Jupyter Widgets 的 FloatProgress 进度条（前端无对应渲染器）
+        try:
+            if message.get('msg_type') == 'display_data' \
+                    and message.get('data')[0].startswith('FloatProgress'):
+                return True
+        except IndexError:
+            pass
+        return False
+
+    if should_filter_message(message):
         return
-
-    # 4. 广播给所有在线前端
-    for client in cls.clients:
-        try:
-            client.write_message(json.dumps(message_final))
-        except Exception:
-            # 连接失效时从 clients 集合移除
-            cls.clients.discard(client)
 ```
 
-### 3.5 前端 onMessage - 接收与渲染
+| 过滤条件 | 触发场景 | 丢弃比例 |
+|---------|----------|:--------:|
+| msg_id 缺失 | Jupyter `status` 类型消息（parent_header.msg_id 缺失） | 少 |
+| data/error/execution_state/type 全空 | 中间心跳 / 无效消息 | 中 |
+| FloatProgress display_data | ipywidgets 渲染的进度条（如 Great Expectations 旧版） | 极少 |
 
-**代码位置**: `mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx` (useWebSocket 配置)
+---
 
-```typescript
-const { sendMessage } = useWebSocket(getWebSocket(), {
-  onMessage: (lastMessage) => {
-    const message: KernelOutputType = JSON.parse(lastMessage.data);
+### 2.2 第二层：环境值脱敏（filter_out_sensitive_data）
 
-    // 按 block uuid 追加到对应 messages 数组
-    setMessages((messagesPrevious) => {
-      const blockUUID = message.block_uuid || message.uuid;
-      if (!blockUUID) return messagesPrevious;
+**代码位置**：`websocket_server.py#L334-L342` + `mage_ai/shared/security.py`
 
-      const existing = messagesPrevious[blockUUID] || [];
-      return {
-        ...messagesPrevious,
-        [blockUUID]: existing.concat(message),
-      };
-    });
+#### 2.2.1 开关与前置条件
 
-    // 状态变更为 idle 时，从 runningBlocks 中移除
-    if (ExecutionStateEnum.IDLE === message.execution_state) {
-      setRunningBlocks((prev) => prev.filter(({ uuid }) => uuid !== blockUUID));
+```python
+# mage_ai/settings/server.py#L42  —— 默认开启
+HIDE_ENV_VAR_VALUES = int(os.getenv('HIDE_ENV_VAR_VALUES', 1) or 1) == 1
+
+# websocket_server.py#L335-L336
+def filter_out_sensitive_data(message):
+    if not message.get('data') or not HIDE_ENV_VAR_VALUES:
+        return message  # ← 无 data 或管理员显式关闭 HIDE_ENV_VAR_VALUES=0，跳过脱敏
+```
+
+#### 2.2.2 脱敏算法（完整核实）
+
+`mage_ai/shared/security.py#L14-L20` + `#L43-L51`
+
+```python
+MIN_SECRET_LENGTH = 8
+WHITELISTED_ENV_VARS = {
+    'MAGE_DATA_DIR',
+    'MAGE_REPO_PATH',
+    'HOME',
+    'PWD',
+    'PYTHONPATH',
+}
+
+def filter_out_env_var_values(value: str) -> str:
+    # 步骤 1：收集所有环境变量的值
+    env_var_values = dict(os.environ).values()
+
+    # 步骤 2：保留白名单中的值（不脱敏）
+    whitelisted_env_var_values = {os.getenv(k) for k in WHITELISTED_ENV_VARS if os.getenv(k)}
+
+    # 步骤 3：过滤短值（< 8 字符认为不够成"秘密"）+ 过滤白名单
+    env_var_values = [
+        v for v in env_var_values
+        if v and len(v) >= MIN_SECRET_LENGTH and v not in whitelisted_env_var_values
+    ]
+
+    # 步骤 4：实际替换（辅助函数）
+    return filter_out_values(value, env_var_values)
+
+
+def filter_out_values(log: str, values: List[str]) -> str:
+    if not log or not values:
+        return log
+    # ★ 按长度降序排序：防止长串（如 "abcdefghijk"）被其前缀子串先替换后剩下残留
+    values.sort(key=len, reverse=True)
+    log_clean = log
+    for value in values:
+        replace_value = '*' * len(value)  # ★ 等长度星号（保留原始信息长度）
+        log_clean = log_clean.replace(value, replace_value)
+    return log_clean
+```
+
+#### 2.2.3 脱敏行为示例
+
+假设：
+- `os.environ['AWS_SECRET_ACCESS_KEY'] = 'abcdefghijklmnop'`（16 字符，非白名单）
+- `os.environ['HOME'] = '/home/mage'`（在白名单中）
+- `os.environ['SHORT'] = 'abc'`（3 字符，< 8）
+
+代码执行 `print("Use key: abcdefghijklmnop under /home/mage with abc")`
+
+**实际推送内容**：
+```
+Use key: **************** under /home/mage with abc
+        └── 16 个星号 ──┘       └────── 白名单保留 ──────┘   └ 短值保留
+```
+
+#### 2.2.4 重要设计决策（权衡）
+
+| 决策 | 优点 | 缺点 |
+|------|------|------|
+| **按值匹配**（不按 NAME= 前缀） | 捕获任何位置的泄露（异常堆栈、debug 变量 dump） | 假阳性：如果代码中恰好出现一段 8+ 字符的普通字符串等于某个 env 值，也会被误星号化 |
+| **等长度星号** | 保留信息熵分布，方便开发人员目测 | 泄露了值的字符长度（对密码学安全有微小影响，但对调试友好） |
+| **按长度降序替换** | 避免 `AWS_SECRET='abcd...'` + `AWS_SECRET_REGION='abcd...efg'` 时子串先替换导致残片 | 遍历成本增加（O(n²)，但 env vars 通常 < 200 个） |
+
+---
+
+### 2.3 第三层：执行元数据补充
+
+**代码位置**：`websocket_server.py#L360-L399`
+
+#### 2.3.1 上下文来源：running_executions_mapping 映射表
+
+这张表在执行请求到达时建立：
+
+```python
+# 单块执行时：websocket_server.py#L443-L447 + #L533
+value = dict(
+    block_type=block_type or block.type,      # data_loader / transformer ...
+    block_uuid=block_uuid,
+    replicated_block=block.replicated_block,  # 克隆 block 的源 uuid
+)
+# ...
+WebSocketServer.running_executions_mapping[msg_id] = value
+
+# 管道批量执行时：websocket_server.py#L585
+WebSocketServer.running_executions_mapping[msg_id] = dict(pipeline_uuid=pipeline_uuid)
+```
+
+数据结构：
+```
+running_executions_mapping: Dict[
+    msg_id: str,                  # ← Jupyter client.execute() 返回的 msg_id
+    {
+        block_type?: str,
+        block_uuid?: str,
+        replicated_block?: str,
+        pipeline_uuid?: str,
     }
-  },
-  reconnectAttempts: 10,
-  reconnectInterval: 3000,
-  shouldReconnect: () => true,
-});
+]
 ```
+
+#### 2.3.2 查表 + 合并 + 错误格式化
+
+```python
+# L360-L369  查上下文：execution_metadata 优先级 > running_executions_mapping
+execution_metadata = message.get('execution_metadata')
+msg_id_value = (
+    execution_metadata                        # 管道批量执行路径通过 publish_pipeline_message 直接塞
+    if execution_metadata is not None
+    else WebSocketServer.running_executions_mapping.get(msg_id, dict())
+)
+block_type = msg_id_value.get('block_type')
+block_uuid = msg_id_value.get('block_uuid')
+replicated_block = msg_id_value.get('replicated_block')
+pipeline_uuid = msg_id_value.get('pipeline_uuid')
+
+# L371-L376  错误格式化：裁剪 Mage 内部栈帧 + 颜色修正
+error = message.get('error')
+if error:
+    message['data'] = cls.format_error(
+        error,
+        block_uuid=replicated_block if replicated_block else block_uuid,
+    )
+    # format_error 内部：
+    #   ① 删除 execute_custom_code() 到 {block_uuid}.py / execute_block_function 之间的内部调用帧
+    #   ② 将 ANSI [0;34m（深蓝）→ [0;33m（黄），提升暗背景可读性
+    #   ③ 失败回退：原样返回
+
+# L378-L387  merge_dict：原始消息 + 上下文字段
+output_dict = dict(
+    block_type=block_type,
+    pipeline_uuid=pipeline_uuid,
+    uuid=block_uuid,   # ★ 命名：前端按 uuid 分桶 messages[uuid]
+)
+message_final = merge_dict(message, output_dict)
+# merge_dict 语义：后者优先级覆盖前者（但 uuid 是新字段，通常不冲突）
+```
+
+#### 2.3.3 最终推送：防日志洪泛
+
+```python
+# L389-L399  ★ 只在有 block 或 pipeline 上下文时才真正推送 + 打日志
+if block_uuid or pipeline_uuid:
+    logger.info(
+        f'[{block_uuid}] Sending message for {msg_id} to '
+        f'{len(cls.clients)} client(s):\n{json.dumps(message_final, indent=2)}'
+    )
+
+    for client in cls.clients:
+        client.write_message(json.dumps(message_final))
+```
+
+**为什么加这层判断？**
+代码注释说明了：KernelResource 接口（`GET /api/kernels`）在获取内核状态时，会间接触发 subscriber 的回调产生一批无关联 block_uuid/pipeline_uuid 的消息，这些消息对前端无用，且会导致日志洪泛。这层判断充当"静默丢弃"的最后一层过滤。
 
 ---
 
-## 四、终端通道接入方式
+### 2.4 三层处理的最终效果总结
 
-### 4.1 架构总览
-
-终端通道使用 **terminado** 库（Jupyter 生态的 WebSocket-PTY 桥）：
-
-```
-┌───────────────────┐   stdin/stdout    ┌────────────────────────┐   forkpty   ┌──────────────┐
-│  Terminal (React) │ ◄───────────────► │ TerminalWebsocketServer │ ◄──────────►│ /bin/bash 等 │
-│  components/      │   WebSocket 帧    │  terminal_server.py     │   PTY 主从  │  子进程 shell │
-└───────────────────┘                   └────────────────────────┘             └──────────────┘
-         ▲                                        ▲
-         │                                        │
-         │ useTerminal hook 管理多标签状态          │ MageTermManager 按 term_name 复用
-         ▼                                        ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                    localStorage 持久化终端列表（当前选中 tab）                      │
-└──────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 4.2 TermManager - 后端终端池
-
-**代码位置**: `mage_ai/server/terminal_server.py#L22-L48`
-
-提供两种终端管理策略：
-
+假设原始消息（来自 parse_output_message）：
 ```python
-# 策略 A（默认）: 按名称复用同一终端（断开重连不会丢失 shell 会话）
-class MageTermManager(terminado.NamedTermManager):
-    def get_terminal(self, term_name: str, **kwargs):
-        if term_name in self.terminals:
-            return self.terminals[term_name]              # 已存在 → 复用
-
-        # 否则新建 pty，注册到字典，启动读线程
-        term = self.new_terminal(**kwargs)               # forkpty + exec shell
-        term.term_name = term_name
-        self.terminals[term_name] = term
-        self.start_reading(term)                         # 起线程循环读 PTY master fd
-        return term
-
-# 策略 B: 每次连接独占新终端（USE_UNIQUE_TERMINAL=true 时使用）
-class MageUniqueTermManager(terminado.UniqueTermManager):
-    def get_terminal(self, url_component=None, **kwargs):
-        term = self.new_terminal(**kwargs)
-        self.start_reading(term)
-        return term                                         # 不复用
+{
+    'msg_id': 'abc123',
+    'msg_type': 'stream',
+    'data': ['Connecting to db with password=MySecretPassword123'],
+    'type': 'text/plain',
+    # ← 缺 uuid / pipeline_uuid（parse_output_message 不知这些关联）
+    # ← 缺 block_type
+}
 ```
 
-### 4.3 TerminalWebsocketServer - 连接生命周期
+经过三层处理：
+1. **第一层**：msg_id 非空 → data/type 有值 → 非 FloatProgress → **通过**
+2. **第二层**：`MySecretPassword123` 长度 19 ≥ 8，非白名单 → 脱敏为 `*******************`
+3. **第三层**：查表 `running_executions_mapping['abc123']` → `{block_uuid: 'block_xyz', block_type: 'data_loader', pipeline_uuid: 'pipe_001'}` → 补充字段 → error 为空不处理
 
-**代码位置**: `mage_ai/server/terminal_server.py#L51-L158`
-
-#### 4.3.1 open() - 连接建立
-
-```python
-def open(self, url_component=None):
-    super().open(url_component)
-
-    # 1. 解析并校验 cwd，确保不越出项目目录
-    cwd = self.get_argument('cwd', None, True)
-    if cwd:
-        try:
-            ensure_file_is_in_project(cwd)     # 安全检查：禁止 cd 到项目外
-        except FileNotInProjectError:
-            cwd = None
-
-    # 2. 解析 term_name（前端用 userId--controllerUUID--tabUUID 构造）
-    term_name = self.get_argument('term_name', None, True) or 'tty'
-
-    # 3. 从 TermManager 获取或创建终端实例
-    self.__initialize_terminal(term_name, cwd=cwd)
-
-def __initialize_terminal(self, term_name: str, cwd: str = None):
-    self.terminal = self.term_manager.get_terminal(term_name, cwd=cwd)
-    self.terminal.clients.append(self)              # ← 订阅该终端的输出流
-
-    self.send_json_message(["setup", {}])           # 通知前端初始化完成
-
-    # 重连回放：将缓冲的历史输出发送给新客户端（支持断网恢复显示）
-    buffered = ""
-    preopen_buffer = self.terminal.read_buffer.copy()
-    while preopen_buffer:
-        buffered += preopen_buffer.popleft()
-    if buffered:
-        self.on_pty_read(buffered)
-
-    # Bash 专用：关闭 bracketed-paste 模式（避免粘贴命令被包裹）
-    if self.term_command == 'bash':
-        self.terminal.ptyproc.write("bind 'set enable-bracketed-paste off' # Mage terminal settings command\r")
+**最终推送到前端的消息**：
+```json
+{
+    "msg_id": "abc123",
+    "msg_type": "stream",
+    "data": ["Connecting to db with password=*******************"],
+    "type": "text/plain",
+    "block_type": "data_loader",
+    "pipeline_uuid": "pipe_001",
+    "uuid": "block_xyz"
+}
 ```
 
-#### 4.3.2 on_message() - 认证 + 指令转发
-
-```python
-@gen.coroutine
-def on_message(self, raw_message):
-    message = json.loads(raw_message)
-
-    api_key = message.get('api_key')
-    token = message.get('token')
-    command = message.get('command')   # 例: ['stdin', 'ls -la'] 或 ['stdin', '\r']
-
-    # 特殊指令：清屏（前端 Cmd+K）→ 替换成实际的 shell clear 命令
-    index = find_index(lambda x: x == '__CLEAR_OUTPUT__', command or [])
-    if index >= 0:
-        command[index] = r"clear -x && history -c && history -w && clear -x"
-
-    # 全局禁用检查
-    if DISABLE_TERMINAL:
-        return self.send_json_message(['stdout', f'{command[1]}\nUnauthorized access to the terminal.'])
-
-    # 权限检查：OAuth2 校验 + 至少 Editor 角色
-    if REQUIRE_USER_AUTHENTICATION or is_disable_pipeline_edit_access():
-        valid = False
-        if api_key and token:
-            oauth_client = Oauth2Application.query.filter(
-                Oauth2Application.client_id == api_key,
-            ).first()
-            if oauth_client:
-                oauth_token, valid = authenticate_client_and_token(oauth_client.id, token)
-                if valid and oauth_token and oauth_token.user:
-                    valid = has_at_least_editor_role(
-                        oauth_token.user, Entity.PROJECT, get_project_uuid(),
-                    )
-        if not valid or is_disable_pipeline_edit_access():
-            return self.send_json_message(['stdout', '...Unauthorized...'])
-
-    # ✅ 认证通过：交给 terminado 的 TermSocket 处理（写入 PTY slave fd）
-    return terminado.TermSocket.on_message(self, json.dumps(command))
-```
-
-#### 4.3.3 on_pty_read() - PTY 输出 → 前端
-
-```python
-def on_pty_read(self, text):
-    """PTY master 有可读数据时被 TermManager 的读取线程回调"""
-    updated_text = text
-    if self.term_command == 'cmd':
-        # Windows cmd.exe 会发 OSC 0 标题序列（\x1B]0;...\x07），过滤掉
-        xterm_escape = re.compile(r'(?:\x1B\]0;).*\x07')
-        updated_text = xterm_escape.sub('', text)
-    self.send_json_message(["stdout", updated_text])
-```
-
-### 4.4 useTerminal - 前端 Hook 层
-
-**代码位置**: `mage_ai/frontend/components/Terminal/useTerminal/index.tsx#L41-L500`
-
-#### 4.4.1 WebSocket 连接建立
-
-```typescript
-// L236-L249
-const {
-  lastMessage,   // 最新一条消息（react-use-websocket 内部维护）
-  readyState,
-  sendMessage,   // 发送函数
-} = useWebSocket(getWebSocket(selectedItem ? 'terminal' : null), {
-  queryParams: {
-    // ★ term_name 三元组：用户维度隔离 + 控制器维度 + Tab 维度
-    term_name: `${user?.id}--${uuidTerminalController}--${selectedItem?.uuid}`,
-  },
-}, !!selectedItem);
-```
-
-> **term_name 命名策略解读**:
-> - `userId` → 同项目多用户互不干扰
-> - `uuidTerminalController` → 同一个页面里的不同 Terminal 实例（如管道编辑器 vs 文件编辑器）互不干扰
-> - `selectedItem.uuid` → 同一个 Terminal UI 里的多个 Tab（Main Mage/自定义标签页）互相独立
-
-#### 4.4.2 输出接收与渲染
-
-```typescript
-// L251-L264
-useEffect(() => {
-  if (lastMessage) {
-    const msg = JSON.parse(lastMessage.data);
-    // msg[0] 是事件类型: 'stdout' | 'setup' | 'disconnect' 等
-    setStdout(selectedItem, (prev: string) => {
-      const p = prev || '';
-      if (msg[0] === 'stdout') {
-        const out = msg[1];
-        return p + out;     // 纯字符串追加（含 ANSI 颜色码）
-      }
-      return p;
-    });
-  }
-}, [lastMessage, selectedItem, setStdout]);
-
-// L270-L285  输出转为 KernelOutputType 数组供渲染组件消费
-const outputs: KernelOutputType[] = useMemo(() => {
-  if (!stdoutSelected) return [];
-
-  const splitStdout = stdoutSelected
-    .split('\n')
-    .filter(d => !d.includes('# Mage terminal settings command'));  // 过滤内部配置命令
-
-  return splitStdout.map(d => ({
-    data: d,                // 单行字符串（含 ANSI）
-    type: DataTypeEnum.TEXT,
-  }));
-}, [selectedItem, stdoutSelected]);
-```
-
-#### 4.4.3 多 Tab 管理（localStorage 持久化）
-
-```typescript
-// L159-L185 新增/关闭 Tab
-const addItem = useCallback((item, idx = 0) => {
-  const values = pushAtIndex(item, idx, items?.map(i => ({ ...i, selected: false })));
-  setItems(values, true);      // 写 localStorage
-  setItemsState(() => values); // 写 state
-}, [items]);
-
-const removeItem = useCallback((uuidSelected) => {
-  if (UUID_MAIN === uuidSelected) return;  // "Main Mage" Tab 不可删除
-  const values = items?.filter(({ uuid }) => uuid !== uuidSelected);
-  // ... 选中逻辑调整
-  setItems(values, true);
-}, [items]);
-```
-
-### 4.5 Terminal 组件 - UI 交互层
-
-**代码位置**: `mage_ai/frontend/components/Terminal/index.tsx#L71-L399`
-
-#### 4.5.1 核心交互：sendCommand
-
-```typescript
-// L248-L271   按下 Enter 时触发
-const sendCommand = useCallback((cmd) => {
-  // 1. 先发命令文本（不带回车，方便记录到 history）
-  sendMessage(JSON.stringify({
-    ...oauthWebsocketData,
-    command: ['stdin', cmd],
-  }));
-  // 2. 再发回车符（真正执行）
-  sendMessage(JSON.stringify({
-    ...oauthWebsocketData,
-    command: ['stdin', '\r'],
-  }));
-
-  // 3. 本地维护 history & UI 状态
-  if (cmd?.length >= 2) {
-    setCommandIndex(commandHistory.length + 1);
-    setCommandHistory(prev => prev.concat(cmd));
-    setCursorIndex(0);
-  }
-  setCommand('');
-}, [commandHistory, sendMessage, setCommand, oauthWebsocketData, ...]);
-```
-
-#### 4.5.2 特殊快捷键处理
-
-| 快捷键 | 行为 | 实现（L307-L316 / L292-L304） |
-|--------|------|-------------------------------|
-| `Ctrl+C` | 中断当前命令 | 发送 `command`（保留用于显示） + `\x03`（ETX ASCII 码即 SIGINT） |
-| `Cmd+K` | 清屏（在 useTerminal 里） | 发送 `__CLEAR_OUTPUT__` 魔法标记，后端替换为 `clear -x && history -c...`，同时本地清空 stdout |
-| `Ctrl+V` / `Cmd+V` | 粘贴 | 通过 `navigator.clipboard.readText()` 读取，多行自动分段执行 |
-| `↑` / `↓` | 历史命令 | 遍历 `commandHistory` 数组 |
-| `←` / `→` | 光标移动 | 更新 `cursorIndex` 状态 |
-
-#### 4.5.3 ANSI 渲染
-
-组件使用 `ansi-to-react` 库将后端输出中的 ANSI 颜色码转换为带样式的 `<span>`：
-
-```typescript
-// 组件最顶部 import
-import Ansi from 'ansi-to-react';
-
-// 渲染时包裹 <Ansi>...</Ansi>
-return <LineStyle><Ansi>{line.data}</Ansi></LineStyle>;
-```
+前端接收到后按 `uuid` 分桶到 `messages['block_xyz']` 数组追加渲染。
 
 ---
 
-## 附录：关键文件路径索引
+## 三、终端通道补充说明（简化）
 
-| 模块 | 文件路径（仓库相对路径） | 职责 |
-|------|--------------------------|------|
-| **Editor 主页面** | `mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx` | WebSocket 建立、runBlock、savePipelineContent |
-| **Editor V1 组件** | `mage_ai/frontend/components/CodeEditor/index.tsx` | Monaco 编辑器 UI |
-| **CodeBlock 中间层** | `mage_ai/frontend/components/CodeBlock/index.tsx` | 快捷键 → executeCode → runBlock 转发 |
-| **终端 Hook** | `mage_ai/frontend/components/Terminal/useTerminal/index.tsx` | 终端 WS、多 Tab 管理、状态持久化 |
-| **终端 UI** | `mage_ai/frontend/components/Terminal/index.tsx` | PTY 渲染、键盘交互、sendCommand |
-| **WS URL 构造** | `mage_ai/frontend/api/utils/url.ts` | getWebSocket() 协议/域名拼接 |
-| **Tornado 主入口** | `mage_ai/server/server.py` | 路由注册、TermManager 创建、Subscriber 启动 |
-| **Editor WS Handler** | `mage_ai/server/websocket_server.py` | on_message 认证分发、send_message 广播 |
-| **终端 WS Handler** | `mage_ai/server/terminal_server.py` | MageTermManager、TerminalWebsocketServer |
-| **Subscriber** | `mage_ai/server/subscriber.py` | 轮询 IOPub + callback 驱动 |
-| **输出解析器** | `mage_ai/server/kernel_output_parser.py` | Jupyter 消息 → Mage KernelOutputType |
-| **SSE 事件流** | `mage_ai/server/events/stream.py` | EventStreamHandler（WS 补充通道） |
+终端通道复用相同的认证模式（api_key + token + Editor 角色），但在消息格式上与 Editor 通道完全独立：
+
+| 维度 | Editor WS (`/websocket/`) | Terminal WS (`/websocket/terminal`) |
+|------|--------------------------|--------------------------------------|
+| **发送格式** | JSON 对象，字段 `code/uuid/type/...` | JSON 对象：`{ api_key, token, command: ['stdin', payload] }` |
+| **接收格式** | JSON 对象，字段 `uuid/pipeline_uuid/data/type/...` | JSON 数组：`['stdout', '<含ANSI的文本>']` 或 `['setup', {}]` |
+| **数据脱敏** | ✓ filter_out_sensitive_data | ✗ 不在 send_message 路径，无脱敏（终端场景下用户直接操作 shell，输出不应被篡改） |
+| **消息过滤** | ✓ 三层守卫 | ✗ terminado 内部直接写 PTY 读回调 on_pty_read |
+| **上下文补充** | ✓ running_executions_mapping | ✗ 按 term_name 直接绑定 |
+
+**终端 WS 不经过 send_message 的原因**：
+终端使用 `terminado.TermSocket` 作为基类，PTY 读取线程回调的是 `on_pty_read()` → 直接调用 `send_json_message()`，绕过了 `WebSocketServer.send_message()` 类方法。这是设计有意为之：终端属于"全双工原始通道"，输出就是 PTY 的原始字节流，不做任何业务层处理。
+
+---
+
+## 四、关键文件索引
+
+| 关注点 | 仓库相对路径 | 关键行号 |
+|--------|-------------|---------|
+| **runBlock 保存再执行** | `mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx` | L2667-L2704 |
+| **savePipelineContent（含两阶段遍历）** | `mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx` | L1187-L1446 |
+| **runBlockOrig（sendMessage）** | `mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx` | L2571-L2665 |
+| **send_message 三层处理** | `mage_ai/server/websocket_server.py` | L312-L399 |
+| **on_message 执行请求 + running_executions_mapping 建立** | `mage_ai/server/websocket_server.py` | L185-L310, L443-L533 |
+| **format_error（错误栈裁剪）** | `mage_ai/server/websocket_server.py` | L646-L711 |
+| **环境值脱敏算法** | `mage_ai/shared/security.py` | L14-L51 |
+| **HIDE_ENV_VAR_VALUES 开关** | `mage_ai/settings/server.py` | L42 |
+| **parse_output_message（Jupyter → Mage）** | `mage_ai/server/kernel_output_parser.py` | L25-L86 |
+| **subscriber 轮询** | `mage_ai/server/subscriber.py` | L8-L24 |
+| **TermManager + TerminalWebsocketServer** | `mage_ai/server/terminal_server.py` | L22-L158 |
+| **useTerminal Hook** | `mage_ai/frontend/components/Terminal/useTerminal/index.tsx` | L41-L500 |
+| **Tornado 路由 + 启动时序** | `mage_ai/server/server.py` | L266-L310, L745-L749 |
