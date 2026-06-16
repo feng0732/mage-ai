@@ -233,16 +233,18 @@ RUNNING ────────────────────────
 
 **状态切换触发点**：
 
-| 源状态 | 目标状态 | 触发位置 | 触发条件 | 关键操作 |
-|--------|---------|---------|---------|---------|
-| INITIAL | RUNNING | `PipelineScheduler.start()` L197-200 | 成功初始化块运行，获取分布式锁 | 设置 `started_at`，更新状态 |
-| RUNNING | COMPLETED | `PipelineScheduler.schedule()` L262 | `all_blocks_completed() == True` 且 `any_blocks_failed() == False` | 调用 `complete()`，**设置 `completed_at`**，发送成功通知 |
-| RUNNING | FAILED | `PipelineScheduler.schedule()` L251-253 | 所有块完成但存在失败块 | **设置 `completed_at`**，更新状态，调用 `on_pipeline_run_failure()` |
-| RUNNING | FAILED | `PipelineScheduler.schedule()` L309 | 块失败且 `allow_blocks_to_fail == False` | **不设置 `completed_at`**，更新状态，调用 `on_pipeline_run_failure()` |
-| RUNNING | FAILED/CANCELLED | `PipelineScheduler.schedule()` L306 | 管道运行超时（状态由 `timeout_status` 决定，默认 FAILED） | **不设置 `completed_at`**，更新状态，调用 `on_pipeline_run_failure()` |
-| RUNNING | FAILED | `PipelineScheduler.start()` L187 | 初始化块运行时异常 | **不设置 `completed_at`**，更新状态，直接发送失败通知 |
-| RUNNING | CANCELLED | `stop_pipeline_run()` L1452 | 用户主动取消 / 内存超限 | **不设置 `completed_at`**，更新状态，取消所有块，终止作业 |
-| RUNNING | FAILED/CANCELLED | `StreamingPipelineExecutor.__update_pipeline_run_status()` L288-289 | Streaming 管道结束 | **始终设置 `completed_at`** |
+| 源状态 | 目标状态 | 触发位置 | 触发条件 | completed_at | 失败通知 |
+|--------|---------|---------|---------|-------------|---------|
+| INITIAL | RUNNING | `PipelineScheduler.start()` L197-200 | 成功初始化块运行，获取分布式锁 | - | - |
+| RUNNING | COMPLETED | `schedule()` L262 `complete()` | 所有块成功完成 | ✅ 设置 | ✅ 成功通知 |
+| RUNNING | FAILED | `schedule()` L251-253 | 所有块完成但存在失败块 | ✅ 设置 | ✅ 发送 |
+| RUNNING | FAILED | `schedule()` L309 | 块失败且 `allow_blocks_to_fail == False` | ❌ 未设置 | ✅ 发送 |
+| RUNNING | FAILED | `schedule()` L306 | 管道超时（默认 FAILED） | ❌ 未设置 | ✅ 发送 |
+| RUNNING | CANCELLED | `schedule()` L306 | 管道超时（配置为 CANCELLED） | ❌ 未设置 | ❌ 不发送 |
+| RUNNING | CANCELLED | `stop_pipeline_run()` L1452 | 用户主动取消 | ❌ 未设置 | ❌ 不发送 |
+| RUNNING | CANCELLED | `memory_usage_failure()` → `stop()` | 内存使用率 ≥ 95% | ❌ 未设置 | ✅ **发送（summary）** |
+| RUNNING | FAILED | `start()` L187 | 初始化块运行时异常 | ❌ 未设置 | ✅ 发送（直接调用） |
+| RUNNING | FAILED/其他 | `streaming_pipeline_executor.py` L288-289 | Streaming 管道结束 | ✅ **始终设置** | FAILED 时发送 |
 
 ### 2.2 BlockRun 状态机
 
@@ -424,22 +426,125 @@ QUEUED 状态是块从"可执行"到"实际运行"之间的中间状态，主要
 
 ---
 
-## 4. 失败、取消、超时的路径对比
+## 4. 取消与失败路径详细对比
 
-### 4.1 四种终止路径总览对比
+### 4.1 终止路径总览（七种场景）
 
-| 维度 | 运行中块失败 | 全部块结束后发现失败 | 管道超时 | 用户取消 |
-|------|-------------|-------------------|---------|---------|
-| **触发条件** | `allow_blocks_to_fail=False` 且存在失败块 | `all_blocks_completed()=True` 且 `any_blocks_failed()=True` | 运行时间 > `PipelineSchedule.timeout` | 调用 `stop_pipeline_run()` / 内存超限 |
-| **触发位置** | `schedule()` L308-L331 | `schedule()` L250-L260 | `schedule()` L302-L307 | `stop_pipeline_run()` L1426-L1457 |
-| **最终状态** | FAILED | FAILED | FAILED（默认）或 CANCELLED | CANCELLED（默认） |
-| **completed_at** | ❌ **未设置** | ✅ **已设置** | ❌ **未设置** | ❌ **未设置** |
-| **失败通知** | ✅ 发送（通过 `on_pipeline_run_failure`） | ✅ 发送（通过 `on_pipeline_run_failure`） | ✅ 仅当最终状态为 FAILED 时发送 | ❌ **不发送** |
-| **块取消** | ✅ 调用 `cancel_block_runs_and_jobs()` | ✅ 调用（实际无需要取消的块） | ✅ 调用 `cancel_block_runs_and_jobs()` | ✅ 调用 `cancel_block_runs_and_jobs()` |
-| **调用 on_pipeline_run_failure** | ✅ 是，默认 status=FAILED | ✅ 是，默认 status=FAILED | ✅ 是，status 参数为最终状态 | ❌ **否，直接取消** |
-| **块状态分布** | 失败块为 FAILED，其余 INITIAL/QUEUED/RUNNING → CANCELLED | 失败块为 FAILED，其余为 COMPLETED/UPSTREAM_FAILED/CONDITION_FAILED | 运行中的块 → CANCELLED | 所有 INITIAL/QUEUED/RUNNING → CANCELLED |
+| 终止场景 | 最终状态 | completed_at | 失败通知 | 调用 on_pipeline_run_failure | 调用 cancel_block_runs_and_jobs | 代码入口 |
+|---------|---------|-------------|---------|------------------------------|--------------------------------|---------|
+| **正常完成** | COMPLETED | ✅ 设置 | ✅ 成功通知 | ❌ | ❌ | `schedule()` L262 `complete()` |
+| **全部块结束后失败** | FAILED | ✅ 设置 | ✅ 发送 | ✅ (status=FAILED) | ✅（无实际效果） | `schedule()` L251 |
+| **运行中块失败** | FAILED | ❌ 未设置 | ✅ 发送 | ✅ (status=FAILED) | ✅ | `schedule()` L309 |
+| **管道超时 (默认 FAILED)** | FAILED | ❌ 未设置 | ✅ 发送 | ✅ (status=FAILED) | ✅ | `schedule()` L306 |
+| **管道超时 (配置为 CANCELLED)** | CANCELLED | ❌ 未设置 | ❌ **不发送** | ✅ (status=CANCELLED) | ✅ | `schedule()` L306 |
+| **用户主动取消** | CANCELLED | ❌ 未设置 | ❌ **不发送** | ❌ **不调用** | ✅ | API → `stop()` → `stop_pipeline_run()` |
+| **内存超限取消** | CANCELLED | ❌ 未设置 | ✅ **发送**（summary） | ❌ **不调用** | ✅（通过 stop()） | `memory_usage_failure()` → `stop()` |
+| **start() 初始化失败** | FAILED | ❌ 未设置 | ✅ 发送 | ❌ 不调用 | ❌ 不调用 | `start()` L187 |
+| **Streaming 管道任意终止** | FAILED/其他 | ✅ **始终设置** | ✅ FAILED 时发送 | ❌ 不调用 | ❌ 不调用 | `streaming_pipeline_executor.py` L288 |
 
-### 4.2 路径一：运行中块失败（allow_blocks_to_fail=False）
+---
+
+### 4.2 取消分支的三种不同路径
+
+#### 路径 A：用户主动取消
+
+**触发时机**：用户通过 API 或 UI 点击取消按钮
+
+**调用链路**：
+```
+API: cancel_pipeline_runs()  [mage_ai/api/resources/PipelineResource.py L780]
+  └─ PipelineScheduler.stop()  [L206]
+       └─ stop_pipeline_run(pipeline_run, pipeline)  [L1426]
+            ├─ 前置状态检查（仅 INITIAL/RUNNING）
+            ├─ 更新管道状态为 CANCELLED（不设置 completed_at）
+            ├─ 记录使用统计
+            └─ cancel_block_runs_and_jobs()  [L1460]
+                 ├─ 收集 INITIAL/QUEUED/RUNNING 状态的块
+                 ├─ 批量更新块为 CANCELLED（不设置 completed_at）
+                 ├─ 终止相关作业
+                 └─ 入队取消清理作业（on_pipeline_run_cancelled）
+```
+
+**关键特征**：
+- 状态：CANCELLED
+- **不调用 `on_pipeline_run_failure()`**
+- **不发送失败通知**
+- **不设置 `completed_at`**
+- 块取消：批量 CANCELLED，不设置 completed_at
+
+#### 路径 B：内存超限取消
+
+**触发时机**：心跳检测发现系统内存使用率 ≥ 95%（仅 LOCAL_PYTHON 执行器）
+
+**调用链路**：
+```
+schedule() → __run_heartbeat()
+  └─ memory_usage >= MEMORY_USAGE_MAXIMUM (0.95)
+       └─ memory_usage_failure(tags=tags)  [L490]
+            ├─ 记录内存超限日志
+            ├─ self.stop()  → 同用户取消路径
+            │      └─ stop_pipeline_run()
+            │           ├─ 状态 → CANCELLED
+            │           └─ cancel_block_runs_and_jobs()
+            ├─ ✅ 发送失败通知（summary=内存超限消息）  [L501]
+            │   直接调用 notification_sender.send_pipeline_run_failure_message(summary=msg)
+            └─ INTEGRATION 类型：计算管道运行指标
+```
+
+**关键特征**：
+- 状态：CANCELLED（通过 `stop()` 设置）
+- **不调用 `on_pipeline_run_failure()`**
+- **会发送失败通知**（直接调用 `send_pipeline_run_failure_message`，参数为 `summary`）
+- **不设置 `completed_at`**
+- 是所有 CANCELLED 状态中**唯一会发送通知**的场景
+- 通知内容是"内存使用率达到 95%"的 summary，没有 error 和 stacktrace
+
+#### 路径 C：管道超时取消（timeout_status=CANCELLED）
+
+**触发时机**：管道运行超时，且 `PipelineSchedule.timeout_status` 配置为 CANCELLED
+
+**调用链路**：
+```
+schedule()
+  └─ __check_pipeline_run_timeout() == True
+       ├─ status = timeout_status or FAILED  → CANCELLED
+       ├─ 更新管道状态为 CANCELLED（不设置 completed_at）  [L306]
+       └─ on_pipeline_run_failure('Pipeline run timed out.', status=CANCELLED)  [L307]
+            ├─ 记录使用统计
+            ├─ ❌ status != FAILED → 不发送通知
+            └─ cancel_block_runs_and_jobs()
+                 └─ 同用户取消路径的块取消逻辑
+```
+
+**关键特征**：
+- 状态：CANCELLED
+- **调用 `on_pipeline_run_failure()`**，但传入 `status=CANCELLED`
+- **不发送失败通知**（因为 status != FAILED，on_pipeline_run_failure 内部判断跳过）
+- **不设置 `completed_at`**
+- 是三种取消路径中**唯一经过 on_pipeline_run_failure** 的
+
+---
+
+### 4.3 三种取消路径的对比
+
+| 维度 | 用户主动取消 | 内存超限取消 | 超时取消 (CANCELLED) |
+|------|-------------|-------------|---------------------|
+| **触发方式** | API/UI 调用 | 心跳检测内存 ≥ 95% | 调度循环检测超时 |
+| **最终状态** | CANCELLED | CANCELLED | CANCELLED |
+| **completed_at** | ❌ 未设置 | ❌ 未设置 | ❌ 未设置 |
+| **失败通知** | ❌ 不发送 | ✅ **发送**（summary） | ❌ 不发送 |
+| **调用 on_pipeline_run_failure** | ❌ 不调用 | ❌ 不调用 | ✅ 调用（status=CANCELLED） |
+| **调用 stop_pipeline_run** | ✅ 是 | ✅ 是（通过 stop()） | ❌ 否（直接更新状态） |
+| **取消块的方式** | cancel_block_runs_and_jobs | cancel_block_runs_and_jobs | cancel_block_runs_and_jobs |
+| **通知发送方式** | - | 直接 send_pipeline_run_failure_message(summary=...) | - |
+| **入队取消清理作业** | ✅ 是 | ✅ 是 | ✅ 是 |
+| **记录使用统计** | ✅ 是（stop_pipeline_run 内） | ✅ 是（stop_pipeline_run 内） | ✅ 是（on_pipeline_run_failure 内） |
+
+---
+
+### 4.4 失败路径对比
+
+#### 路径一：运行中块失败（allow_blocks_to_fail=False）
 
 **触发时机**：在 `schedule()` 循环中检测到有块已失败，且 `allow_blocks_to_fail == False`。
 
@@ -460,46 +565,9 @@ elif self.pipeline_run.any_blocks_failed() and not self.allow_blocks_to_fail:
     self.on_pipeline_run_failure(error_msg)
 ```
 
-**`on_pipeline_run_failure()` 的执行**（L341-L374）：
+#### 路径二：全部块结束后发现失败
 
-```python
-def on_pipeline_run_failure(self, error_msg, status=PipelineRun.PipelineRunStatus.FAILED):
-    # 1. 记录使用统计
-    UsageStatisticLogger().pipeline_run_ended_sync(self.pipeline_run)
-
-    # 2. 仅当 status == FAILED 时发送失败通知
-    if status == PipelineRun.PipelineRunStatus.FAILED:
-        # 收集失败块的错误堆栈（最多 50 行，超出截断）
-        ...
-        self.notification_sender.send_pipeline_run_failure_message(...)
-
-    # 3. 取消所有进行中的块运行 + 终止作业
-    cancel_block_runs_and_jobs(self.pipeline_run, self.pipeline)
-```
-
-**`cancel_block_runs_and_jobs()` 的执行**（L1460-L1519）：
-
-```python
-def cancel_block_runs_and_jobs(pipeline_run, pipeline):
-    # 1. 收集需要取消的块：状态为 INITIAL/QUEUED/RUNNING
-    block_runs_to_cancel = [b for b in pipeline_run.block_runs
-                            if b.status in [INITIAL, QUEUED, RUNNING]]
-
-    # 2. 批量更新为 CANCELLED
-    BlockRun.batch_update_status(cancelled_block_run_ids, BlockRun.BlockRunStatus.CANCELLED)
-
-    # 3. 终止相关作业
-    #    - INTEGRATION/STREAMING：kill_pipeline_run_job + kill_integration_stream_job
-    #    - 普通批处理：kill_block_run_job（每个运行中的块）
-    #    - K8S 执行器：executor.cancel()
-
-    # 4. 入队取消清理作业
-    GenericJob.enqueue_cancel_pipeline_run(pipeline_run.id, cancelled_block_run_ids)
-```
-
-### 4.3 路径二：全部块结束后发现失败
-
-**触发时机**：所有块都已到达终态（COMPLETED / FAILED / UPSTREAM_FAILED / CONDITION_FAILED），但其中存在 FAILED 状态的块。通常出现在 `allow_blocks_to_fail=True` 的场景下。
+**触发时机**：所有块都已到达终态，但其中存在 FAILED 状态的块。常见于 `allow_blocks_to_fail=True` 的场景。
 
 **代码执行顺序**（`schedule()` L240-L260）：
 
@@ -520,131 +588,165 @@ if self.pipeline_run.all_blocks_completed(self.allow_blocks_to_fail):
         failed_block_runs = self.pipeline_run.failed_block_runs
         error_msg = 'Failed blocks: ' + ', '.join([b.block_uuid for b in failed_block_runs]) + '.'
 
-        # 5. 调用 on_pipeline_run_failure（发送通知 + 取消块，但实际没有需要取消的块）
+        # 5. 调用 on_pipeline_run_failure
         self.on_pipeline_run_failure(error_msg)
 ```
 
-**与路径一的关键区别**：
-- **completed_at 已设置**：因为所有块都已结束，可以确定结束时间
-- **实际块取消无效**：`cancel_block_runs_and_jobs()` 会被调用，但此时所有块都已经是终态，没有 INITIAL/QUEUED/RUNNING 状态的块需要取消
-
-### 4.4 路径三：管道超时
-
-**触发时机**：`PipelineSchedule.timeout` 配置了超时秒数，且管道运行时间超过该阈值。
+#### 路径三：管道超时（默认 FAILED）
 
 **代码执行顺序**（`schedule()` L302-L307）：
 
 ```python
-# 1. 检测超时
 elif self.__check_pipeline_run_timeout():
-
-    # 2. 确定最终状态：由 timeout_status 配置决定，默认 FAILED
     status = (
         self.pipeline_schedule.timeout_status or PipelineRun.PipelineRunStatus.FAILED
     )
-
-    # 3. 更新管道状态 —— 注意：没有设置 completed_at
+    # 更新管道状态 —— 注意：没有设置 completed_at
     self.pipeline_run.update(status=status)
-
-    # 4. 调用 on_pipeline_run_failure，传入最终状态
+    # 调用 on_pipeline_run_failure，传入最终状态
     self.on_pipeline_run_failure('Pipeline run timed out.', status=status)
 ```
 
-**`on_pipeline_run_failure()` 的差异**：
-- 如果 `status == FAILED`：发送失败通知 + 取消块
-- 如果 `status == CANCELLED`：**不发送通知**，只取消块
+---
 
-**块超时 vs 管道超时的区别**：
+### 4.5 `on_pipeline_run_failure()` 的执行逻辑
 
-| 维度 | 块超时 | 管道超时 |
-|------|-------|---------|
-| 触发位置 | `__check_block_run_timeout()` | `__check_pipeline_run_timeout()` |
-| 配置位置 | 块的 `timeout` 属性 | `PipelineSchedule.timeout` |
-| 最终块状态 | FAILED | 未完成的块 → CANCELLED |
-| 最终管道状态 | 取决于 allow_blocks_to_fail | FAILED / CANCELLED |
-| 通知 | 管道失败时发送 | 取决于最终状态 |
-
-### 4.5 路径四：用户取消 / 内存超限
-
-**触发时机**：
-1. 用户通过 API 主动调用取消
-2. 心跳检测发现内存使用率 ≥ 95%（仅 LOCAL_PYTHON 执行器）
-
-**代码执行顺序**（`stop_pipeline_run()` L1426-L1457）：
+**位置**：`pipeline_scheduler_original.py` L341-L374
 
 ```python
-def stop_pipeline_run(pipeline_run, pipeline=None, status=PipelineRun.PipelineRunStatus.CANCELLED):
-    # 1. 前置检查：仅允许取消 INITIAL 或 RUNNING 状态
-    if pipeline_run.status not in [INITIAL, RUNNING]:
+def on_pipeline_run_failure(self, error_msg, status=PipelineRun.PipelineRunStatus.FAILED):
+    # 1. 记录使用统计
+    UsageStatisticLogger().pipeline_run_ended_sync(self.pipeline_run)
+
+    # 2. 仅当 status == FAILED 时发送失败通知
+    if status == PipelineRun.PipelineRunStatus.FAILED:
+        # 收集失败块的错误堆栈（最多 50 行，超出截断）
+        failed_block_runs = self.pipeline_run.failed_block_runs
+        stacktrace = None
+        for br in failed_block_runs:
+            if br.metrics:
+                message = br.metrics.get('error', {}).get('message')
+                if message:
+                    # 截断到 50 行
+                    ...
+                    stacktrace = f'Error for block {br.block_uuid}:\n{message}'
+                    break
+
+        self.notification_sender.send_pipeline_run_failure_message(
+            pipeline=self.pipeline,
+            pipeline_run=self.pipeline_run,
+            error=error_msg,
+            stacktrace=stacktrace,
+        )
+
+    # 3. 取消所有进行中的块运行 + 终止作业
+    cancel_block_runs_and_jobs(self.pipeline_run, self.pipeline)
+```
+
+**关键逻辑**：
+- `status == FAILED` 时才发送通知，CANCELLED 不发送
+- 总是调用 `cancel_block_runs_and_jobs()`，无论 status 是什么
+- error 参数是简要错误消息，stacktrace 是从第一个失败块的 metrics.error.message 中提取
+
+---
+
+### 4.6 块取消与状态更新详解
+
+**函数**：`cancel_block_runs_and_jobs(pipeline_run, pipeline)`
+
+**位置**：`pipeline_scheduler_original.py` L1460-L1519
+
+```python
+def cancel_block_runs_and_jobs(pipeline_run, pipeline):
+    # 1. 收集需要取消的块
+    block_runs_to_cancel = []
+    running_blocks = []
+    for b in pipeline_run.block_runs:
+        if b.status in [INITIAL, QUEUED, RUNNING]:
+            block_runs_to_cancel.append(b)
+        if b.status == RUNNING:
+            running_blocks.append(b)
+    cancelled_block_run_ids = [b.id for b in block_runs_to_cancel]
+
+    # 2. 批量更新块状态为 CANCELLED —— 注意：不设置 completed_at
+    BlockRun.batch_update_status(
+        cancelled_block_run_ids,
+        BlockRun.BlockRunStatus.CANCELLED,
+    )
+
+    # 3. 终止相关作业
+    if pipeline and (pipeline.type in [INTEGRATION, STREAMING] or pipeline.run_pipeline_in_one_process):
+        # 整体管道作业
+        job_manager.kill_pipeline_run_job(pipeline_run.id)
+        if pipeline.type == INTEGRATION:
+            for stream in pipeline.streams():
+                job_manager.kill_integration_stream_job(...)
+        if pipeline_run.executor_type == K8S:
+            ExecutorFactory.get_pipeline_executor(...).cancel(...)
+    else:
+        # 逐个块作业
+        for b in running_blocks:
+            job_manager.kill_block_run_job(b.id)
+
+    # 4. 入队取消清理作业（执行 on_cancelled 回调）
+    GenericJob.enqueue_cancel_pipeline_run(pipeline_run.id, cancelled_block_run_ids)
+```
+
+**块取消的状态更新细节**：
+- 只取消状态为 INITIAL、QUEUED、RUNNING 的块
+- 已经是 COMPLETED、FAILED、UPSTREAM_FAILED、CONDITION_FAILED 的块不受影响
+- **批量更新为 CANCELLED 时不设置 completed_at**
+- 作业终止只针对 RUNNING 状态的块（running_blocks）
+
+---
+
+### 4.7 取消后清理：`on_pipeline_run_cancelled()`
+
+**位置**：`pipeline_scheduler_original.py` L936-L1008
+
+这是一个异步执行的清理作业，在取消操作入队后执行。
+
+```python
+def on_pipeline_run_cancelled(job_id, pipeline_run_id, cancelled_block_run_ids):
+    # 1. 作业状态检查和标记
+    job = GenericJob.query.get(job_id)
+    if job.status not in [INITIAL, QUEUED, RUNNING]:
+        return
+    job.mark_running()
+
+    # 2. 参数校验
+    if not pipeline_run_id:
+        job.mark_failed(...)
+        return
+    if not cancelled_block_run_ids:
+        job.mark_failed(...)
         return
 
-    # 2. 更新管道状态 —— 注意：没有设置 completed_at
-    pipeline_run.update(status=status)  # 默认 CANCELLED
+    try:
+        # 3. 验证管道运行状态（必须是 CANCELLED）
+        pipeline_run = PipelineRun.query.get(pipeline_run_id)
+        if pipeline_run.status != PipelineRun.PipelineRunStatus.CANCELLED:
+            job.mark_failed(...)
+            return
 
-    # 3. 记录使用统计
-    UsageStatisticLogger().pipeline_run_ended_sync(pipeline_run)
-
-    # 4. 取消所有块运行 + 终止作业（不通过 on_pipeline_run_failure）
-    cancel_block_runs_and_jobs(pipeline_run, pipeline)
+        # 4. 对每个被取消的块执行 on_cancelled 回调
+        for block_run_id in cancelled_block_run_ids:
+            block_run = BlockRun.query.get(block_run_id)
+            if not block_run or block_run.status != BlockRun.BlockRunStatus.CANCELLED:
+                continue
+            ExecutorFactory.get_block_executor(...).execute_callback(
+                callback='on_cancelled',
+                global_vars=pipeline_run.get_variables(),
+                pipeline_run=pipeline_run,
+                block_run_id=block_run_id,
+            )
+    except Exception as e:
+        job.mark_failed(...)
+        return
+    job.mark_completed()
 ```
 
-**与其他路径的关键区别**：
-- **不调用 `on_pipeline_run_failure()`**：直接跳过，不经过该函数
-- **不发送失败通知**：因为不调用 `on_pipeline_run_failure()`，且状态为 CANCELLED
-- **不设置 completed_at**：与路径一、三一致
-
-### 4.6 特殊情况：start() 初始化失败
-
-**触发时机**：`PipelineScheduler.start()` 中创建 BlockRun 时抛出异常。
-
-**代码执行顺序**（`start()` L176-L193）：
-
-```python
-try:
-    # 初始化块运行...
-except Exception as e:
-    error_msg = 'Fail to initialize block runs.'
-    self.logger.exception(error_msg, ...)
-
-    # 更新管道状态 —— 注意：没有设置 completed_at
-    self.pipeline_run.update(status=PipelineRun.PipelineRunStatus.FAILED)
-
-    # 直接发送失败通知（不通过 on_pipeline_run_failure）
-    self.notification_sender.send_pipeline_run_failure_message(
-        pipeline=self.pipeline,
-        pipeline_run=self.pipeline_run,
-        error=error_msg,
-    )
-    return False
-```
-
-**特点**：
-- 不调用 `on_pipeline_run_failure()`，直接发送通知
-- 不调用 `cancel_block_runs_and_jobs()`（块尚未创建成功）
-- 不设置 completed_at
-
-### 4.7 特殊情况：Streaming 管道
-
-**文件**：`mage_ai/data_preparation/executors/streaming_pipeline_executor.py`
-
-Streaming 管道的状态更新走独立路径：
-
-```python
-def __update_pipeline_run_status(self, pipeline_run_id, status, error=None):
-    pipeline_run = PipelineRun.query.get(pipeline_run_id)
-
-    # 注意：始终设置 completed_at
-    pipeline_run.update(
-        status=status,
-        completed_at=datetime.now(tz=pytz.UTC),  # ✅ 始终设置
-    )
-
-    if status == PipelineRun.PipelineRunStatus.FAILED:
-        # 记录统计 + 发送通知
-        notification_sender.send_pipeline_run_failure_message(...)
-```
-
-**特点**：无论 FAILED 还是其他终止状态，**始终设置 `completed_at`**。
+**作用**：执行块的 `on_cancelled` 回调，用于取消后的清理工作。
 
 ---
 
@@ -845,28 +947,86 @@ DictLogger
 
 ## 8. 容易混淆的结论澄清
 
-### ❌ 之前容易混淆的结论
+### 8.1 最容易混淆的 8 个结论
 
-| 混淆点 | 错误理解 | 正确结论 |
-|--------|---------|---------|
-| completed_at | 所有终止状态都会设置 completed_at | **只有全部块结束后失败、正常完成、Streaming 管道**才设置；运行中失败、超时、用户取消**均不设置** |
-| 失败通知 | 只要终止就发送通知 | **只有最终状态为 FAILED**时才发送；CANCELLED 不发送；用户取消不经过 on_pipeline_run_failure |
-| on_pipeline_run_failure | 所有失败路径都调用 | 用户取消（stop_pipeline_run）和 start() 初始化失败**不调用**，直接处理 |
-| 管道超时 | 超时一定是 FAILED 状态 | 由 `timeout_status` 配置决定，**默认 FAILED，可配置为 CANCELLED** |
-| 块取消 | 只有用户取消才取消块 | 所有失败路径（运行中块失败、超时）都会调用 `cancel_block_runs_and_jobs()` 取消进行中的块 |
-| completed_at 缺失 | 不设置 completed_at 是 bug | 目前代码设计如此，但**存在不一致性**—— Streaming 管道始终设置，非 Streaming 管道部分路径不设置 |
+| 混淆点 | 常见错误理解 | 正确结论 |
+|--------|-------------|---------|
+| **CANCELLED 不发通知** | 所有 CANCELLED 状态都不发送通知 | ❌ 不对。**内存超限取消是 CANCELLED 状态，但会发送失败通知**（直接调用 send_pipeline_run_failure_message） |
+| **取消都走同一路径** | 用户取消、超时取消、内存超限取消走相同代码路径 | ❌ 不对。三条路径完全不同：用户取消走 `stop_pipeline_run()`，超时取消走 `on_pipeline_run_failure(status=CANCELLED)`，内存超限走 `memory_usage_failure()` → `stop()` + 单独发通知 |
+| **completed_at 设置** | FAILED 状态都有 completed_at | ❌ 不对。**全部块结束后失败才有 completed_at，运行中块失败没有** |
+| **on_pipeline_run_failure 只处理失败** | 该函数只处理 FAILED 状态 | ❌ 不对。它也处理 CANCELLED（超时取消时），只是 CANCELLED 时跳过通知发送 |
+| **取消就是用户操作** | CANCELLED 状态都是用户主动取消的 | ❌ 不对。CANCELLED 可能来自：用户取消、内存超限、超时配置为 CANCELLED |
+| **块取消只在用户取消时** | 只有用户取消才会取消块 | ❌ 不对。运行中块失败、超时（FAILED/CANCELLED）、内存超限、用户取消**都会调用 `cancel_block_runs_and_jobs()`** |
+| **失败通知都走 on_pipeline_run_failure** | 发送失败通知都经过该函数 | ❌ 不对。内存超限取消、start() 初始化失败、Streaming 管道失败都是直接调用 `send_pipeline_run_failure_message`，不经过 on_pipeline_run_failure |
+| **失败都有 error 和 stacktrace** | 失败通知都包含 error 和 stacktrace | ❌ 不对。内存超限取消的通知只有 summary，没有 error 和 stacktrace |
 
-### ✅ 终止路径 completed_at 设置情况速查表
+---
 
-| 终止路径 | completed_at | 代码位置 |
-|---------|-------------|---------|
-| 正常完成 (COMPLETED) | ✅ 设置 | `PipelineRun.complete()` L1408 |
-| 全部块结束后失败 (FAILED) | ✅ 设置 | `schedule()` L253 |
-| 运行中块失败 (FAILED) | ❌ 未设置 | `schedule()` L309 |
-| 管道超时 (FAILED/CANCELLED) | ❌ 未设置 | `schedule()` L306 |
-| 用户取消 (CANCELLED) | ❌ 未设置 | `stop_pipeline_run()` L1452 |
-| start() 初始化失败 (FAILED) | ❌ 未设置 | `start()` L187 |
-| Streaming 管道任意终止 | ✅ 始终设置 | `streaming_pipeline_executor.py` L289 |
+### 8.2 三种取消路径的对比速查
+
+| 维度 | 用户主动取消 | 内存超限取消 | 超时取消 (CANCELLED) |
+|------|-------------|-------------|---------------------|
+| **入口函数** | API → `cancel_pipeline_runs()` | `memory_usage_failure()` | `schedule()` 超时检测 |
+| **是否调用 stop_pipeline_run** | ✅ 是 | ✅ 是（通过 stop()） | ❌ 否 |
+| **是否调用 on_pipeline_run_failure** | ❌ 否 | ❌ 否 | ✅ 是（status=CANCELLED） |
+| **是否发送失败通知** | ❌ 不发送 | ✅ 发送（summary） | ❌ 不发送 |
+| **通知调用方式** | - | 直接 `send_pipeline_run_failure_message(summary=...)` | - |
+| **completed_at** | ❌ 未设置 | ❌ 未设置 | ❌ 未设置 |
+| **块取消方式** | `cancel_block_runs_and_jobs()` | `cancel_block_runs_and_jobs()` | `cancel_block_runs_and_jobs()` |
+| **最终管道状态** | CANCELLED | CANCELLED | CANCELLED |
+| **是否入队取消清理作业** | ✅ 是 | ✅ 是 | ✅ 是 |
+| **是否记录使用统计** | ✅ 是（stop_pipeline_run 内） | ✅ 是（stop_pipeline_run 内） | ✅ 是（on_pipeline_run_failure 内） |
+
+---
+
+### 8.3 completed_at 设置情况速查（PipelineRun）
+
+| 终止场景 | 最终状态 | completed_at | 代码位置 |
+|---------|---------|-------------|---------|
+| 正常完成 | COMPLETED | ✅ 设置 | `PipelineRun.complete()` L1408 |
+| 全部块结束后失败 | FAILED | ✅ 设置 | `schedule()` L253 |
+| 运行中块失败 | FAILED | ❌ 未设置 | `schedule()` L309 |
+| 管道超时 (默认) | FAILED | ❌ 未设置 | `schedule()` L306 |
+| 管道超时 (配置 CANCELLED) | CANCELLED | ❌ 未设置 | `schedule()` L306 |
+| 用户主动取消 | CANCELLED | ❌ 未设置 | `stop_pipeline_run()` L1452 |
+| 内存超限取消 | CANCELLED | ❌ 未设置 | `stop_pipeline_run()` L1452 |
+| start() 初始化失败 | FAILED | ❌ 未设置 | `start()` L187 |
+| Streaming 管道任意终止 | FAILED / 其他 | ✅ **始终设置** | `streaming_pipeline_executor.py` L289 |
+
+**关键发现**：
+- 非 Streaming 管道中，只有「所有块都已到达终态」的场景才设置 completed_at（正常完成、全部块结束后失败）
+- 运行中被终止的场景（运行中块失败、超时、取消）都不设置 completed_at
+- Streaming 管道走独立路径，始终设置 completed_at
+
+---
+
+### 8.4 BlockRun 的 completed_at 设置情况
+
+| 块终止场景 | 最终状态 | completed_at | 代码位置 |
+|-----------|---------|-------------|---------|
+| 正常完成 | COMPLETED | ✅ 设置 | `on_block_complete()` L392 |
+| 执行失败 | FAILED | ❌ **未设置** | `on_block_failure()` L450-453 |
+| 被批量取消 | CANCELLED | ❌ **未设置** | `BlockRun.batch_update_status()` |
+| 上游失败 | UPSTREAM_FAILED | ❌ 未设置 | `update_block_run_statuses()` |
+| 条件失败 | CONDITION_FAILED | ❌ 未设置 | `update_block_run_statuses()` |
+
+**注意**：BlockRun 的 FAILED 和 CANCELLED 状态都**不设置 completed_at**，只有 COMPLETED 才设置。这与 PipelineRun 的行为一致——被中断/失败的都不记录结束时间。
+
+---
+
+### 8.5 失败通知发送路径汇总
+
+| 场景 | 状态 | 是否发送 | 调用路径 | 通知内容 |
+|------|------|---------|---------|---------|
+| 全部块结束后失败 | FAILED | ✅ 发送 | `on_pipeline_run_failure()` → `send_pipeline_run_failure_message` | error + stacktrace |
+| 运行中块失败 | FAILED | ✅ 发送 | `on_pipeline_run_failure()` → `send_pipeline_run_failure_message` | error + stacktrace |
+| 管道超时 (FAILED) | FAILED | ✅ 发送 | `on_pipeline_run_failure()` → `send_pipeline_run_failure_message` | error + stacktrace |
+| 管道超时 (CANCELLED) | CANCELLED | ❌ 不发送 | - | - |
+| 用户取消 | CANCELLED | ❌ 不发送 | - | - |
+| 内存超限取消 | CANCELLED | ✅ 发送 | 直接 `send_pipeline_run_failure_message(summary=...)` | summary（无 error/stacktrace） |
+| start() 初始化失败 | FAILED | ✅ 发送 | 直接 `send_pipeline_run_failure_message(error=...)` | error（无 stacktrace） |
+| Streaming 管道失败 | FAILED | ✅ 发送 | 直接 `send_pipeline_run_failure_message` | error + stacktrace |
+| 正常完成 | COMPLETED | ✅ 成功通知 | `send_pipeline_run_success_message` | 成功消息 |
 
 ---
 
@@ -881,31 +1041,47 @@ DictLogger
 5. **分布式锁**：防止并发调度冲突，保证状态一致性
 6. **细粒度并发控制**：支持管道级别的块并发数限制
 7. **丰富的可观测性**：metrics 字段支持收集详细的运行指标
+8. **取消后回调机制**：通过 `on_pipeline_run_cancelled` 异步作业执行块的 `on_cancelled` 回调
 
 ### 9.2 可改进点
 
 **问题1：completed_at 设置不一致**
 
-非 Streaming 管道的多条终止路径不设置 `completed_at`，导致：
-- 无法准确计算运行时长
-- 数据统计不完整
+多个终止路径不设置 `completed_at`，导致：
+- 无法准确计算运行时长（只能用 started_at + 当前时间估算）
+- 数据统计和分析不完整
 - Streaming 与非 Streaming 管道行为不一致
 
-涉及位置：
+涉及的不设置位置：
 - `schedule()` L309（运行中块失败）
-- `schedule()` L306（管道超时）
-- `stop_pipeline_run()` L1452（用户取消）
+- `schedule()` L306（管道超时，FAILED 和 CANCELLED）
+- `stop_pipeline_run()` L1452（用户取消、内存超限取消）
 - `start()` L187（初始化失败）
+- `BlockRun.batch_update_status()`（块取消）
+- `on_block_failure()`（块失败）
 
-建议统一在所有终止路径设置 `completed_at`。
+建议：在所有终止路径统一设置 `completed_at`，保持数据一致性。
 
-**问题2：取消时没有超时通知的选项**
+**问题2：取消路径不统一，逻辑分散**
 
-用户取消和 CANCELLED 状态的超时完全不发送通知，但某些场景下可能需要告警。可以考虑增加配置项。
+三种取消路径（用户取消、内存超限、超时取消）走的代码分支完全不同，通知行为也不一致：
+- 用户取消：不发通知
+- 内存超限：发通知（summary）
+- 超时取消（CANCELLED）：不发通知
 
-**问题3：on_pipeline_run_failure 直接取消块，未区分是否需要取消**
+建议：统一取消处理逻辑，增加配置项控制是否发送取消通知。
 
-该函数总是调用 `cancel_block_runs_and_jobs()`，即使在"全部块结束后失败"场景下没有需要取消的块，也会做一次遍历。虽然影响不大，但逻辑上可以更清晰。
+**问题3：on_pipeline_run_failure 命名有歧义**
+
+该函数名暗示只处理失败，但实际上它也处理 CANCELLED 状态（超时取消时）。只是 CANCELLED 时跳过通知发送，但仍然会执行 `cancel_block_runs_and_jobs()`。更准确的命名可能是 `on_pipeline_run_terminated()` 或 `handle_pipeline_run_end()`。
+
+**问题4：BlockRun 的 FAILED 状态没有 completed_at**
+
+块失败时不设置 completed_at，但块的运行时长是可以计算的（started_at 到失败时间）。这使得无法准确统计失败块的执行时长。
+
+**问题5：内存超限取消的通知内容不完整**
+
+内存超限取消发送的失败通知只有 summary，没有 error 和 stacktrace。如果用户习惯在失败通知中查找错误信息，可能会困惑。建议统一通知格式，或明确标记为"取消通知"而非"失败通知"。
 
 ---
 
