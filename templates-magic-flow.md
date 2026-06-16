@@ -153,7 +153,59 @@ WebSocketServer.running_executions_mapping[msg_id] = value  # 记录 block_uuid 
 
 ### 3.2 新路径：REST API → Magic Kernel
 
-核心逻辑在 `mage_ai/api/resources/CodeExecutionResource.py`：
+核心逻辑在 `mage_ai/api/resources/CodeExecutionResource.py`。
+
+#### 3.2.1 双通道架构：REST 提交 + SSE 接收
+
+Magic Kernel 路径采用 **「REST 提交任务 + SSE 推送结果」** 的双通道模式，与 Jupyter 路径的单 WebSocket 通道不同：
+
+```
+前端 (useEventStreams Hook)
+    │
+    ├─► sendMessage() ──────────────────► POST /api/code_executions
+    │     (React Query mutation)              CodeExecutionResource.create()
+    │          │                                   │
+    │          │ 同步返回 ProcessDetails          └─► kernel.run(message) ──► 进程池执行
+    │          │
+    │          └─► 存入 messages 数组（仅用于追踪提交记录）
+    │
+    └─► EventSource ──────────────────► GET /events/stream/{uuid}
+          (浏览器原生 API)                EventStreamHandler.get()
+          onmessage ◄───────────────────── SSE 长连接，每 0.1s 轮询队列
+              │
+              └─► 追加到 events 数组（所有 ExecutionResult）
+```
+
+前端 Hook 定义于 `mage_ai/frontend/utils/server/events/useEventStreams.ts`：
+
+```typescript
+// 发送通道：REST API
+const sendMessage = (payload: { message: string }) => {
+  return api.code_executions.useCreate()({
+    code_execution: {
+      message: payload.message,
+      message_request_uuid: getNewUUID(),
+      timestamp: Number(new Date()),
+      uuid,
+    },
+  });
+};
+
+// 接收通道：SSE
+useEffect(() => {
+  eventSourceRef.current = new EventSource(getEventStreamsUrl(uuid));
+  eventSource.onmessage = (event) => {
+    const eventData = JSON.parse(event.data);
+    if (eventData.uuid === uuid) {
+      setEvents(prevData => [...prevData, eventData]);
+    }
+  };
+}, [uuid]);
+```
+
+**重连机制**：连接断开后自动指数退避重连（默认最多 10 次），重连间隔 = `(重连次数 + 1) * 1000ms`。
+
+#### 3.2.2 代码提交
 
 ```python
 class CodeExecutionResource(GenericResource):
@@ -181,6 +233,7 @@ class CodeExecutionResource(GenericResource):
 | **代码预处理** | `add_execution_code` + `add_internal_output_info`（重包装） | 无预处理，直接执行 |
 | **执行方式** | `KernelClient.execute(code)` → ipykernel | `kernel.run(message)` → 进程池 exec |
 | **上下文** | Jupyter kernel 维护持久命名空间 | 每次执行独立 `exec_globals = {}` |
+| **结果通道** | WebSocket（双向，同一条连接） | SSE（单向推送，独立长连接） |
 | **适用场景** | 交互式 Notebook（主路径） | 隔离执行/并发任务 |
 
 ---
@@ -231,35 +284,89 @@ client.write_message(json.dumps(message_final))  ← WebSocket 推送到浏览�
 
 ### 4.2 Magic Kernel 路径的状态回传
 
+#### 4.2.1 三层队列架构
+
+Magic Kernel 的状态回传经过 **三层队列 + 一个桥接线程**：
+
 ```
-子进程（Pool worker）
-    │
-    │ execute_code_async() 逐条 put 到 read_queue
-    │   - ExecutionResult(STDOUT, RUNNING)   ← 实时 print 输出
-    │   - ExecutionResult(DATA, SUCCESS)     ← 最终求值结果
-    │   - ExecutionResult(STATUS, READY)     ← 内核就绪
-    │   - ExecutionResult(STATUS, ERROR)     ← 异常
-    │   - None                               ← 哨兵
-    ▼
-ReaderThread（主进程 daemon 线程）
-    │
-    │ read_queue.get() → write_queue.put()
-    │ 定义于 mage_ai/kernels/magic/threads/reader.py
-    ▼
-全局 execution_result_queue[uuid]
-    │ 定义于 mage_ai/kernels/magic/queues/manager.py
-    │
-    │ EventStreamHandler.get(uuid)
-    │ 定义于 mage_ai/server/events/stream.py
-    │ SSE (Server-Sent Events) 长轮询：
-    │   while True:
-    │     queue.get_nowait() → EventStream.load(...) → self.write(f'data: {json}\n\n')
-    │     asyncio.sleep(0.1)
-    ▼
-浏览器 EventSource API 接收
+    子进程（Pool worker）
+         │
+         │  queue.put(ExecutionResult)   ← 执行代码时逐条写入
+         │  queue.put(None)               ← 最后放哨兵（仅在 read_queue 内有效）
+         ▼
+    ┌───────────────────────┐
+    │ read_queue            │  跨进程队列（SyncManager.QueueProxy）
+    │ (multiprocessing.Queue)│
+    └───────────┬───────────┘
+                │
+                │  ReaderThread（daemon 线程）
+                │  read_queue.get() → if result is not None → write_queue.put(result)
+                │  None 被过滤，不转发
+                ▼
+    ┌───────────────────────┐
+    │ write_queue           │  主进程内队列（FasterQueue）
+    │ (FasterQueue)         │  全局 execution_result_queue[uuid]
+    └───────────┬───────────┘
+                │
+                │  EventStreamHandler.get()
+                │  while True: queue.get_nowait() → EventStream → self.write()
+                │  每 0.1s 轮询一次
+                ▼
+    浏览器 EventSource.onmessage
 ```
 
-**EventStream 消息结构**：
+#### 4.2.2 None 哨兵的消费边界
+
+**None 哨兵只在 read_queue 层存在，不会流向下游**：
+
+| 队列层级 | 是否含 None | 作用 |
+|---------|------------|------|
+| read_queue（跨进程） | ✅ 是 | 标记单次执行流结束，让消费者知道"这次执行的输出完了" |
+| write_queue（主进程） | ❌ 否 | ReaderThread 中 `if result is not None:` 过滤掉 |
+| SSE（前端） | ❌ 否 | 永远收不到 None，通过状态消息判断结束 |
+
+ReaderThread 过滤逻辑（`mage_ai/kernels/magic/threads/reader.py`）：
+
+```python
+result = read_queue.get()
+if result is not None:       # ← None 在此被过滤
+    write_queue.put(result)
+```
+
+> **关键修正**：None 哨兵不是给前端/外层用的，它只在「子进程 → ReaderThread」这一跳中传递，用于标记单次执行输出流的结束。外层（write_queue 及之后）通过 `ExecutionStatus.READY / ERROR / CANCELLED` 状态消息判断执行结束。
+
+#### 4.2.3 main_queue：另一个内部信号
+
+除了 read_queue / write_queue 这对「数据队列」，还有一个独立的 **main_queue**（仅传 uuid 字符串），在两处被写入：
+
+1. `read_stdout_continuously` 中每输出一行 stdout 就 `main_queue.put(uuid)`
+2. `execute_code_async` 的 finally 块中 `main_queue.put(uuid)`
+
+> 这是一个**内部通知信号**，用于唤醒外部消费者（如日志收集器、状态监控器）"这个 kernel 有新动态"，不承载 ExecutionResult 数据。它只在内部队列流转，不会推送到浏览器。
+
+#### 4.2.4 哪些状态会到浏览器？哪些只在内部？
+
+**所有 ExecutionResult 状态都会推送到浏览器**，没有"只在内部流转"的 ExecutionResult：
+
+| ExecutionResult 状态 | ResultType | 是否到浏览器 | 说明 |
+|---------------------|-----------|-------------|------|
+| `RUNNING` | `STDOUT` | ✅ 是 | 实时 print 输出（逐行） |
+| `RUNNING` | `STATUS` | ✅ 是 | exec 完成后发出的"正在运行中"状态 |
+| `SUCCESS` | `DATA` | ✅ 是 | 最后表达式求值结果 |
+| `READY` | `STATUS` | ✅ 是 | 执行完成，内核就绪 |
+| `CANCELLED` | `STATUS` | ✅ 是 | 用户中断（含 ErrorDetails） |
+| `ERROR` | `STATUS` | ✅ 是 | 执行异常（含 ErrorDetails） |
+
+**仅在内部流转的信号**：
+
+| 信号 | 载体 | 流转范围 |
+|-----|------|---------|
+| None 哨兵 | read_queue | 子进程 → ReaderThread 之间 |
+| main_queue 通知 | uuid 字符串 | 子进程内部（预留接口） |
+
+#### 4.2.5 EventStream 消息结构
+
+推送到浏览器的每条 SSE 消息都包装成 `EventStream` 对象：
 
 ```json
 {
@@ -284,6 +391,7 @@ ReaderThread（主进程 daemon 线程）
 | **传输协议** | WebSocket（双向） | SSE（单向推送） |
 | **推送频率** | 1s 轮询 iopub | 0.1s 轮询队列 |
 | **消息映射** | `msg_id → block_uuid`（内存字典） | `uuid → FasterQueue`（全局字典） |
+| **结束标记** | `execution_state: idle` | `ExecutionStatus.READY / ERROR / CANCELLED` |
 | **错误过滤** | `format_error()` 去除内部堆栈 | `ErrorDetails.from_current_error()` 保留完整堆栈 |
 | **敏感数据** | `filter_out_env_var_values()` | 无额外过滤 |
 
@@ -383,92 +491,105 @@ if not valid or DISABLE_NOTEBOOK_EDIT_ACCESS == 1:
 
 ### 5.2 Magic Kernel 路径的错误处理
 
-#### 5.2.1 代码执行层（execution.py）
+Magic Kernel 的错误处理是 **四层防御 + 协作式取消**，每层各有职责。
 
-核心逻辑在 `mage_ai/kernels/magic/execution.py` 的 `execute_code_async` 函数：
+#### 5.2.1 第 1 层：代码执行层（execution.py）
+
+这是最核心的一层，在 `execute_code_async` 函数内：
 
 ```python
 try:
-    async with context:
-        await self.__execute_code_async(...)
-        queue.put(
-            ExecutionResult.load(
-                process=process,
-                status=ExecutionStatus.READY,
-                type=ResultType.STATUS,
-                uuid=uuid,
-            )
-        )
+    compiled_code = compile(message, '<string>', 'exec')
+    async_stdout = AsyncStdout()
+    
+    reader_thread = Thread(target=read_stdout_continuously, ...)
+    reader_thread.start()
+
+    with redirect_stdout(async_stdout):
+        exec(compiled_code, exec_globals)                 # 执行用户代码
+        if any(stop_event.is_set() for stop_event in stop_events):
+            raise StopAsyncIteration                      # 【关键】代码执行完毕后才检查取消
+        queue.put(ExecutionResult(RUNNING, STATUS))       # exec 完成，发"运行中"状态
+
+    stop_event_read.set()                                  # 停止 stdout 读取线程
+    reader_thread.join(timeout=0.5)
+
+    # 求值最后一条表达式
+    last_expr = code_lines[-1].strip()
+    if last_expr and not last_expr.startswith('#'):
+        compiled_expr = compile(last_expr, '<string>', 'eval')
+        output = eval(compiled_expr, exec_globals)
+        last_output = output
+
+    queue.put(ExecutionResult(SUCCESS, DATA, output=last_output))
+    queue.put(ExecutionResult(READY, STATUS))             # 执行完成
+
 except StopAsyncIteration as err:
-    # 用户主动中断
-    queue.put(
-        ExecutionResult.load(
-            error=ErrorDetails.from_current_error(err),
-            process=process,
-            status=ExecutionStatus.CANCELLED,
-            type=ResultType.STATUS,
-            uuid=uuid,
-        )
-    )
+    # 协作式取消：代码执行完后发现 stop_event 已置位
+    queue.put(ExecutionResult(CANCELLED, STATUS, error=ErrorDetails.from_current_error(err)))
+
 except Exception as err:
-    # 执行异常
-    queue.put(
-        ExecutionResult.load(
-            error=ErrorDetails.from_current_error(err),
-            process=process,
-            status=ExecutionStatus.ERROR,
-            type=ResultType.STATUS,
-            uuid=uuid,
-        )
-    )
+    # 用户代码异常或编译错误
+    queue.put(ExecutionResult(ERROR, STATUS, error=ErrorDetails.from_current_error(err)))
+
 finally:
-    # 无论成功失败，通知消费端
     if main_queue is not None:
-        main_queue.put(uuid)
-    queue.put(None)  # 哨兵值，标记输出结束
+        main_queue.put(uuid)    # 通知内部监控
+    queue.put(None)             # 哨兵：read_queue 层的流结束标记
 ```
 
-| 异常类型 | 状态 | 错误回传 |
-|---------|------|---------|
-| `StopAsyncIteration`（用户中断） | `CANCELLED` | `ErrorDetails.from_current_error(err)` |
-| 其他 `Exception` | `ERROR` | `ErrorDetails.from_current_error(err)` 完整堆栈 |
-| finally 块 | — | `main_queue.put(uuid)` + `queue.put(None)` 确保消费端不被阻塞 |
+**关键修正：StopAsyncIteration 的触发时机**
 
-#### 5.2.2 进程池提交层（process.py）
+| 误解 | 实际情况 |
+|-----|---------|
+| ❌ 执行过程中随时可中断 | ✅ **协作式取消**：只在 `exec()` 完成后检查一次 `stop_event`，如果已置位才抛 `StopAsyncIteration` |
+| ❌ 正在运行的 long-running 代码能被打断 | ✅ 不能，必须等 `exec()` 返回。如果用户代码是死循环，取消信号不会生效 |
+| ❌ stop_event 是抢占式中断信号 | ✅ 是状态标志位，需要被执行代码主动检查 |
+
+> 简单说：StopAsyncIteration 表示「用户要求取消，而且代码刚好用完了 CPU 时间片检查了一下，发现要取消就抛异常退出」，不是强制中断。
+
+**异常发生时 reader_thread 的状态**：
+
+如果在 try 块内（exec 过程中）抛出异常，`stop_event_read.set()` 和 `reader_thread.join()` **不会被执行**（因为它们在 try 块的后半段）。但由于整个子进程会退出，reader_thread 作为 daemon 线程也会随之终止，不会造成资源泄漏。
+
+#### 5.2.2 第 2 层：进程池提交层（process.py）
 
 ```python
 def execute_message(...):
     try:
-        asyncio.run(execute_code_async(...))  # 子进程内跑 asyncio 事件循环
+        asyncio.run(execute_code_async(...))   # 子进程内跑 asyncio 事件循环
     except Exception as err:
-        print(f'[Process.execute_code:{uuid}] Error: {err}')  # 极端兜底：子进程内异常只打印日志
+        print(f'[Process.execute_code:{uuid}] Error: {err}')  # 仅打印日志，不回传队列
 ```
 
-这是最外层的「防御式打印」，理论上不会触发（因为 execute_code_async 内部已全量捕获），但防止 asyncio.run 本身抛错导致 worker 进程无声崩溃。
+这是最外层的「防御式打印」，理论上不会触发（因为 execute_code_async 内部已全量捕获）。如果触发，说明 `asyncio.run` 或事件循环本身出了问题——这种情况下子进程可能已经无法正常往队列写消息了，所以只往 stdout 打印兜底日志。
 
-#### 5.2.3 ReaderThread 桥接层（threads/reader.py）
+#### 5.2.3 第 3 层：ReaderThread 桥接层
 
 ```python
 try:
     while not stop_event.is_set():
-        result = read_queue.get(timeout=0.1)
+        result = read_queue.get()
         if result is not None:
             write_queue.put(result)
 except Empty:
     pass                              # 空队列正常
 except Exception as err:
     if is_debug():
-        print(f'[ReaderThread] ERROR: {err}')  # 不 kill 线程
+        print(f'[ReaderThread] ERROR: {err}')  # 不 kill 线程，继续循环
 ```
 
-#### 5.2.4 Kernel 管理层
+桥接层容错：单条消息解析失败不影响后续消息，线程继续运行。
+
+#### 5.2.4 第 4 层：Kernel 管理层
 
 | 场景 | 处理 |
 |-----|------|
-| 终止超时（10s） | `force_terminate()` 暴力杀进程 |
-| 终止后清理 Lock | `acquire(blocking=False)` 非阻塞尝试，失败则跳过 |
-| 查询已死进程状态 | `psutil.NoSuchProcess` → 跳过 |
-| drain 写队列 | 只清除当前 uuid 消息，其他 uuid 回推 |
+| 终止超时（10s） | `force_terminate()` 暴力杀进程（遍历 pool._pool 逐一 terminate） |
+| 终止后清理 Lock | `acquire(blocking=False)` 非阻塞尝试，失败则跳过 + 日志 |
+| 查询已死进程状态 | `psutil.NoSuchProcess` → 跳过该进程 |
+| drain 写队列 | 只清除当前 uuid 消息，其他 uuid 回推（避免影响其他 Kernel） |
+| drain 读队列 | `get_nowait()` 循环直到 Empty，全部丢弃 |
 
 ### 5.3 execute_custom_code 内部的错误处理
 
@@ -496,27 +617,35 @@ except Exception as err:
 
 2. 编辑代码 ───────────► (前端本地编辑，未提交)
 
-3. 点击运行 ───────────► WebSocket.on_message()
-                         │
-                         ├─► 获取 block.content / custom_code
-                         ├─► add_execution_code() 包装
-                         │   （嵌入 execute_custom_code.py）
-                         ├─► add_internal_output_info() 追加
-                         │   （嵌入 custom_output.py）
-                         │
-                         ├─► [Jupyter 路径]
-                         │   client.execute(code) ──────► ipykernel 执行
-                         │                                  │
-                         │   get_messages() ◄────────────── iopub 回传
-                         │   parse_output_message()
-                         │   WebSocketServer.send_message()
-                         │   client.write_message() ────► 前端显示输出
-                         │
-                         └─► [Magic 路径]
-                             kernel.run(message) ────────► 进程池 exec
-                                                            │
-                             EventStreamHandler ◄────────── ReaderThread 桥接
-                             SSE 推送 ──────────────────────► 前端显示输出
+3. 点击运行 ────────────┬─────────────────────────────── Jupyter 路径
+                        │  WebSocket.on_message()
+                        │  ├─► 获取 block.content / custom_code
+                        │  ├─► add_execution_code() 包装
+                        │  ├─► add_internal_output_info() 追加
+                        │  └─► client.execute(code) ────► ipykernel 执行
+                        │                                    │
+                        │  get_messages() ◄─────────────── iopub 回传
+                        │  parse_output_message()
+                        │  WebSocketServer.send_message()
+                        │  client.write_message() ───────► 前端显示输出
+                        │
+                        └─────────────────────────────── Magic 路径
+                           POST /api/code_executions
+                           └─► kernel.run(message) ───────► 进程池 exec
+                                                                 │
+                                                                 ├─► stdout 逐行 → read_queue
+                                                                 ├─► RUNNING STATUS 消息
+                                                                 ├─► SUCCESS DATA / ERROR / CANCELLED
+                                                                 └─► None 哨兵（仅 read_queue）
+                                                                     │
+                           ReaderThread ◄───────────────────────────┘
+                           过滤 None，转发到 write_queue
+                                │
+                           EventStreamHandler SSE ◄────────────────┘
+                           每 0.1s 轮询，包装成 EventStream 推送
+                                ▼
+                           前端 EventSource.onmessage
+                           追加到 events 数组显示
 
 4. 出错时 ◄──────────── error 消息
                          │
@@ -560,6 +689,7 @@ client.execute() ──► 完整可执行代码字符串
 | **代码可见性** | 经过 `add_execution_code` + `add_internal_output_info` 重包装 | 原样传入 `kernel.run(message)` |
 | **命名空间** | 单一持久命名空间（跨执行共享变量） | 每次执行独立 `exec_globals = {}` |
 | **输出格式化** | Jupyter 消息协议 + `parse_output_message` + `format_error` | `ExecutionResult` 数据类 + SSE |
+| **取消语义** | Jupyter 内核级 interrupt（可中断运行中的代码） | 协作式取消（仅 exec 完成后检查 stop_event） |
 | **当前定位** | 主路径（Notebook 交互） | 实验性路径（独立并发执行） |
 
 ### 7.3 错误回传的层次差异
@@ -578,7 +708,15 @@ client.execute() ──► 完整可执行代码字符串
 
 **Jupyter**：通过 `msg_id` 关联，`running_executions_mapping[msg_id] = {block_uuid, block_type}`，确保多次执行的输出不会混淆。
 
-**Magic**：通过 `uuid`（kernel ID）分区，`execution_result_queue[uuid]` 是每个 kernel 独立的 `FasterQueue`，`EventStreamHandler` 按 URL 中的 uuid 取对应队列。`None` 哨兵标记单次执行流的结束。
+**Magic**：通过 `uuid`（kernel ID）分区，`execution_result_queue[uuid]` 是每个 kernel 独立的 `FasterQueue`，`EventStreamHandler` 按 URL 中的 uuid 取对应队列。None 哨兵标记单次执行流在 read_queue 层的结束。
+
+### 7.5 None 哨兵的设计取舍
+
+为什么用 None 只在 read_queue 层做结束标记，而不是一路传到前端？
+
+- **跨进程边界需要明确的帧边界**：子进程写、父进程读，需要一个"这条消息流结束了"的标记，否则 ReaderThread 不知道一条执行的输出何时结束
+- **上层有更好的状态机制**：write_queue 及之后的层级通过 `ExecutionStatus` 枚举（READY/ERROR/CANCELLED）来判断结束，语义更清晰
+- **单一职责**：哨兵是队列协议的一部分，不应该泄漏到业务层
 
 ---
 
@@ -594,10 +732,13 @@ client.execute() ──► 完整可执行代码字符串
 ### 状态回传
 1. Jupyter 路径 `format_error` 逻辑：搜索 `def format_error(`
 2. Jupyter 路径 `parse_output_message`：在 kernel_output_parser.py 中搜索函数名
-3. Magic 路径 `ReaderThread` 桥接：在 threads/reader.py 中搜索 `read_queue_and_forward_results`
+3. Magic 路径 `ReaderThread` 桥接 + None 过滤：在 threads/reader.py 中搜索 `read_queue_and_forward_results`，观察 `if result is not None:`
 4. Magic 路径 SSE 推送：在 events/stream.py 中搜索 `EventStreamHandler`
+5. 前端双通道 Hook：在 frontend/utils/server/events/useEventStreams.ts 中搜索 `useEventStreams`
 
 ### 出错处理
 1. Jupyter 路径 `execute_custom_code.py` 框架代码：文件中搜索 `def execute_custom_code`
 2. Magic 路径 `execute_code_async` 的 try/except/finally：在 execution.py 中搜索 `except StopAsyncIteration`
-3. Magic 路径 `None` 哨兵：在 execution.py 末尾搜索 `queue.put(None)`
+3. Magic 路径 StopAsyncIteration 触发点：在 execution.py 中搜索 `raise StopAsyncIteration`，确认它在 `exec()` 之后
+4. Magic 路径 None 哨兵：在 execution.py 末尾搜索 `queue.put(None)`
+5. Magic 路径外层兜底：在 process.py 中搜索 `def execute_message`，观察外层 try/except
