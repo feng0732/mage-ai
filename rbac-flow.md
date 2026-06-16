@@ -676,9 +676,237 @@ RESERVED_ENTITY_NAMES = [
 
 ---
 
-## 五、多租户隔离机制对比
+## 五、资源类型与数据层隔离分类
 
-### 5.1 旧模式下的多租户
+数据层的项目隔离并非对所有资源一视同仁。不同资源类型的数据存储方式、查询路径、隔离机制差异很大。以下按六大类别分别说明。
+
+### 5.1 第一类：文件系统存储 + repo_path 过滤
+
+**代表资源**：Pipeline, Block, File, Widget, Variable, Schedule（YAML文件）, CustomTemplate 等
+
+**数据存储**：文件系统，数据物理分布在各项目目录下
+
+**隔离机制**：通过 `get_repo_path()` 确定当前项目根路径，所有文件读写都限制在该目录下
+
+**代码位置**：
+- `mage_ai/api/resources/PipelineResource.py` [L204]: `Pipeline.get_all_pipelines(repo_path=repo_path)`
+- `mage_ai/settings/repo.py` [L34-L64]: `get_repo_path()` 确定当前项目路径
+- `mage_ai/server/server.py` [L784]: 服务器启动时 `set_repo_path(project)`
+
+**特点**：
+- ✅ **物理隔离最可靠**：数据文件本身就在不同目录下
+- ✅ 权限系统失效也不会泄漏其他项目数据
+- ⚠️ 依赖 repo_path 的正确设置，如果路径被篡改可能越界
+- ⚠️ `repo_path is None` 的 OR 条件可能泄漏无主记录
+
+**典型查询**：
+```python
+# PipelineResource.collection 中
+repo_path = get_repo_path()
+pipeline_uuids = Pipeline.get_all_pipelines(repo_path=repo_path)
+```
+
+**策略层 entity 定义**：通常定义了 `entity` 属性，返回 `Entity.PIPELINE, pipeline_uuid` 或 `Entity.PROJECT, project_uuid`
+
+---
+
+### 5.2 第二类：数据库存储 + repo_path 字段过滤（repo_query）
+
+**代表资源**：PipelineSchedule, Secret, Backfill 等
+
+**数据存储**：数据库表，每条记录有 `repo_path` / `repo_name` 字段
+
+**隔离机制**：通过 `repo_query` 类属性自动过滤，SQL 条件为 `repo_path == current_repo_path OR repo_path IS NULL`
+
+**代码位置**：
+- `mage_ai/orchestration/db/models/schedules.py` [L112-L121]: `PipelineSchedule.repo_query`
+- `mage_ai/orchestration/db/models/secrets.py` [L19-L26]: `Secret.repo_query`
+- `mage_ai/api/resources/PipelineScheduleResource.py` [L80-L83]: 非项目平台模式下使用 `repo_query`
+
+**特点**：
+- ✅ 数据库级过滤，相对可靠
+- ⚠️ `repo_path IS NULL` 的 OR 条件会包含"全局"记录
+- ⚠️ 如果忘记使用 `repo_query` 而直接用 `.query`，会返回全部数据
+
+**典型查询**：
+```python
+@classproperty
+def repo_query(cls):
+    return cls.query.filter(
+        or_(
+            PipelineSchedule.repo_path == get_repo_path(),
+            PipelineSchedule.repo_path.is_(None),
+        )
+    )
+```
+
+**策略层 entity 定义**：部分资源（如 PipelineRun）定义了 `entity` 属性，部分没有。
+
+---
+
+### 5.3 第三类：数据库存储 + 关联表间接隔离
+
+**代表资源**：PipelineRun, BlockRun, Output 等运行时数据
+
+**数据存储**：数据库表，通过 `pipeline_schedule_id` 或 `pipeline_uuid` 关联到项目
+
+**隔离机制**：不直接按 repo_path 过滤，而是先获取当前项目的 schedule/pipeline ID 列表，再用 `IN` 子查询过滤
+
+**代码位置**：
+- `mage_ai/api/resources/PipelineRunResource.py` [L99, L135-L136]:
+  ```python
+  repo_pipeline_schedule_ids = [s.id for s in PipelineSchedule.repo_query]
+  query = query.filter(PipelineRun.pipeline_schedule_id.in_(repo_pipeline_schedule_ids))
+  ```
+
+**特点**：
+- ✅ 间接隔离，依赖上游的 repo_query 正确性
+- ⚠️ 多一层关联，性能较差
+- ⚠️ 存在 `include_all_pipeline_schedules` 参数可以绕过过滤
+- ⚠️ 如果上游 schedule 数据被污染，下游 run 数据也会泄漏
+
+**典型绕过风险**：
+```python
+include_all_pipeline_schedules = query_arg.get('include_all_pipeline_schedules', [None])
+if not include_all_pipeline_schedules:
+    query = query.filter(PipelineRun.pipeline_schedule_id.in_(repo_pipeline_schedule_ids))
+# 如果传了 include_all_pipeline_schedules 参数，就不过滤了 ⚠️
+```
+
+---
+
+### 5.4 第四类：权限管理资源（全局数据库 + entity 字段）
+
+**代表资源**：Role, Permission, User, UserRole, RolePermission
+
+**数据存储**：全局数据库表，**没有项目字段**，通过 `entity` + `entity_id` 字段关联到各层级
+
+**隔离机制**：
+- **LIST 默认不过滤**：`Role.query.all()` / `Permission.query.all()` 返回所有记录
+- **查询参数可过滤**：通过 `?entity=project&entity_ids[]=uuid1,uuid2` 参数过滤
+- **权限检查时匹配**：使用时通过 entity + entity_id 匹配
+
+**代码位置**：
+- `mage_ai/api/resources/RoleResource.py` [L15-L47]: collection 方法
+  - 默认：`Role.query.all()`（全部返回）
+  - 传了 entity 参数：按 entity + entity_ids 过滤
+  - 传了 limit_roles 参数：按当前项目 access 位过滤
+- `mage_ai/api/resources/PermissionResource.py` [L12-L33]: 直接使用父类 DatabaseResource.collection
+- `mage_ai/api/resources/UserResource.py` [L27-L37]: 管理员过滤掉 owner
+
+**策略层行为**：
+- 策略类很简单，通常只有 `pass`
+- 使用旧模式条件：`has_at_least_viewer_role()` / `has_at_least_admin_role()`
+- **不使用**细粒度权限模式的 entity_name 匹配
+
+**特点**：
+- ❌ **LIST 接口默认返回全局所有数据**，没有项目隔离
+- ⚠️ 依赖前端正确传 `entity` / `entity_ids` 参数来过滤
+- ⚠️ 普通用户可以看到所有角色/权限的定义
+- ⚠️ 权限定义本身不是机密，但用户分配关系可能敏感
+- ✅ 权限**使用**时通过 entity_id 匹配，不会错用其他项目的权限
+
+**典型 LIST 行为**：
+```python
+# RoleResource.collection 默认行为
+roles = Role.query.all()  # 返回所有角色，不限项目
+
+# 传了 entity=project 参数后
+permissions_query = Permission.query.filter(Permission.entity == entity)
+if entity != Entity.GLOBAL and entity_ids:
+    permissions_query = permissions_query.filter(Permission.entity_id.in_(entity_ids))
+```
+
+---
+
+### 5.5 第五类：工作空间与集群管理资源
+
+**代表资源**：Workspace, Cluster, ComputeCluster 等
+
+**数据存储**：不来自数据库，来自集群管理系统（Kubernetes API、云服务商 API 等）
+
+**隔离机制**：
+- 通过 `cluster_type` / `namespace` 等集群级概念隔离
+- 项目类型校验（只有 MAIN 项目可以管理工作空间）
+- `verify_project()` 方法验证子项目是否存在
+
+**代码位置**：
+- `mage_ai/api/resources/WorkspaceResource.py` [L27-L67]: collection 方法
+- `mage_ai/api/resources/WorkspaceResource.py` [L158-L179]: `verify_project()` 验证
+
+**特点**：
+- ✅ 集群级隔离，物理上分开
+- ⚠️ 工作空间与项目是 1:1 对应关系
+- ⚠️ 只有 MAIN 项目类型可以管理工作空间
+
+**典型验证逻辑**：
+```python
+def verify_project(self, subproject=None, user=None):
+    project_type = get_project_type()
+    if project_type != ProjectType.MAIN:
+        raise ApiError('This project is ineligible for workspace management.')
+    
+    if project_type == ProjectType.MAIN and subproject:
+        repo_path = get_repo_path(user=user)
+        projects_folder = os.path.join(repo_path, 'projects')
+        projects = [...]  # 扫描项目目录
+        if subproject not in projects:
+            raise ApiError(f'Project {subproject} was not found.')
+```
+
+---
+
+### 5.6 第六类：运行时与系统资源
+
+**代表资源**：Kernel, SparkApplication, SparkJob, Log, Status, Scheduler, CacheItem 等
+
+**数据存储**：当前进程内存、本地文件系统或进程间通信
+
+**隔离机制**：
+- 进程级隔离：每个 Mage 实例只管理自己的运行时资源
+- 项目切换时整个进程上下文切换
+
+**特点**：
+- ✅ 进程级天然隔离
+- ⚠️ 单实例单项目模式下不存在跨项目问题
+- ⚠️ 多项目部署下需要依赖进程级隔离
+
+**策略层行为**：通常是简单的角色检查（viewer/editor/admin），不涉及细粒度的 entity 匹配
+
+---
+
+### 5.7 分类总表
+
+| 类别 | 代表资源 | 数据来源 | 项目隔离方式 | 隔离可靠性 | LIST 是否默认过滤 |
+|------|---------|---------|-------------|-----------|-----------------|
+| 1. 文件系统类 | Pipeline, Block, File | 文件系统 | `repo_path` 目录限制 | ✅ 高 | 是 |
+| 2. repo_query 类 | PipelineSchedule, Secret | 数据库 | `repo_query` (repo_path 字段) | ✅ 中高 | 是 |
+| 3. 关联间接类 | PipelineRun, BlockRun | 数据库 | 通过上游 schedule/pipeline 间接过滤 | ⚠️ 中 | 是（但有绕过参数） |
+| 4. 权限管理类 | Role, Permission, User | 全局数据库 | entity+entity_id 字段（使用时） | ⚠️ 中低 | **否，返回全部** |
+| 5. 工作空间类 | Workspace, Cluster | 集群系统 | cluster_type / namespace | ✅ 高 | 是 |
+| 6. 运行时类 | Kernel, Spark*, Status | 进程内存 | 进程级隔离 | ✅ 高 | 是 |
+
+### 5.8 策略层与数据层的对应关系
+
+| 类别 | 策略类定义 entity | 使用旧模式条件 | 使用新模式条件 | 缓存污染影响 |
+|------|------------------|---------------|---------------|-------------|
+| 1. 文件系统类 | 部分有（Pipeline 有） | 是 | 是 | 同项目内越权 |
+| 2. repo_query 类 | 部分有 | 是 | 是 | 同项目内越权 |
+| 3. 关联间接类 | 部分有（PipelineRun 有） | 是 | 是 | 同项目内越权 |
+| 4. 权限管理类 | ❌ 没有 | ✅ 全部使用旧模式 | ❌ 不使用 | 不适用（旧模式） |
+| 5. 工作空间类 | 自定义 | 自定义 | - | 不适用 |
+| 6. 运行时类 | 通常没有 | 是 | 部分是 | 进程内影响 |
+
+**关键结论**：
+1. **不是所有资源都走细粒度权限路径**。权限管理类资源（Role/Permission/User）的策略类全部使用旧模式的 `has_at_least_admin_role()` 等条件，不涉及 entity_name 匹配。
+2. **数据层隔离比权限层隔离更重要**。对于 1~3 类资源，即使权限系统失效，数据层过滤也能防止跨项目数据泄漏。
+3. **第 4 类资源（权限管理）是特殊的**：LIST 默认返回全局数据，但这些数据是"权限定义"而非"业务数据"，泄漏风险不同。
+
+---
+
+## 六、多租户隔离机制对比
+
+### 6.1 旧模式下的多租户
 
 租户边界 = `Entity.PROJECT + project_uuid`
 
@@ -709,9 +937,9 @@ Permission 3:
 - 全局权限可以跨项目
 - PIPELINE 级权限可以在项目内进一步细化
 
-### 5.2 新模式下的多租户
+### 6.2 新模式下的多租户
 
-新模式**不使用 `Entity` 枚举层级**（GLOBAL/PROJECT/PIPELINE），理论上通过 `entity_name + entity_id` 实现细粒度控制，但实际有三道防线共同作用于跨项目隔离：
+新模式**不使用 `Entity` 枚举层级**（GLOBAL/PROJECT/PIPELINE），理论上通过 `entity_name + entity_id` 实现细粒度控制，但实际有三道防线共同作用于跨项目隔离。注意：这里的分析主要针对**第 1~3 类资源**（文件系统类、repo_query 类、关联间接类），第 4~6 类资源的隔离方式不同，详见第五章。
 
 | 防线层级 | 实现方式 | 可靠性 | 代码位置 |
 |----------|---------|--------|---------|
@@ -719,7 +947,7 @@ Permission 3:
 | 权限系统层 | `entity_name + entity_id` 匹配 | ⚠️ 中（有缺陷） | `mage_ai/api/policies/mixins/user_permissions.py` [L117-L127] |
 | 缓存层 | 请求级 ResultSet | ✅ 高（不会跨请求） | `mage_ai/api/mixins/result_set.py` [L81-L170] |
 
-#### 5.2.1 数据查询层的项目隔离（最可靠防线）
+#### 6.2.1 数据查询层的项目隔离（最可靠防线）
 
 **核心机制**：所有数据查询通过 `repo_path` 限制在当前项目范围内。
 
@@ -741,7 +969,7 @@ PipelineResource.collection()
 
 **关键结论**：即使权限系统有缺陷，**数据查询层天然保证了不会返回其他项目的数据**。
 
-#### 5.2.2 权限系统层的四种场景分析
+#### 6.2.2 权限系统层的四种场景分析
 
 需要严格区分以下四种不同场景，它们的影响范围和后果完全不同：
 
@@ -834,7 +1062,7 @@ if permission.entity_id is not None and resource:  # 两个条件同时满足才
 - ❌ **在默认配置下，不会发生真实的跨项目数据泄漏**
 - ⚠️ 但权限粒度控制失效（同项目内越权访问）是真实存在的问题
 
-#### 5.2.3 权限系统的实际问题（非跨项目）
+#### 6.2.3 权限系统的实际问题（非跨项目）
 
 虽然不会跨项目泄漏，但新模式在**同项目内**存在以下权限控制缺陷：
 
@@ -845,7 +1073,7 @@ if permission.entity_id is not None and resource:  # 两个条件同时满足才
 | CREATE 权限过度放行 | 本应只能编辑特定资源的用户可以创建新资源 | CREATE 时 resource 始终为 None |
 | 禁用权限范围过大 | 一个禁用权限可能影响整个资源类型 | 不检查 entity 层级 + resource=None 时跳过检查 |
 
-#### 5.2.4 易混淆点澄清
+#### 6.2.4 易混淆点澄清
 
 | 说法 | 准确性 | 说明 |
 |------|--------|------|
@@ -855,7 +1083,7 @@ if permission.entity_id is not None and resource:  # 两个条件同时满足才
 | "entity_id 精确匹配完全失效" | ❌ 错误 | 在 DETAIL/UPDATE/DELETE 等单资源操作中仍然有效 |
 | "缓存会跨请求泄漏" | ❌ 错误 | ResultSet 是请求级的，每个请求独立 |
 
-#### 5.2.5 重要提醒
+#### 6.2.5 重要提醒
 
 新模式的权限系统存在设计缺陷，但**不会导致跨项目数据泄漏**。实际风险是：
 1. **同项目内的权限粒度控制失效**（用户可以看到项目内原本无权限的资源）
@@ -869,7 +1097,7 @@ if permission.entity_id is not None and resource:  # 两个条件同时满足才
 
 ---
 
-## 六、失败分支详细对比
+## 七、失败分支详细对比
 
 | 失败类型 | 旧模式 | 新模式 | 共同 |
 |----------|--------|--------|------|
@@ -890,7 +1118,7 @@ if permission.entity_id is not None and resource:  # 两个条件同时满足才
 | 指标埋点 | ✅ | ✅ | ✅ |
 | 无项目权限友好提示 | ✅（旧模式特有） | ❌ | - |
 
-### 6.1 旧模式失败流程图
+### 7.1 旧模式失败流程图
 
 ```
 policy.authorize_action(action)
@@ -913,7 +1141,7 @@ policy.authorize_action(action)
            └─ DEBUG 模式重新抛出
 ```
 
-### 6.2 新模式失败流程图（完整链路）
+### 7.2 新模式失败流程图（完整链路）
 
 ```
 validate_condition_with_cache()  ← 入口
@@ -953,7 +1181,7 @@ validate_condition_with_cache()  ← 入口
     └─ 写入缓存（无论成功失败都缓存）
 ```
 
-### 6.3 LIST 操作特殊失败路径
+### 7.3 LIST 操作特殊失败路径
 
 ```
 GET /pipelines (LIST)
@@ -987,9 +1215,9 @@ GET /pipelines (LIST)
 
 ---
 
-## 七、关键代码位置索引
+## 八、关键代码位置索引
 
-### 7.1 旧模式（角色权限路径）
+### 8.1 旧模式（角色权限路径）
 
 | 功能 | 文件相对路径 | 行号 |
 |------|-------------|------|
@@ -1003,7 +1231,7 @@ GET /pipelines (LIST)
 | Role.get_parent_access（继承逻辑） | `mage_ai/orchestration/db/models/oauth.py` | L411-L431 |
 | Entity 枚举 | `mage_ai/orchestration/constants.py` | L21-L27 |
 
-### 7.2 新模式（细粒度权限路径）
+### 8.2 新模式（细粒度权限路径）
 
 | 功能 | 文件相对路径 | 行号 |
 |------|-------------|------|
@@ -1018,7 +1246,7 @@ GET /pipelines (LIST)
 | 权限位扩展映射 | `mage_ai/authentication/permissions/constants.py` | L222-L227 |
 | 保留实体列表 | `mage_ai/authentication/permissions/constants.py` | L103-L108 |
 
-### 7.3 共用框架
+### 8.3 共用框架
 
 | 功能 | 文件相对路径 | 行号 |
 |------|-------------|------|
@@ -1032,11 +1260,24 @@ GET /pipelines (LIST)
 | 错误处理与钩子 | `mage_ai/api/operations/base.py` | L231-L258 |
 | ApiError 定义 | `mage_ai/api/errors.py` | L7-L63 |
 
+### 8.4 资源与数据层隔离
+
+| 功能 | 文件相对路径 | 行号 |
+|------|-------------|------|
+| PipelineResource.collection | `mage_ai/api/resources/PipelineResource.py` | L104-L204 |
+| RoleResource.collection | `mage_ai/api/resources/RoleResource.py` | L15-L63 |
+| PermissionResource.collection | `mage_ai/api/resources/PermissionResource.py` | L12-L33 |
+| PipelineRunResource.collection | `mage_ai/api/resources/PipelineRunResource.py` | L38-L136 |
+| WorkspaceResource.collection | `mage_ai/api/resources/WorkspaceResource.py` | L27-L67 |
+| PipelineSchedule.repo_query | `mage_ai/orchestration/db/models/schedules.py` | L112-L121 |
+| Secret.repo_query | `mage_ai/orchestration/db/models/secrets.py` | L19-L26 |
+| get_repo_path | `mage_ai/settings/repo.py` | L34-L64 |
+
 ---
 
-## 八、易混淆点总结
+## 九、易混淆点总结
 
-### 8.1 核心概念区分
+### 9.1 核心概念区分
 
 1. **Entity vs entity_name**:
    - `Entity` (GLOBAL/PROJECT/PIPELINE): 旧模式的**层级范围**概念，有纵向继承
@@ -1058,7 +1299,7 @@ GET /pipelines (LIST)
    - 旧模式：通过 `Entity.PROJECT + project_uuid` 天然隔离
    - 新模式：不使用 Entity 层级，需要通过 entity_id 或额外逻辑实现隔离
 
-### 8.2 资源对象为空时的特殊行为
+### 9.2 资源对象为空时的特殊行为
 
 6. **resource=None 时 entity_id 检查被跳过**:
    - 触发场景：LIST/CREATE 的操作级检查、CREATE 的写属性检查
@@ -1071,7 +1312,7 @@ GET /pipelines (LIST)
    - 阶段 2（属性级）：逐个 resource 检查 → entity_id 检查生效 → 决定"能不能读具体资源的字段"
    - 注意：阶段 2 中任何一个资源失败 → 整个请求 403，而非过滤掉无权限资源
 
-### 8.3 缓存相关的陷阱
+### 9.3 缓存相关的陷阱
 
 8. **缓存 key 不含 entity_id**:
    - 操作级缓存 key：`entity_name → operation → authorized`
@@ -1092,7 +1333,7 @@ GET /pipelines (LIST)
     - 跨请求：不共享（每次请求新建 ResultSet）
     - 初始化位置：`BasePolicy.__init__` [L62] - resource=None 时创建空 ResultSet
 
-### 8.4 禁用优先原则的影响
+### 9.4 禁用优先原则的影响
 
 11. **禁用优先 vs 位或聚合**:
     - 旧模式：位或运算，禁用位不会抵消授权位（没有显式禁用概念）
@@ -1104,7 +1345,7 @@ GET /pipelines (LIST)
     - ❌ 但**不会跨项目泄漏数据**（数据层 repo_path 过滤是独立防线）
     - ❌ 不会导致其他项目的数据被返回，只是可能错误地拒绝当前项目的访问
 
-### 8.5 多租户隔离效果总结
+### 9.5 多租户隔离效果总结
 
 13. **新模式下的实际隔离能力（重要纠正）**:
     | 操作类型 | 权限粒度控制 | 跨项目数据隔离 | 说明 |
@@ -1121,7 +1362,7 @@ GET /pipelines (LIST)
     - 注意：新模式的 entity_id 精确匹配在单资源操作时是可靠的，但列表和创建场景存在设计缺陷
     - 关键区别：旧模式在**权限层**实现项目隔离，新模式在**数据层**实现项目隔离
 
-### 8.6 跨项目影响的澄清
+### 9.6 跨项目影响的澄清
 
 15. **不会导致跨项目数据泄漏的三道防线**:
     - 防线 1：数据查询层 `repo_path` 过滤 → 最可靠，默认启用
