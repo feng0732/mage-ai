@@ -195,42 +195,85 @@ def spark_config(self) -> Dict:
 
 #### 3.1 空配置判断的完整链路
 
-**代码位置 4**：`mage_ai/data_preparation/repo_manager.py` L135, L139
+两个判断入口（`get_compute_service()` 和 `ComputeService.build()`）的判断条件**不同**，必须分开分析。
+
+**代码位置 4**：`mage_ai/data_preparation/repo_manager.py` L135, L139（配置加载）
 
 ```python
-self.emr_config = repo_config.get('emr_config') or dict()  # 空 → {}
-self.spark_config = repo_config.get('spark_config')        # 空 → None
+self.emr_config = repo_config.get('emr_config') or dict()  # 缺失/空 → {}
+self.spark_config = repo_config.get('spark_config')        # 缺失 → None, 空 → {}
 ```
 
-**实际判断逻辑（必须同时满足）**：
+**代码位置 5**：`mage_ai/data_preparation/models/project/__init__.py` L154-L159（属性转换）
 
-| 判断节点 | 条件 | 代码位置 |
-|----------|------|----------|
-| 1 | `repo_config.emr_config` 必须是 **非空 dict**（`if {...}` 为 True） | utils.py L30 |
-| 2 | `repo_config.spark_config` 必须 **不是 None**（可空 dict，但不能缺失） | compute/models.py L150 |
-| 3 | `project.emr_config` 必须 **不是 None**（`{} or None` → None，会被过滤） | project/__init__.py L155 |
-| 4 | kernel 是 PYSPARK 或 `ignore_active_kernel=True` | utils.py L30 |
+```python
+@property
+def emr_config(self) -> Dict:
+    return self.repo_config.emr_config or None    # {} → None, {有key} → {有key}
 
-**metadata.yaml 配置真值表**：
+@property
+def spark_config(self) -> Dict:
+    return self.repo_config.spark_config or None  # None→None, {}→None, {有key}→{有key}
+```
 
-| emr_config 配置 | spark_config 配置 | repo_config.emr_config | project.emr_config | 触发 AWS_EMR？ |
-|-----------------|-------------------|------------------------|--------------------|-----------------|
-| 无此字段 | 无此字段 | `{}` | `None` | ❌ |
-| `emr_config: {}` | 无此字段 | `{}` | `None` | ❌ |
-| `emr_config:` 下有至少 1 个子项 | 无此字段 | `{...}` | `{...}` | ❌（缺 spark_config） |
-| `emr_config:` 下有至少 1 个子项 | `spark_config: {}` | `{...}` | `{...}` | ✅（需同时满足 kernel 条件） |
+> ⚠️ **关键**：`or None` 会把空 dict `{}` 转换为 `None`。所以 `project.spark_config` 和 `project.emr_config` 永远不会是 `{}`，要么是 `None`，要么是非空 dict。
 
-> ⚠️ **关键细节**：`repo_config.get('spark_config')` 返回 `None`（无此字段）和 `{}`（有字段但空）在 `compute/models.py` L150 的 `if project.spark_config` 判断中结果不同：`None` → False，`{}` → True。
->
-> 所以必须在 metadata.yaml 中显式写 `spark_config: {}`（或非空），不能完全不写。
+**入口 A**：`get_compute_service()`（`mage_ai/services/spark/utils.py` L30）
+
+```python
+if repo_config.emr_config and (KernelName.PYSPARK == kernel_name or ignore_active_kernel):
+    return ComputeServiceUUID.AWS_EMR
+```
+
+| 判断条件 | 说明 |
+|----------|------|
+| `repo_config.emr_config` | 直接用 repo_config，不经 project 属性转换；`{}` 是 falsy，`{有key}` 是 truthy |
+| kernel 条件 | kernel 是 PYSPARK **或** `ignore_active_kernel=True` |
+| **不检查** spark_config | AWS_EMR 路径完全不检查 spark_config |
+
+**入口 B**：`ComputeService.build()`（`mage_ai/services/compute/models.py` L147-L156）
+
+```python
+if project and project.spark_config:      # 第 1 关：spark_config 必须非 None
+    if project.emr_config:                 # 第 2 关：emr_config 必须非 None
+        service_class = AWSEMRComputeService
+```
+
+| 判断条件 | 说明 |
+|----------|------|
+| `project.spark_config` | 经 `or None` 转换后，**空 dict `{}` 也会变成 `None`**，所以 `spark_config: {}` 等效于缺失 |
+| `project.emr_config` | 经 `or None` 转换后，**空 dict `{}` 也会变成 `None`**，所以 `emr_config: {}` 等效于缺失 |
+| **不检查** kernel | 此路径不检查 kernel 类型 |
+
+#### 3.1.1 两个入口的完整真值表
+
+| # | metadata.yaml 中 | repo_config.emr_config | repo_config.spark_config | project.emr_config | project.spark_config | 入口A (utils.py) AWS_EMR? | 入口B (compute/models.py) AWSEMRComputeService? |
+|---|-------------------|------------------------|--------------------------|--------------------|----------------------|---------------------------|--------------------------------------------------|
+| 1 | 都不写 | `{}` | `None` | `None` | `None` | ❌ `if {}` → False | ❌ `if None` → False |
+| 2 | `emr_config: {}` | `{}` | `None` | `None` | `None` | ❌ `if {}` → False | ❌ `if None` → False |
+| 3 | `emr_config: {}` + `spark_config: {}` | `{}` | `{}` | `None` | `None` | ❌ `if {}` → False | ❌ `if None` → False |
+| 4 | `emr_config:` 有子项 | `{有key}` | `None` | `{有key}` | `None` | ✅ (需 kernel=PYSPARK) | ❌ `if None` → False |
+| 5 | `emr_config:` 有子项 + `spark_config: {}` | `{有key}` | `{}` | `{有key}` | `None` | ✅ (需 kernel=PYSPARK) | ❌ `{} or None = None` → False |
+| 6 | `emr_config:` 有子项 + `spark_config:` 有子项 | `{有key}` | `{有key}` | `{有key}` | `{有key}` | ✅ (需 kernel=PYSPARK) | ✅ |
+
+> ⚠️ **核心发现**：第 5 行是最容易误判的组合。`spark_config: {}` 写了空 dict，但经过 `project.spark_config` 属性的 `or None` 转换后变成 `None`，和完全不写效果一样，**不能触发 `ComputeService.build()` 的 AWS_EMR 路径**。
+
+#### 3.1.2 两个入口的差异总结
+
+| 维度 | 入口A `get_compute_service()` | 入口B `ComputeService.build()` |
+|------|-------------------------------|-------------------------------|
+| 数据源 | `repo_config` 直接读取 | `project` 属性（经 `or None` 转换） |
+| emr_config | 必须非空 dict | 必须非空 dict（`{}` 被 `or None` 过滤） |
+| spark_config | **不检查** | 必须非空 dict（`{}` 被 `or None` 过滤） |
+| kernel 条件 | kernel=PYSPARK 或 ignore_active_kernel | **不检查** |
 
 #### 3.2 触发条件汇总
 
-要触发 `AWS_EMR` 计算服务路由，必须同时满足：
+两个入口在不同场景下被调用，最终要完整触发 AWS_EMR 需要**两个入口都通过**：
 
 1. ✅ `metadata.yaml` 中 `emr_config` 段至少配置一个子项（如 `master_instance_type`）
-2. ✅ `metadata.yaml` 中 `spark_config` 段存在（可空 dict `{}`，但不能完全不写）
-3. ✅ 当前 kernel 是 `pyspark`，或调用方传 `ignore_active_kernel=True`
+2. ✅ `metadata.yaml` 中 `spark_config` 段至少配置一个子项（如 `app_name` 或 `spark_master`），**空 dict `{}` 不算配置**
+3. ✅ 当前 kernel 是 `pyspark`，或调用方传 `ignore_active_kernel=True`（仅入口A 需要）
 
 ---
 
@@ -448,13 +491,13 @@ else:
 │                                                                      │
 │  监控通道（独立于执行通道）：                                          │
 │                                                                      │
-│  3. ComputeService.build(project)                                    │
-│     ├─ project.spark_config 存在（非 None）                          │
-│     └─ project.emr_config 存在（非空 dict）                          │
+│  3. ComputeService.build(project)    ← 入口B                         │
+│     ├─ project.spark_config 非空 dict（{} 被 or None 转为 None！）   │
+│     └─ project.emr_config 非空 dict（{} 被 or None 转为 None！）     │
 │         → AWSEMRComputeService                                      │
 │                                                                      │
-│  4. get_compute_service()                                            │
-│     ├─ repo_config.emr_config 非空                                  │
+│  4. get_compute_service()            ← 入口A                         │
+│     ├─ repo_config.emr_config 非空 dict（不检查 spark_config）       │
 │     └─ kernel=PYSPARK 或 ignore_active_kernel=True                   │
 │         → ComputeServiceUUID.AWS_EMR                                │
 │                                                                      │
@@ -532,23 +575,28 @@ else:
 - Block 是 SENSOR，但 `is_pyspark_code(block.content)` 返回 True → 依然走 PySpark
 - 上一版描述写反了，特此校正
 
-### 结论 3：空 EMR 配置 ≠ 配置了 EMR
+### 结论 3：空 dict `{}` 在 project 属性中等效于缺失
 
-| 配置方式 | repo_config.emr_config | project.emr_config | 触发 AWS_EMR？ |
-|----------|------------------------|--------------------|-----------------|
-| 完全不写 | `{}` | `None` | ❌ |
-| 写了 `emr_config: {}` | `{}` | `None` | ❌ |
-| 写了至少一个子项 | `{...}` | `{...}` | ✅（还需 spark_config 存在） |
+`project/__init__.py` L155 和 L159 的 `or None` 转换，会把空 dict `{}` 统一转为 `None`：
 
-`{}` 在 Python 中是 falsy，`project.emr_config` 还会进一步把 `{}` 转成 `None`。
+| metadata.yaml 写法 | repo_config 层 | project 层（经 `or None`） | `if` 判断结果 |
+|---------------------|----------------|---------------------------|---------------|
+| 不写 `spark_config` | `None` | `None` | False |
+| 写 `spark_config: {}` | `{}` | `None`（`{} or None`） | False |
+| 写 `spark_config: {app_name: x}` | `{app_name: x}` | `{app_name: x}` | True |
 
-### 结论 4：spark_config 不能完全不写
+**emr_config 同理**：不写、写 `emr_config: {}`、写 `emr_config: {有子项}` 三种情况，project 层分别是 `None`、`None`、`{有子项}`。
 
-`compute/models.py` L150 `if project and project.spark_config:` 判断中：
-- `project.spark_config is None` → False
-- `project.spark_config == {}` → True
+所以 `spark_config: {}` 和完全不写 spark_config **效果完全相同**，都不能触发 `ComputeService.build()` 的 AWS_EMR 路径。
 
-所以 `metadata.yaml` 中必须显式写 `spark_config: {}`（或非空），不能完全不写这个字段。
+### 结论 4：两个判断入口的 spark_config 要求不同
+
+| 入口 | 是否检查 spark_config | 空写 `spark_config: {}` 能否通过 |
+|------|-----------------------|----------------------------------|
+| `get_compute_service()` (utils.py) | **不检查** | 不涉及（只看 emr_config + kernel） |
+| `ComputeService.build()` (compute/models.py) | 必须非空 dict | ❌ `{} or None = None` → 不通过 |
+
+要完整触发 AWS_EMR，两个入口都需要通过，所以 `spark_config` 必须**至少写一个实际的子项**（如 `app_name: 'my-app'`），不能写空 dict `{}`。
 
 ### 结论 5：update_status 参数在 PySpark 执行器中被完全忽略
 
