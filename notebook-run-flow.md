@@ -6,9 +6,11 @@ Notebook 风格运行有 **三条独立但协作的链路**，分工明确：
 
 | 链路 | 作用 | 通道类型 | 方向 | 核心文件 |
 |------|------|----------|------|----------|
-| **执行请求通道** | 前端发送「运行 Block」请求，后端接收并提交给内核 | WebSocket | 前端 → 后端 | [websocket_server.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/websocket_server.py) |
-| **执行结果通道** | 内核执行完代码，把结果推送给前端显示 | SSE (Server-Sent Events) | 后端 → 前端 | [events/stream.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/events/stream.py) |
+| **执行收发通道** | 前端发送「运行 Block」请求 + 接收内核执行结果 | **WebSocket 双向** | 前端 ↔ 后端 | [websocket_server.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/websocket_server.py) |
+| **SSE 事件流通道** | 测试页等特殊场景的代码执行与结果推送 | SSE (Server-Sent Events) | 后端 → 前端 | [events/stream.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/events/stream.py) |
 | **变量持久化通道** | Block 输出写入磁盘，供下游 Block 和输出展示读取 | 本地文件系统 | 内核 → 磁盘 → 内核 | [variable_manager.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/data_preparation/variable_manager.py) |
+
+**⚠️ 关键区分**：Pipeline 编辑页的 Block 运行走 **WebSocket 双向收发**（发请求 + 收结果），测试页走 **SSE 事件流**（发请求用 REST API + 收结果用 SSE）。这两套通道是独立的，不要混淆。
 
 ### 变量持久化的三条写入路径（互斥，每次只走一条）
 
@@ -26,10 +28,10 @@ Notebook 风格运行有 **三条独立但协作的链路**，分工明确：
 | **动态 child 展示读** | `run_task()` → `block.get_outputs()` | 动态 child block 输出展示 | 本 Block variables 目录 |
 | **普通 block 展示读** | `__custom_output()` → `block.get_outputs()` | 普通 block 输出展示 | 本 Block variables 目录 |
 
-### 三条链路协作时序（普通返回值路径）
+### 三条链路协作时序（普通返回值路径 - Pipeline 编辑页）
 
 ```
-前端                          后端                              内核                                磁盘
+前端                          后端                              Jupyter 内核                        磁盘
  │                             │                                 │                                   │
  │ 1. WebSocket: 运行 Block    │                                 │                                   │
  │────────────────────────────>│ 2. 三次代码注入                │                                   │
@@ -66,15 +68,20 @@ Notebook 风格运行有 **三条独立但协作的链路**，分工明确：
  │                             │                                 │       └─ block.get_outputs() ←───── 读取②：普通展示读
  │                             │                                 │          └─ print(render_output_tags(json))                   │
  │                             │                                 │                                                               │
- │                             │ 5. SSE 推送结果                 │                                 │
- │◄────────────────────────────│◄────────────────────────────────│                                 │
- │                             │                                 │                                 │
- │ 6. 前端显示输出              │                                 │                                 │
+ │                             │ 5. iopub 消息 → parse_output_message()                        │
+ │                             │    → WebSocketServer.send_message()                           │
+ │                             │◄────────────────────────────────│                               │
+ │                             │                                 │                               │
+ │ 6. WebSocket onMessage:     │                                 │                               │
+ │    解析内核输出并显示        │                                 │                               │
+ │◄────────────────────────────│                                 │                               │
 ```
 
 ---
 
-## 一、执行请求通道（WebSocket）
+## 一、执行收发通道（WebSocket 双向）
+
+Pipeline 编辑页的 Block 运行使用 **WebSocket 双向收发**：前端通过同一个 WebSocket 连接发请求、收结果。
 
 ### 1.1 前端发起请求
 
@@ -682,16 +689,137 @@ exec(完整代码)
 
 ---
 
-## 五、执行结果通道（SSE 事件流）
+## 五、执行结果回传 - 两套独立通道
 
-### 5.1 Magic Kernel 架构
+Mage 有 **两套独立的结果回传通道**，服务于不同页面，不要混淆：
 
-Magic Kernel 使用三层队列架构，结果通过 SSE 推送到前端：
+| 通道 | 使用页面 | 请求方式 | 结果回传方式 | 内核类型 |
+|------|----------|----------|-------------|----------|
+| **WebSocket 收发** | Pipeline 编辑页 | WebSocket `sendMessage` | WebSocket `onMessage` 回调 | Jupyter Kernel (python3/pysparkkernel) |
+| **SSE 事件流** | 测试页 `/test` | REST API `code_executions` | SSE `EventSource` | Magic Kernel |
+
+---
+
+### 5.1 通道1：WebSocket 收发（Pipeline 编辑页）
+
+这是 **主要的** Notebook 运行通道。Pipeline 编辑页使用 WebSocket **双向收发**：
+
+**前端代码** [edit.tsx#L2426-L2491](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/frontend/pages/pipelines/[pipeline]/edit.tsx#L2426-L2491)：
+
+```typescript
+// 前端建立 WebSocket 连接
+const { sendMessage } = useWebSocket(getWebSocket(), {
+    onMessage: (lastMessage) => {
+        // 收到内核输出结果
+        const message: KernelOutputType = JSON.parse(lastMessage.data);
+        const { block_type, execution_state, msg_type, pipeline_uuid, uuid } = message;
+        
+        if (msgType !== 'stream_pipeline') {
+            // Block 执行结果：设置到对应 block 的 messages 中
+            setMessages((prev) => ({
+                ...prev,
+                [uuid]: messagesFromUUID.concat(message),
+            }));
+        } else {
+            // Pipeline 级别消息
+            setPipelineMessages((prev) => [...prev, message]);
+        }
+        
+        // 更新 Block 运行状态
+        if (execution_state === 'busy') {
+            setRunningBlocks((prev) => prev.concat(block));
+        } else if (execution_state === 'idle') {
+            setRunningBlocks((prev) => prev.filter(({ uuid: uuid2 }) => uuid !== uuid2));
+        }
+    },
+});
+```
+
+**后端结果转发链路**：
 
 ```
-子进程 (执行代码)
+Jupyter Kernel (子进程)
     │
-    │ 写入 ExecutionResult
+    │ 执行代码，产生 iopub 消息
+    ▼
+get_messages()  ← 后台线程持续轮询 [subscriber.py#L8-L24](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/subscriber.py#L8-L24)
+    │ client.get_iopub_msg(timeout=1)  ← 从 Jupyter 内核读取 iopub 消息
+    │ callback(message)
+    ▼
+parse_output_message()  ← 解析 Jupyter 消息格式 [kernel_output_parser.py#L25-L86](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/kernel_output_parser.py#L25-L86)
+    │ 提取 data/error/execution_state/type
+    │ stdout → DataType.TEXT_PLAIN
+    │ traceback → DataType.TEXT
+    │ execute_result → DataType.TEXT_PLAIN 等
+    ▼
+WebSocketServer.send_message()  ← 通过 WebSocket 发给所有客户端 [websocket_server.py#L313-L399](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/websocket_server.py#L313-L399)
+    │ 合并 block_type/block_uuid/pipeline_uuid
+    │ client.write_message(json.dumps(message_final))
+    ▼
+前端 WebSocket onMessage  ← 编辑页接收
+```
+
+**关键代码** - 服务器启动时注册回调 [server.py#L745-L749](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/server.py#L745-L749)：
+
+```python
+get_messages(
+    lambda content: WebSocketServer.send_message(
+        parse_output_message(content),
+    ),
+)
+```
+
+这条线在服务器启动时建立，是一个持续运行的后台线程，不断从 Jupyter 内核的 iopub 通道读取消息，解析后通过 WebSocket 推送给前端。
+
+**Jupyter iopub 消息类型**（`parse_output_message` 处理）：
+
+| iopub 消息 | 解析后 DataType | 说明 |
+|------------|-----------------|------|
+| `stream` (stdout/stderr) | `TEXT_PLAIN` | print 输出 |
+| `execute_result` | `TEXT_PLAIN` / `TEXT_HTML` 等 | 最后表达式值 |
+| `error` | `TEXT` | 错误信息 + traceback |
+| `status` (idle/busy) | 无 data，仅 execution_state | 执行状态 |
+| `display_data` (image/png) | `IMAGE_PNG` | 图片输出 |
+
+---
+
+### 5.2 通道2：SSE 事件流（测试页 / Magic Kernel）
+
+测试页 `/test` 使用 **REST API 发请求 + SSE 收结果**，走 Magic Kernel：
+
+**前端代码** [useEventStreams.ts#L48-L78](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/frontend/utils/server/events/useEventStreams.ts#L48-L78)：
+
+```typescript
+// 发送代码执行请求（通过 REST API）
+const [createMessage, { isLoading }] = useMutation(
+    (payload: { message: string }) => {
+        return api.code_executions.useCreate()({
+            code_execution: {
+                message: payload?.message,
+                message_request_uuid: getNewUUID(),
+                timestamp: Number(new Date()),
+                uuid,
+            },
+        });
+    },
+);
+
+// 接收结果（通过 SSE EventSource）
+eventSourceRef.current = new EventSource(getEventStreamsUrl(uuid));
+eventSource.onmessage = (event) => {
+    const eventData = JSON.parse(event.data);
+    if (eventData.uuid === uuid) {
+        setEvents((prev) => [...prev, eventData]);
+    }
+};
+```
+
+**后端结果转发链路**：
+
+```
+Magic Kernel 子进程
+    │
+    │ 执行代码，产生 ExecutionResult
     ▼
 read_queue (SyncManager.Queue，跨进程)
     │
@@ -699,65 +827,72 @@ read_queue (SyncManager.Queue，跨进程)
     ▼
 write_queue (FasterQueue，主线程)
     │
-    │ EventStreamHandler 轮询
+    │ EventStreamHandler 轮询（每 100ms）
     ▼
-SSE 连接 (前端)
+SSE 连接 → 前端测试页
 ```
 
-### 5.2 `EventStreamHandler` - SSE 服务端
-
-[events/stream.py#L20-L63](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/events/stream.py#L20-L63)
+**EventStreamHandler** [events/stream.py#L20-L63](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/events/stream.py#L20-L63)：
 
 ```python
 async def get(self, uuid: str) -> None:
     self.set_header('Content-Type', 'text/event-stream')
-    self.set_header('Cache-Control', 'no-cache')
-    self.set_header('Connection', 'keep-alive')
     
     while True:
-        queue = await self.__get_queue()  # 按 uuid 获取 write_queue
-        result = None
-        
-        try:
-            result = queue.get_nowait()  # 非阻塞读取
-        except Empty:
-            pass
+        queue = await self.__get_queue()
+        result = queue.get_nowait()
         
         if result is not None:
-            # 封装为 EventStream
-            event_stream = EventStream.load(...)
-            
-            # SSE 格式推送
+            event_stream = EventStream.load(result=result, uuid=self.uuid, ...)
             self.write(f'data: {event_stream_json}\n\n')
         
         await self.flush()
-        await asyncio.sleep(0.1)  # 每 100ms 轮询一次
+        await asyncio.sleep(0.1)
 ```
 
-### 5.3 ExecutionResult 类型
-
-[kernels/magic/constants.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/kernels/magic/constants.py)
+**Magic Kernel ExecutionResult 类型** [kernels/magic/constants.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/kernels/magic/constants.py)：
 
 ```python
 class ResultType(StrEnum):
-    DATA = 'data'      # 执行结果数据（最后表达式的值）
+    DATA = 'data'      # 最后表达式的值
     STATUS = 'status'  # 状态更新
     STDOUT = 'stdout'  # 标准输出
 
 class ExecutionStatus(StrEnum):
-    RUNNING = 'running'  # 执行中
-    SUCCESS = 'success'  # 执行成功
-    ERROR = 'error'      # 执行错误
-    CANCELLED = 'cancelled'  # 用户取消
-    READY = 'ready'      # 内核就绪，可接受新任务
+    RUNNING = 'running'
+    SUCCESS = 'success'
+    ERROR = 'error'
+    CANCELLED = 'cancelled'
+    READY = 'ready'
 ```
 
 执行完成时的消息序列：
-1. 多个 `STDOUT` - 执行过程中的 print 输出（包括 `__custom_output` 打印的渲染输出）
+1. 多个 `STDOUT` - print 输出
 2. `STATUS` + `RUNNING` - 代码块执行完成
-3. `DATA` + `SUCCESS` - 携带最后表达式的输出值
+3. `DATA` + `SUCCESS` - 最后表达式值
 4. `STATUS` + `READY` - 内核就绪
-5. `None` - 哨兵值，标记结束
+5. `None` - 哨兵值
+
+---
+
+### 5.3 两套通道对比
+
+| 维度 | WebSocket 收发 | SSE 事件流 |
+|------|---------------|-----------|
+| **使用页面** | Pipeline 编辑页（主页面） | 测试页 `/test` |
+| **请求方式** | WebSocket `sendMessage` | REST API `code_executions` |
+| **结果回传** | WebSocket `onMessage` | SSE `EventSource.onmessage` |
+| **内核类型** | Jupyter Kernel (`python3` / `pysparkkernel`) | Magic Kernel（Mage 自研） |
+| **消息格式** | Jupyter iopub 消息 → `parse_output_message` 解析 | `ExecutionResult` → `EventStream` 封装 |
+| **消息来源** | `get_messages()` 轮询 iopub 通道 | `ReaderThread` 轮询 `read_queue` |
+| **后端转发** | `WebSocketServer.send_message()` → `client.write_message()` | `EventStreamHandler` → SSE 推送 |
+| **连接管理** | 持久 WebSocket 连接 | SSE 连接 + 自动重连 |
+| **服务场景** | 日常开发，Block 编辑与运行 | 内核调试、代码执行测试 |
+
+**⚠️ 不要混淆**：
+- Pipeline 编辑页的 Block 运行结果通过 **WebSocket** 回传，不是 SSE
+- SSE 只用于测试页的 Magic Kernel 场景
+- 两套通道使用不同的内核（Jupyter vs Magic）和不同的消息格式
 
 ---
 
@@ -781,7 +916,11 @@ class ExecutionStatus(StrEnum):
 
 | 模块 | 文件 | 核心职责 |
 |------|------|----------|
-| **WebSocket 入口** | [websocket_server.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/websocket_server.py) | 接收前端执行请求，代码注入，提交内核 |
+| **WebSocket 入口** | [websocket_server.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/websocket_server.py) | 接收前端执行请求，代码注入，提交内核；send_message 推送结果 |
+| **iopub 订阅** | [subscriber.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/subscriber.py) | `get_messages()` 持续轮询 Jupyter 内核 iopub 通道 |
+| **内核输出解析** | [kernel_output_parser.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/kernel_output_parser.py) | `parse_output_message()` 解析 Jupyter iopub 消息 |
+| **内核管理** | [kernels.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/kernels.py) | Jupyter KernelManager 实例（python3 / pysparkkernel） |
+| **Active Kernel** | [active_kernel.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/active_kernel.py) | 当前活跃内核的客户端管理 |
 | **代码注入** | [output_display.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/utils/output_display.py) | `add_execution_code`, `add_internal_output_info`, `get_block_output_process_code` |
 | **执行代码模板** | [execute_custom_code.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/utils/execute_custom_code.py) | 注入到内核执行的完整脚本，含 `run_task` / `run_tasks` |
 | **输出格式化** | [custom_output.py](file:///d:/fz/0601/solo-dogfeeding/code/321-mage-ai/mage_ai/server/utils/custom_output.py) | `__custom_output` 函数，格式化输出并打印 |
@@ -797,10 +936,10 @@ class ExecutionStatus(StrEnum):
 
 ## 八、常见混淆点澄清
 
-### Q1: WebSocket 和 SSE 两条通道怎么分工？
-- **WebSocket**：双向，前端发请求用（「运行 Block」「取消」等）
-- **SSE**：单向，后端推结果用（stdout、执行状态、输出数据）
-- WebSocket 也可以推结果，但 Magic Kernel 用 SSE 专门推执行结果，传统 Jupyter Kernel 用 WebSocket 推
+### Q1: Pipeline 编辑页的 Block 运行结果走 WebSocket 还是 SSE？
+- **走 WebSocket**。Pipeline 编辑页使用 WebSocket **双向收发**：发请求用 `sendMessage`，收结果用 `onMessage`
+- 后端通过 `get_messages()` → `parse_output_message()` → `WebSocketServer.send_message()` 把 Jupyter 内核的 iopub 消息转发到前端
+- SSE 只用于测试页 `/test` 的 Magic Kernel 场景，跟 Pipeline 编辑页无关
 
 ### Q2: 变量写入到底在 `execute_block_function` 里面还是外面？
 - **普通返回值**：在**外面**（`execute_sync` 外层），`execute_block_function` 只返回 output
