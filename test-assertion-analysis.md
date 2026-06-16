@@ -1,5 +1,176 @@
 # Mage AI 测试与断言机制深度分析
 
+## 零、代码核准与勘误（本章节基于源码走查精确验证）
+
+> 本章节对前版分析中描述的关键路径进行逐行核准，发现并标注实际代码与设计意图的偏差。
+
+---
+
+### 0.1 自动生成脚本依赖上下文注入：实际**完全失效**
+
+#### 核准结论
+`run_process()` 函数中存在代码 BUG，导致「读取所有依赖源码注入 System Prompt」的功能**从未实际生效**。
+
+#### 核准证据
+对 [write_tests.py#L270-L291](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/scripts/server/write_tests.py#L270-L291) 逐行分析：
+
+```python
+def run_process(file_path: str):
+    # ...
+    files_imported = extract_mage_ai_imports(content)   # ✅ 第276行：正确提取了 import 行
+    print(f'Files imported: {len(files_imported)}')
+
+    imported_file_paths = []                             # ⚠️  第279行：空列表初始化
+    for import_line in files_imported:
+        import_file_path = build_file_path_from_import(import_line)
+        print(f'  - {import_file_path}')                 # ❌ 第282行：只打印，从未 append！
+
+    prompt = build_prompt(content, file_path)
+    system_prompt = build_system_prompt(imported_file_paths)  # ⚠️  第285行：传入的是空列表！
+    # ...
+```
+
+**BUG 根因**：第 282 行缺少 `imported_file_paths.append(import_file_path)`。
+
+#### 连锁影响分析
+
+| 函数 | 实际接收值 | 执行结果 |
+|-----|-----------|---------|
+| `build_system_prompt([])` | `file_paths = []` | `for` 循环零次执行，`documents = []` |
+| 最终的 System Prompt | - | `<documents></documents>` 标签内容为空 |
+| Claude API 收到的上下文 | - | **仅包含目标文件本身，不含任何依赖文件源码** |
+
+#### 次级问题：`build_file_path_from_import()` 的路径映射缺陷
+
+对 [write_tests.py#L17-L34](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/scripts/server/write_tests.py#L17-L34) 核准：
+
+```python
+# 典型情况：from mage_ai.settings import get_settings_value
+# 实际映射：mage_ai/settings.py（单个文件）
+# 真实情况：mage_ai/settings/ 是一个目录（子包），内含 __init__.py、platform.py、repo.py 等
+# 结果：FileNotFoundError / PermissionError（即使 append 了也会在 open() 时失败）
+```
+
+**映射边界缺陷**：
+- 对 `import mage_ai.shared.retry`（模块文件）✅ 正确 → `mage_ai/shared/retry.py`
+- 对 `from mage_ai.settings import X`（子包导入）❌ 错误 → 应为 `mage_ai/settings/__init__.py`
+- 对 `from mage_ai.orchestration.db import safe_db_query`（多层子包）❌ 错误 → 应为 `mage_ai/orchestration/db/__init__.py`
+
+#### 核准总结
+| 前版描述（待核准） | 实际情况 | 偏差程度 |
+|-----------------|---------|---------|
+| "读取所有依赖源码注入 System Prompt" | BUG 导致 `imported_file_paths` 恒为空，实际零依赖注入 | **完全失效** |
+| "将每个 import 转为源码文件路径" | 能打印路径但未存入变量，且子包导入映射逻辑缺失 | **部分失效** |
+| "AI 理解真实实现细节" | AI 只能看到目标文件本身 + Few-shot 示例，看不到任何依赖实现 | **认知缩水** |
+
+---
+
+### 0.2 Windows CI 端到端配置差异核准
+
+#### 完整差异对照表
+
+对三份 Playwright 配置 + `build_and_test.yml` 逐字段交叉核准：
+
+| 配置维度 | Linux CI `playwright.config.ci.ts` | Windows CI `playwright-windows.config.ci.ts` | 影响评估 |
+|---------|-----------------------------------|---------------------------------------------|---------|
+| **`testDir`** | `'./tests'`（4 个 spec 文件） | `'./tests/basic'`（仅 1 个 spec 文件） | **测试集缩减 75%** |
+| **`webServer.command`** | `python mage_ai/cli/main.py start test_project` | `cd venv3/Scripts && activate && cd ../../ && python mage_ai/cli/main.py start test_project` | 环境激活方式差异 |
+| **`env.INSTANCE_TYPE`** | 未设置 | `'web_server'` | 潜在条件分支不一致 |
+| **`env.PYTHONPATH`** | `'.'` | `'.'` | ✅ 一致 |
+| **`env.REQUIRE_USER_AUTHENTICATION`** | `'1'` | `'1'` | ✅ 一致 |
+| **Node 版本（CI）** | `18.18.0` | `20.15.1` | 前端构建工具链差异 |
+| **Python 版本（CI）** | 矩阵 3.9/3.10/3.11/3.12，E2E 仅在 3.10 跑 | 仅 `3.10` | ✅ E2E Python 一致 |
+| **后端单元测试** | ✅ `python3 -m unittest discover -s mage_ai` | ❌ **完全跳过** | **Windows 后端零单测覆盖** |
+| **Playwright 浏览器** | Chromium only | Chromium only | ✅ 一致 |
+| **超时/重试策略** | expect 45s / test 100s / CI 重试 2 次 / workers 1 | 与左侧完全一致 | ✅ 一致 |
+
+#### 核准的 CI Job 结构证据
+
+[build_and_test.yml#L111-L148](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/.github/workflows/build_and_test.yml#L111-L148) 中 `test_web_server_windows` Job：
+
+```yaml
+test_web_server_windows:
+  runs-on: windows-latest
+  steps:
+    # ... 省略 Python/Node setup ...
+    - name: Create Mage test project
+      run: |
+        Start-Process -Wait -FilePath "C:\Program Files\Git\unins000.exe" -ArgumentList "/SILENT"
+        python -m venv venv3                          # 显式创建 venv
+        venv3/Scripts/Activate.ps1                    # 手动激活
+        $env:PYTHONPATH = "${env:PYTHONPATH};${pwd}"  # Windows 路径分号
+        python -m pip install -r requirements.txt
+        python mage_ai/cli/main.py init test_project
+    - name: Build frontend, start server, and run Playwright tests
+      run: |
+        yarn playwright test -c playwright-windows.config.ci.ts  # 专用配置
+    # ⚠️  完全没有：python3 -m unittest discover 步骤
+```
+
+**对比 Linux CI Job** [build_and_test.yml#L52-L109](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/.github/workflows/build_and_test.yml#L52-L109)：
+- Linux 两个关键步骤都有：第 72-79 行 `Run unit tests` + `Run mage integrations unit tests`
+- Windows Job 中这两步完全缺失
+
+---
+
+### 0.3 配置差异对测试边界的具体影响
+
+#### 影响一：Windows E2E 测试覆盖范围缩减 75%
+
+Windows 的 `testDir: './tests/basic'` 与 Linux `testDir: './tests'` 导致：
+
+| 测试文件 | Linux CI | Windows CI | 覆盖内容 |
+|---------|----------|-----------|---------|
+| `tests/pipelines.spec.ts` | ✅ 运行 | ❌ 跳过 | Overview 页面入口创建流水线 + Pipelines Dashboard 入口 |
+| `tests/pipeline_runs.spec.ts` | ✅ 运行 | ❌ 跳过 | **example_pipeline 端到端运行流（核心业务路径）** |
+| `tests/pages.spec.ts` | ✅ 运行 | ❌ 跳过 | 基础页面导航 |
+| `tests/basic/pipelines.spec.ts` | ✅ 运行 | ✅ 运行 | 基础流水线 CRUD（单一入口） |
+
+**业务影响**：Windows CI 完全无法检测 example_pipeline 运行成功与否，这是平台最核心的用户路径之一。
+
+#### 影响二：Windows 平台后端代码**零单测覆盖**
+
+| 检测维度 | Linux CI | Windows CI |
+|---------|----------|-----------|
+| 后端 Python 单测（mage_ai/） | ✅ 矩阵 ×4 版本全跑 | ❌ 0 个断言执行 |
+| 集成单测（mage_integrations/） | ✅ Python 3.10 上跑 | ❌ 0 个断言执行 |
+| 任何 Windows 特有路径（`os.name == 'nt'`、反斜杠路径、进程 `CREATE_NO_WINDOW` 等） | ❌ 无法覆盖 | ❌ 也无法覆盖（无单测） |
+
+**典型盲区**：
+- `mage_ai/shared/files.py` 中 Windows 特有的路径处理逻辑
+- `mage_ai/services/spark/*` 中 Windows 下的进程启动参数
+- `mage_ai/cli/main.py` 中 Windows 平台的事件循环选择
+
+#### 影响三：环境变量不一致引发的测试有效性风险
+
+```
+INSTANCE_TYPE 差异：
+  Linux CI:   未设置（默认值由代码 determine）
+  Windows CI: 'web_server'
+```
+
+如果代码中存在 `os.getenv('INSTANCE_TYPE') == 'web_server'` 的条件分支（如 scheduler 角色判断、并发限制、资源配额计算等），两个平台的测试就运行在**不同代码分支**上，失去可比性。
+
+#### 影响四：E2E 功能开关的固定盲区（两平台共有）
+
+[tests/utils.ts#L15-L23](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/mage_ai/frontend/tests/utils.ts#L15-L23) 中的 `ignoreKeys` 定义了**永远不被 E2E 测试启用的功能**：
+
+```typescript
+const featuresFiltered = ignoreKeys(FeatureUUIDEnum, [
+  'CODE_BLOCK_V2',                    // 新版代码块编辑器
+  'COMMAND_CENTER',                   // 命令中心 UI
+  'COMPUTE_MANAGEMENT',               // 计算资源管理
+  'CUSTOM_DESIGN',                    // 自定义设计系统
+  'DBT_V2',                           // DBT v2 集成
+  'GLOBAL_HOOKS',                     // 全局钩子
+  'NOTEBOOK_BLOCK_OUTPUT_SPLIT_VIEW', // Notebook 分栏视图
+]);
+```
+
+**意味着**：即使这 7 个功能在代码中存在缺陷，E2E 测试也**永远无法检测**到——这是硬编码的覆盖盲区，与平台无关。
+
+---
+
 ## 一、前端端到端测试（Playwright E2E）
 
 ### 1.1 框架与配置体系
