@@ -123,16 +123,18 @@ api.pipelines.useUpdate(pipelineUUID, { update_content: true })
 
 [Pipeline.save_async](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/mage_ai/data_preparation/models/pipeline.py#L2419-L2495) 是真正写磁盘的地方，有一个关键的"反直觉"设计：
 
-> 🔑 **拧巴点 3：save_async 预留了"先读磁盘再合并"的单 block 分支，但当前未被使用**
+> 🔑 **拧巴点 3：save() 和 save_async() 都有"先读磁盘再合并"的单 block 分支，但只有 save() 的分支被实际使用**
 >
-> `save_async(block_uuid=xxx)` 分支**不会**直接把当前 `self` 序列化后写盘，而是：
-> 1. 先 `await Pipeline.get_async(self.uuid, self.repo_path)` 从磁盘加载一份 `current_pipeline`
+> `save(block_uuid=xxx)` / `save_async(block_uuid=xxx)` 分支**不会**直接把当前 `self` 序列化后写盘，而是：
+> 1. 先从磁盘加载一份 `current_pipeline`（同步用 `Pipeline(...)` 构造，异步用 `await Pipeline.get_async(...)`）
 > 2. 只把 `block_uuid` 对应的 block 从 self 取出来替换进 `current_pipeline`
 > 3. 然后序列化 `current_pipeline` 写回
 >
-> **然而**：经过逐行追踪所有调用点的参数，当前代码中**没有任何地方**传入 `block_uuid` 走这个分支。所有实际调用都走 `block_uuid=None` 的全量 `self.to_dict()` 写盘。这个"先读后合并"机制是**预留接口**，设计意图是防并发覆盖，但实际运行中全是全量写盘。
+> **实际使用情况**：
+> - `save(block_uuid=xxx)` **活跃**：`Pipeline.update_block()` 在只改 block 自身属性时，通过 `save_kwargs` 传入 `block_uuid`，走这个精确保存分支
+> - `save_async(block_uuid=xxx)` **死代码**：异步编辑保存路径（Pipeline.update）从不传 `block_uuid`，全部走全量 `self.to_dict()` 写盘
 >
-> 详见 [pipeline-edit-sync-analysis.md](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/pipeline-edit-sync-analysis.md) 第五节。
+> 详见 [pipeline-edit-sync-analysis.md](file:///d:/fz/0601/solo-dogfeeding/code/325-mage-ai/pipeline-edit-sync-analysis.md) 第四节。
 
 写完 metadata.yaml 后的额外动作：
 - 写 `.test` 临时文件验证 YAML 合法性，校验不通过抛异常（L2466-L2485）
