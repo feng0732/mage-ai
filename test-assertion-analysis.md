@@ -6,83 +6,165 @@
 
 ---
 
-### 0.1 自动生成脚本依赖上下文注入：实际**完全失效**
+### 0.1 自动生成脚本依赖上下文注入：实际**完全失效**（统一结论）
 
-#### 核准结论
-`run_process()` 函数中存在代码 BUG，导致「读取所有依赖源码注入 System Prompt」的功能**从未实际生效**。
+#### 核准结论（最终统一）
+`run_process()` → `build_system_prompt()` → `build_test()` 完整调用链中存在 BUG，导致「读取所有依赖源码注入 System Prompt 辅助 AI 生成」的设计意图**从未实际生效**。Claude API 实际收到的上下文仅包含：目标文件源代码 + Few-shot 示范对，**零依赖文件源码**。
 
-#### 核准证据
-对 [write_tests.py#L270-L291](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/scripts/server/write_tests.py#L270-L291) 逐行分析：
+#### 完整调用链逐行核准证据
+
+**调用链 1/4：`run_process()` 收集依赖阶段** [write_tests.py#L270-L286](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/scripts/server/write_tests.py#L270-L286)
 
 ```python
 def run_process(file_path: str):
-    # ...
-    files_imported = extract_mage_ai_imports(content)   # ✅ 第276行：正确提取了 import 行
-    print(f'Files imported: {len(files_imported)}')
+    # ... 读取目标文件 content ...
+
+    files_imported = extract_mage_ai_imports(content)   # ✅ 第276行：正确提取 mage_ai import 行
+    print(f'Files imported: {len(files_imported)}')      # 控制台能看到导入数量
 
     imported_file_paths = []                             # ⚠️  第279行：空列表初始化
     for import_line in files_imported:
         import_file_path = build_file_path_from_import(import_line)
-        print(f'  - {import_file_path}')                 # ❌ 第282行：只打印，从未 append！
+        print(f'  - {import_file_path}')                 # ❌ 第282行：只打印路径！从未 append 到列表
 
     prompt = build_prompt(content, file_path)
-    system_prompt = build_system_prompt(imported_file_paths)  # ⚠️  第285行：传入的是空列表！
-    # ...
+    system_prompt = build_system_prompt(imported_file_paths)  # ⚠️  第285行：传入空列表！
+    result = build_test(prompt, system_prompt=system_prompt)
 ```
 
-**BUG 根因**：第 282 行缺少 `imported_file_paths.append(import_file_path)`。
-
-#### 连锁影响分析
-
-| 函数 | 实际接收值 | 执行结果 |
-|-----|-----------|---------|
-| `build_system_prompt([])` | `file_paths = []` | `for` 循环零次执行，`documents = []` |
-| 最终的 System Prompt | - | `<documents></documents>` 标签内容为空 |
-| Claude API 收到的上下文 | - | **仅包含目标文件本身，不含任何依赖文件源码** |
-
-#### 次级问题：`build_file_path_from_import()` 的路径映射缺陷
-
-对 [write_tests.py#L17-L34](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/scripts/server/write_tests.py#L17-L34) 核准：
-
-```python
-# 典型情况：from mage_ai.settings import get_settings_value
-# 实际映射：mage_ai/settings.py（单个文件）
-# 真实情况：mage_ai/settings/ 是一个目录（子包），内含 __init__.py、platform.py、repo.py 等
-# 结果：FileNotFoundError / PermissionError（即使 append 了也会在 open() 时失败）
-```
-
-**映射边界缺陷**：
-- 对 `import mage_ai.shared.retry`（模块文件）✅ 正确 → `mage_ai/shared/retry.py`
-- 对 `from mage_ai.settings import X`（子包导入）❌ 错误 → 应为 `mage_ai/settings/__init__.py`
-- 对 `from mage_ai.orchestration.db import safe_db_query`（多层子包）❌ 错误 → 应为 `mage_ai/orchestration/db/__init__.py`
-
-#### 核准总结
-| 前版描述（待核准） | 实际情况 | 偏差程度 |
-|-----------------|---------|---------|
-| "读取所有依赖源码注入 System Prompt" | BUG 导致 `imported_file_paths` 恒为空，实际零依赖注入 | **完全失效** |
-| "将每个 import 转为源码文件路径" | 能打印路径但未存入变量，且子包导入映射逻辑缺失 | **部分失效** |
-| "AI 理解真实实现细节" | AI 只能看到目标文件本身 + Few-shot 示例，看不到任何依赖实现 | **认知缩水** |
+**BUG 根因**：第 282 行**缺少** `imported_file_paths.append(import_file_path)`，导致无论有多少依赖，`imported_file_paths` 恒为 `[]`。
 
 ---
 
-### 0.2 Windows CI 端到端配置差异核准
+**调用链 2/4：`build_system_prompt()` 处理空列表** [write_tests.py#L176-L210](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/scripts/server/write_tests.py#L176-L210)
 
-#### 完整差异对照表
+```python
+def build_system_prompt(file_paths: list[str]) -> str:
+    documents = []
+    for file_path in file_paths:  # ⚠️  file_paths = []，for 循环零次执行
+        with open(file_path, 'r') as file:
+            code = file.read()
+            documents.append(f"<source>...</source><document_content>{code}</document_content>")
 
-对三份 Playwright 配置 + `build_and_test.yml` 逐字段交叉核准：
+    documents_string = '\n'.join(documents)  # ⚠️  documents = []，join 结果 = ""
 
-| 配置维度 | Linux CI `playwright.config.ci.ts` | Windows CI `playwright-windows.config.ci.ts` | 影响评估 |
-|---------|-----------------------------------|---------------------------------------------|---------|
-| **`testDir`** | `'./tests'`（4 个 spec 文件） | `'./tests/basic'`（仅 1 个 spec 文件） | **测试集缩减 75%** |
-| **`webServer.command`** | `python mage_ai/cli/main.py start test_project` | `cd venv3/Scripts && activate && cd ../../ && python mage_ai/cli/main.py start test_project` | 环境激活方式差异 |
-| **`env.INSTANCE_TYPE`** | 未设置 | `'web_server'` | 潜在条件分支不一致 |
-| **`env.PYTHONPATH`** | `'.'` | `'.'` | ✅ 一致 |
-| **`env.REQUIRE_USER_AUTHENTICATION`** | `'1'` | `'1'` | ✅ 一致 |
-| **Node 版本（CI）** | `18.18.0` | `20.15.1` | 前端构建工具链差异 |
-| **Python 版本（CI）** | 矩阵 3.9/3.10/3.11/3.12，E2E 仅在 3.10 跑 | 仅 `3.10` | ✅ E2E Python 一致 |
-| **后端单元测试** | ✅ `python3 -m unittest discover -s mage_ai` | ❌ **完全跳过** | **Windows 后端零单测覆盖** |
-| **Playwright 浏览器** | Chromium only | Chromium only | ✅ 一致 |
-| **超时/重试策略** | expect 45s / test 100s / CI 重试 2 次 / workers 1 | 与左侧完全一致 | ✅ 一致 |
+    return f"""
+Here are documents that contain Python code for you to reference:
+
+<documents>
+{documents_string}       <!-- ⚠️  最终为空字符串：<documents></documents> -->
+</documents>
+"""
+```
+
+**结果**：System Prompt 中的 `<documents>` 标签内容为空，无任何依赖源码。
+
+---
+
+**调用链 3/4：`build_test()` 传递给 Claude API** [write_tests.py#L213-L242](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/scripts/server/write_tests.py#L213-L242)
+
+```python
+def build_test(prompt: str, system_prompt: Optional[str] = None, temperature: float = 1.0):
+    message = client.messages.create(
+        model=MODEL,
+        max_tokens=4096,
+        temperature=temperature,
+        system=system_prompt,  # ⚠️  传入的是包含空 <documents> 的 system prompt
+        messages=[
+            {'role': 'user', 'content': [{'text': prompt, 'type': 'text'}]},
+            {'role': 'assistant', 'content': '<test>'},  # 前缀填充，引导输出格式
+        ],
+    )
+    return message.content
+```
+
+**结果**：Claude API 的 `system` 参数只包含空的文档引用标签，无实际依赖代码。
+
+---
+
+**调用链 4/4：`build_prompt()` 中的用户 Prompt** [write_tests.py#L71-L173](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/scripts/server/write_tests.py#L71-L173)
+
+用户侧 Prompt 仅包含：
+1. Few-shot 示范（retry 装饰器代码 + RetryTests 测试代码）
+2. 任务说明
+3. 目标文件本身的源代码（`<code>{code}</code>`）
+
+**不包含**任何依赖文件的源码。
+
+#### 完整调用链最终结论
+
+```
+目标文件内容 + Few-shot 示范
+       ↓
+build_prompt() → user prompt（仅目标文件）
+       ↓
+build_system_prompt([]) → system prompt（<documents></documents> 为空）
+       ↓
+build_test() → Claude API
+       ↓
+AI 生成的测试仅基于：目标文件本身 + 示范样式
+```
+
+#### 次级问题：`build_file_path_from_import()` 的路径映射缺陷（即使修复 append 也会失败）
+
+对 [write_tests.py#L17-L34](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/scripts/server/write_tests.py#L17-L34) 核准：
+
+| import 语句 | 映射结果 | 实际文件 | 结果 |
+|------------|---------|---------|------|
+| `import mage_ai.shared.retry` | `mage_ai/shared/retry.py` | ✅ 存在 | 正确 |
+| `from mage_ai.settings import X` | `mage_ai/settings.py` | ❌ 不存在（是子包目录） | `FileNotFoundError` |
+| `from mage_ai.orchestration.db import safe_db_query` | `mage_ai/orchestration/db.py` | ❌ 不存在（是子包目录） | `FileNotFoundError` |
+
+**缺陷根因**：未处理 Python 子包（目录型模块）的 `__init__.py` 约定。
+
+#### 核准总结（统一版）
+| 设计意图（预期） | 实际代码行为 | 偏差程度 |
+|-----------------|-------------|---------|
+| 解析 mage_ai 内部依赖 | ✅ 能正确提取 import 行并打印路径 | 无偏差 |
+| 读取所有依赖源码注入 System Prompt | ❌ `imported_file_paths` 恒为空，无依赖被读取注入 | **完全失效** |
+| AI 基于完整上下文生成测试 | ❌ AI 仅能看到目标文件 + Few-shot 示范 | **认知缩水** |
+| import → 文件路径映射正确 | ❌ 子包导入映射错误，即使修复 append 也会 `open()` 失败 | **部分失效** |
+
+---
+
+### 0.2 Windows CI 端到端配置差异核准（补齐完整表）
+
+#### 完整三方配置对照表（逐字段核准，无遗漏）
+
+对三份 Playwright 配置文件 + `build_and_test.yml` CI 工作流进行**逐字段交叉核准**，共 16 项配置维度：
+
+| 配置维度 | 本地开发 `playwright.config.ts` | Linux CI `playwright.config.ci.ts` | Windows CI `playwright-windows.config.ci.ts` | 差异影响评估 |
+|---------|-------------------------------|-----------------------------------|---------------------------------------------|-------------|
+| **`expect.timeout`** | `45000`（45秒） | `45000`（45秒） | `45000`（45秒） | ✅ 全一致 |
+| **`forbidOnly`** | `!!process.env.CI` | `!!process.env.CI` | `!!process.env.CI` | ✅ 全一致 |
+| **`fullyParallel`** | `true` | `true` | `true` | ✅ 全一致 |
+| **`projects`** | Chromium only | Chromium only | Chromium only | ✅ 全一致 |
+| **`reporter`** | `'html'` | `'html'` | `'html'` | ✅ 全一致 |
+| **`retries`** | `process.env.CI ? 2 : 0` | `process.env.CI ? 2 : 0` | `process.env.CI ? 2 : 0` | ✅ 全一致 |
+| **`timeout`** | `100000`（100秒） | `100000`（100秒） | `100000`（100秒） | ✅ 全一致 |
+| **`workers`** | `process.env.CI ? 1 : undefined` | `process.env.CI ? 1 : undefined` | `process.env.CI ? 1 : undefined` | ✅ 全一致 |
+| **`use.trace`** | `'on'` | `'on'` | `'on'` | ✅ 全一致 |
+| **`webServer.reuseExistingServer`** | `!process.env.CI` | `!process.env.CI` | `!process.env.CI` | ✅ 全一致 |
+| --- | --- | --- | --- | --- |
+| **`testDir`** 🔴 | `'./tests'`（4 spec） | `'./tests'`（4 spec） | `'./tests/basic'`（1 spec） | **Windows 测试集缩减 75%** |
+| **`use.baseURL`** 🔴 | `'http://localhost:3000'` | `'http://localhost:6789'` | `'http://localhost:6789'` | 本地用 Next.js dev，CI 用生产服务 |
+| **`webServer.command`** 🔴 | `'yarn run dev'` | `'python mage_ai/cli/main.py start test_project'` | `'cd venv3/Scripts && activate && cd ../../ && python mage_ai/cli/main.py start test_project'` | Windows 需显式激活 venv |
+| **`webServer.cwd`** 🔴 | 未设置 | `'../../'` | `'../../'` | ✅ CI 间一致，本地不同 |
+| **`webServer.url`** 🔴 | `'http://localhost:3000'` | `'http://localhost:6789'` | `'http://localhost:6789'` | 与 baseURL 对应 |
+| **`webServer.env`** 🔴 | 未设置 env 对象 | `{ PYTHONPATH: '.', REQUIRE_USER_AUTHENTICATION: '1' }` | `{ INSTANCE_TYPE: 'web_server', PYTHONPATH: '.', REQUIRE_USER_AUTHENTICATION: '1' }` | **Windows 多设了 `INSTANCE_TYPE`** |
+| --- | --- | --- | --- | --- |
+| **Node 版本（CI YAML）** 🔴 | N/A | `18.18.0` | `20.15.1` | 前端构建工具链差异 |
+| **Python 版本（CI YAML）** 🔴 | N/A | 矩阵 3.9-3.12，E2E 仅 3.10 | 仅 `3.10` | ✅ E2E Python 一致 |
+| **后端单测（CI YAML）** 🔴 | N/A | ✅ `python -m unittest discover -s mage_ai` | ❌ **完全省略** | **Windows 后端零单测覆盖** |
+| **集成单测（CI YAML）** 🔴 | N/A | ✅ `python -m unittest discover mage_integrations.tests` | ❌ **完全省略** | **Windows 集成零单测覆盖** |
+
+#### 配置差异分类统计
+| 分类 | 数量 | 具体维度 |
+|-----|------|---------|
+| ✅ 三平台完全一致 | 10 项 | expect.timeout、forbidOnly、fullyParallel、projects、reporter、retries、timeout、workers、use.trace、webServer.reuseExistingServer |
+| 🔴 CI 间一致，与本地不同 | 4 项 | use.baseURL、webServer.command、webServer.url、webServer.cwd |
+| 🔴 Linux CI vs Windows CI 差异 | 5 项 | testDir、webServer.env(INSTANCE_TYPE)、Node版本、后端单测、集成单测 |
+| **合计** | **19 项** | |
 
 #### 核准的 CI Job 结构证据
 
@@ -91,8 +173,19 @@ def run_process(file_path: str):
 ```yaml
 test_web_server_windows:
   runs-on: windows-latest
+  strategy:
+    matrix:
+      python-version: ["3.10"]    # 仅 3.10，无矩阵
   steps:
-    # ... 省略 Python/Node setup ...
+    - uses: actions/checkout@v5
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.10"
+    - name: Set up Node
+      uses: actions/setup-node@v6
+      with:
+        node-version: "20.15.1"   # Node 20，与 Linux 的 18.18.0 不同
     - name: Create Mage test project
       run: |
         Start-Process -Wait -FilePath "C:\Program Files\Git\unins000.exe" -ArgumentList "/SILENT"
@@ -103,13 +196,18 @@ test_web_server_windows:
         python mage_ai/cli/main.py init test_project
     - name: Build frontend, start server, and run Playwright tests
       run: |
+        yarn install &&
+        yarn export_prod &&
+        yarn playwright install chromium &&
         yarn playwright test -c playwright-windows.config.ci.ts  # 专用配置
-    # ⚠️  完全没有：python3 -m unittest discover 步骤
+      working-directory: mage_ai/frontend/
+    # ⚠️  完全没有：python -m unittest discover 步骤
+    # ⚠️  完全没有：mage_integrations 测试步骤
 ```
 
 **对比 Linux CI Job** [build_and_test.yml#L52-L109](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/.github/workflows/build_and_test.yml#L52-L109)：
-- Linux 两个关键步骤都有：第 72-79 行 `Run unit tests` + `Run mage integrations unit tests`
-- Windows Job 中这两步完全缺失
+- Linux 第 72-79 行：`Run unit tests` + `Run mage integrations unit tests` 两步完整执行
+- Windows Job 中这两步**完全缺失**
 
 ---
 
@@ -181,9 +279,11 @@ Mage AI 前端采用 **Playwright** 作为端到端测试框架，存在三套�
 |---------|------|----------|----------------|---------|
 | [playwright.config.ts](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/mage_ai/frontend/playwright.config.ts) | 本地开发调试 | `http://localhost:3000` | `yarn run dev`（Next.js dev server） | 本地并行 |
 | [playwright.config.ci.ts](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/mage_ai/frontend/playwright.config.ci.ts) | CI 环境 | `http://localhost:6789` | `python mage_ai/cli/main.py start test_project`（生产模式） | 串行（workers=1） |
-| [playwright-windows.config.ci.ts](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/mage_ai/frontend/playwright-windows.config.ci.ts) | Windows CI | - | - | - |
+| [playwright-windows.config.ci.ts](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/mage_ai/frontend/playwright-windows.config.ci.ts) | Windows CI | `http://localhost:6789` | `cd venv3/Scripts && activate && cd ../../ && python mage_ai/cli/main.py start test_project`（需显式激活 venv） | 串行（workers=1） |
 
-**CI 核心配置特征**：
+> **⚠️ 核准提示**：完整的 19 项配置维度三方对比表（含 CI YAML 层面差异）请参考 [第零章 0.2 节](#02-windows-ci-端到端配置差异核准补齐完整表)。
+
+**CI 核心配置特征（Linux CI）**：
 
 ```typescript
 // playwright.config.ci.ts
@@ -215,6 +315,13 @@ Mage AI 前端采用 **Playwright** 作为端到端测试框架，存在三套�
 - **强制认证**：`REQUIRE_USER_AUTHENTICATION=1`，测试带权限的真实用户流程
 - **Trace 全开**：失败时可通过 Playwright Trace Viewer 复现完整操作
 - **长超时**：E2E 涉及服务启动、页面渲染、异步加载，超时阈值高
+
+**Windows CI 特有差异（与第零章核准结论统一）**：
+- 🔴 **测试集缩减**：`testDir: './tests/basic'`，仅运行 `tests/basic/pipelines.spec.ts`，不跑 `pipeline_runs.spec.ts` 等核心流程
+- 🔴 **环境变量不一致**：额外设置 `INSTANCE_TYPE: 'web_server'`，可能导致与 Linux CI 运行在不同代码分支
+- 🔴 **Node 版本差异**：Node 20.15.1 对比 Linux 的 Node 18.18.0
+- 🔴 **需显式激活 venv**：启动命令前置 `cd venv3/Scripts && activate && cd ../../`
+- 🔴 **后端单测全跳**：CI YAML 中完全省略 `python -m unittest discover` 步骤
 
 ### 1.2 测试 Fixture 体系
 
@@ -328,7 +435,9 @@ await expect(page.locator('#pipeline-triggers-row-0')).toContainText('completed'
 
 [scripts/server/write_tests.py](file:///d:/fz/0601/solo-dogfeeding/code/332-mage-ai/scripts/server/write_tests.py) 是一个基于 **Claude AI (claude-3-opus-20240229)** 的单元测试自动生成工具。
 
-**核心执行流程**：
+> **⚠️ 重要核准结论（与第零章统一）**：设计了依赖源码注入能力，但**因代码 BUG 实际未生效**。详见 [第零章 0.1 节](#01-自动生成脚本依赖上下文注入实际完全失效统一结论)。
+
+**设计预期的执行流程**（代码逻辑设计）：
 
 ```
 输入：目标 Python 文件路径
@@ -344,6 +453,30 @@ await expect(page.locator('#pipeline-triggers-row-0')).toContainText('completed'
 5. build_prompt()：构造 Few-shot Prompt（示例代码 + 示例测试）
     ↓
 6. build_test()：调用 Claude API 生成测试代码
+    ↓
+7. 解析 AI 返回：提取 <test>...</test> 标签内代码
+    ↓
+8. 写入 mage_ai/tests/ 对应目录的 test_*.py 文件
+    ↓
+9. run_shell_command()：自动执行 unittest 验证生成结果
+```
+
+**实际执行的流程**（代码 BUG 导致）：
+
+```
+输入：目标 Python 文件路径
+    ↓
+1. 读取源代码内容
+    ↓
+2. extract_mage_ai_imports()：解析 mage_ai 内部依赖导入（仅打印，未存入列表）
+    ↓
+3. build_file_path_from_import()：将每个 import 转为源码文件路径（仅打印，未使用）
+    ↓
+4. build_system_prompt([])：传入空列表，<documents> 标签内容为空
+    ↓
+5. build_prompt()：构造 Few-shot Prompt（仅包含目标文件 + 示范对）
+    ↓
+6. build_test()：调用 Claude API 生成测试代码（零依赖上下文）
     ↓
 7. 解析 AI 返回：提取 <test>...</test> 标签内代码
     ↓
@@ -387,7 +520,12 @@ class RetryTests(TestCase):
 2. **强制引用先行**：要求 AI 先找到相关代码引用再回答，降低幻觉
 3. **角色预热**："Instruct Claude to read the document carefully, as it will be asked questions later"
 
-**System Prompt 上下文注入**：通过 `build_system_prompt()` 将目标文件及其所有 mage_ai 内部依赖的源代码完整注入，确保 AI 理解真实实现细节。
+**System Prompt 上下文注入（与第零章核准结论统一）**：
+
+| 设计预期 | 实际代码行为 |
+|---------|-------------|
+| `build_system_prompt()` 将目标文件及其所有 mage_ai 内部依赖的源代码完整注入 | ❌ 因 `imported_file_paths` 恒为空，`<documents>` 标签内容为空，零依赖注入 |
+| AI 理解真实实现细节，生成更准确的测试 | ❌ AI 仅基于目标文件本身 + Few-shot 示范生成 |
 
 ### 2.3 文件路径映射规则
 
@@ -405,6 +543,11 @@ def build_file_path_from_import(import_line, base_path=''):
 # 输出: mage_ai/tests/shared/test_utils.py
 ```
 
+**核准的映射边界缺陷（与第零章统一）**：
+- ✅ 对 `import mage_ai.shared.retry`（模块文件）：正确映射到 `mage_ai/shared/retry.py`
+- ❌ 对 `from mage_ai.settings import X`（子包导入）：错误映射到 `mage_ai/settings.py`（实际应为 `mage_ai/settings/__init__.py`）
+- ❌ 对 `from mage_ai.orchestration.db import safe_db_query`（多层子包）：错误映射到 `mage_ai/orchestration/db.py`
+
 ### 2.4 自动化验证闭环
 
 生成完成后，脚本会**自动运行 unittest** 验证：
@@ -414,9 +557,10 @@ command = f'./scripts/server/py.sh -m unittest {test_file_path}'
 output = run_shell_command(command, raise_on_error=False)
 ```
 
-**边界约束**：
+**边界约束（与第零章核准结论统一）**：
 - **模型限制**：`max_tokens=4096`，单个文件生成的测试代码约 1000 行以内
-- **仅处理 mage_ai 内部导入**：第三方库（pandas, sqlalchemy 等）不包含在上下文注入中
+- **依赖注入实际状态**：⚠️  零依赖注入（BUG 导致），第三方库和内部依赖均未注入
+- **路径映射实际状态**：⚠️  子包导入映射错误（即使修复 append BUG，也会 `FileNotFoundError`）
 - **手动目标文件**：脚本主函数使用硬编码文件列表 `mage_ai/data_preparation/models/utils.py` 等，注释中提供了 `git diff` 过滤新增文件的自动化方案
 
 ---
