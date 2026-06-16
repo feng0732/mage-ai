@@ -17,11 +17,27 @@
 
 ---
 
-## 一、触发远程执行的三层判定链
+## 一、两条独立路径：远程执行 vs 监控路由
 
-Mage 决定「是否走 EMR 远程执行」由三层判定叠加而成，任何一层不满足都不会触发 EMR。
+Mage 中「Spark/EMR」涉及两条**完全独立**的代码路径，它们的入口、判断条件、依赖配置各不相同，不能混为一谈：
 
-### 第 1 层：Pipeline 执行器选择
+| 维度 | 路径 A：远程 EMR 执行 | 路径 B：Spark UI 监控路由 |
+|------|----------------------|--------------------------|
+| **做什么** | 向 EMR 集群提交 spark-submit Step | 决定前端 Spark UI 连本地端口还是 SSH 隧道 |
+| **入口代码** | `PySparkPipelineExecutor.execute()` | `get_compute_service()` / `ComputeService.build()` |
+| **触发条件** | executor_type == PYSPARK | emr_config + spark_config + kernel |
+| **依赖 emr_config** | ✅ 用来建集群/加 Step | ✅ 用来判断走 EMR 路由 |
+| **依赖 spark_config** | ❌ **完全不检查** | ✅ `ComputeService.build()` 要求非空 |
+| **依赖 kernel 类型** | ❌ **完全不检查** | ✅ `get_compute_service()` 要求 PYSPARK |
+| **依赖 s3_bucket** | ✅ 没有则初始化直接报错 | ❌ 不涉及 |
+
+> ⚠️ **最易混淆的点**：远程执行和监控路由可以独立生效。一个 Pipeline 可能已经在 EMR 上跑起来了（路径 A），但 Mage 前端的 Spark UI 页面还是显示空白（路径 B 不通）。反之亦然。
+
+---
+
+## 二、路径 A：远程 EMR 执行的触发条件
+
+### 步骤 1：ExecutorFactory 选出 PySpark 执行器
 
 **代码位置**：`mage_ai/data_preparation/executors/executor_factory.py` L24-L37
 
@@ -57,7 +73,7 @@ pipeline.type == PYSPARK ?
              └─ 其他值 → 使用该值
 ```
 
-### 第 2 层：Block 执行器选择
+### 步骤 2：Block 级执行器选择
 
 **代码位置**：`mage_ai/data_preparation/executors/executor_factory.py` L127-L138
 
@@ -94,10 +110,6 @@ if executor_type is None:
 | PYSPARK | SENSOR | 否 | 不自动提升，走 block.get_executor_type() |
 | 非 PYSPARK | 任意 | 任意 | 不自动提升，走 block.get_executor_type() |
 
-> ⚠️ **之前描述错误**：上一版写反了 SENSOR 的行为。实际是：SENSOR 类型的 Block 只要代码含 `spark` 字面量，依然会自动提升为 PySpark 执行器。
->
-> **正确结论**：非 SENSOR 的 Block，只要 Pipeline 是 PYSPARK 类型，不管代码写什么，都会走 PySpark；SENSOR 类型的 Block 需要代码含 `spark` 字面量才会走 PySpark。
-
 #### 2.2 Block.get_executor_type() 二级回退链
 
 **代码位置**：`mage_ai/data_preparation/models/block/__init__.py` L2884-L2900
@@ -105,12 +117,9 @@ if executor_type is None:
 ```python
 def get_executor_type(self) -> str:
     if self.executor_type:
-        # Block 自身配置了 executor_type → 支持 Jinja 模板渲染
         block_executor_type = Template(self.executor_type).render(**get_template_vars())
     else:
         block_executor_type = None
-    
-    # 如果 Block 没配置 或 配置为 LOCAL_PYTHON → 回退到 Pipeline
     if not block_executor_type or block_executor_type == ExecutorType.LOCAL_PYTHON:
         if self.pipeline:
             pipeline_executor_type = self.pipeline.get_executor_type()
@@ -146,9 +155,70 @@ Block.executor_type (支持 Jinja)
 | Block 未配置但 Pipeline `executor_type: pyspark` | 通过回退链继承 |
 | DEFAULT_EXECUTOR_TYPE=pyspark | 环境变量兜底 |
 
-### 第 3 层：计算服务类型判定（监控 / 交互层）
+### 步骤 3：PySpark 执行器初始化（路径 A 的实际前置约束）
 
-**代码位置 1**：`mage_ai/services/spark/utils.py` L9-L37
+executor_type == PYSPARK 后，`PySparkPipelineExecutor.__init__()` 或 `PySparkBlockExecutor.__init__()` 被调用。它们**不检查 emr_config 是否为空**，也不检查 spark_config 和 kernel 类型，但有唯一前置约束：
+
+**代码位置**：`mage_ai/data_preparation/executors/pyspark_pipeline_executor.py` L18-L28
+
+```python
+self.emr_config = self.pipeline.repo_config.emr_config or dict()  # 空 dict 也能跑，用默认值
+# ...
+self.resource_manager = EmrResourceManager(
+    pipeline.repo_config.s3_bucket,        # ← 这个不能是 None
+    pipeline.repo_config.s3_path_prefix,
+)
+```
+
+**代码位置**：`mage_ai/services/aws/emr/resource_manager.py` L16-L20
+
+```python
+if self.s3_bucket is None:
+    raise Exception('Please specify the correct s3_bucket to initialize EMR cluster.'
+                    'Add "remote_variables_dir: s3://[bucket]/[path]" to'
+                    ' project\'s metadata.yaml file.')
+```
+
+**路径 A 的完整前置条件**：
+
+| 条件 | 代码位置 | 缺失后果 |
+|------|----------|----------|
+| executor_type == PYSPARK | executor_factory.py | 走 BlockExecutor 本地执行 |
+| `remote_variables_dir: s3://bucket/path` | repo_manager.py L158, resource_manager.py L16 | `EmrResourceManager.__init__()` 抛异常 |
+
+**路径 A 不检查的东西**：
+
+| 不检查项 | 说明 |
+|----------|------|
+| emr_config 是否有内容 | 空 dict `{}` 也行，EmrConfig.load() 会用默认值（如 `r5.4xlarge`） |
+| spark_config | 执行器完全不读 spark_config |
+| kernel 类型 | 执行器完全不关心 kernel |
+| ComputeService 路由 | 执行路径和监控路由完全独立 |
+
+### 步骤 4：提交 EMR Step（路径 A 的执行动作）
+
+**代码位置**：`mage_ai/data_preparation/executors/pyspark_pipeline_executor.py` L46-L48
+
+```python
+def execute(self, ...) -> None:
+    self.upload_pipeline_execution_script(global_vars=global_vars)  # 渲染 jinja → S3
+    self.resource_manager.upload_bootstrap_script()                  # bootstrap → S3
+    self.submit_spark_job()                                          # emr.submit_spark_job()
+```
+
+`emr.submit_spark_job()` 内部会自动查找/创建 EMR 集群，不需要预先配置。
+
+---
+
+## 三、路径 B：Spark UI 监控路由的触发条件
+
+路径 B 决定 Mage 前端的 Spark UI 页面连接到哪里。有两个独立入口，判断条件不同。
+
+### 入口 B1：get_compute_service()
+
+**代码位置**：`mage_ai/services/spark/utils.py` L9-L37
+
+**调用方**：`mage_ai/services/spark/api/service.py` L17（`API.build()` 内部）
 
 ```python
 def get_compute_service(emr_config=None, repo_config=None, ...):
@@ -156,10 +226,11 @@ def get_compute_service(emr_config=None, repo_config=None, ...):
         repo_config = get_repo_config()
     if repo_config and emr_config:
         repo_config.emr_config = emr_config
-    
     if not repo_config:
         return None
-    
+    if not kernel_name:
+        kernel_name = get_active_kernel_name()
+
     if repo_config.emr_config and (KernelName.PYSPARK == kernel_name or ignore_active_kernel):
         return ComputeServiceUUID.AWS_EMR
     elif is_spark_env() and repo_config.spark_config and \
@@ -168,87 +239,78 @@ def get_compute_service(emr_config=None, repo_config=None, ...):
     return None
 ```
 
-**代码位置 2**：`mage_ai/services/compute/models.py` L147-L156
+**入口 B1 的判断条件**：
+
+| 条件 | 说明 |
+|------|------|
+| `repo_config.emr_config` 非空 dict | 直接读 repo_config，不经 project 属性；`{}` 是 falsy |
+| kernel == PYSPARK **或** `ignore_active_kernel=True` | `API.build()` 调用时固定传 `ignore_active_kernel=True` |
+| **不检查** spark_config | AWS_EMR 分支完全不读 spark_config |
+
+### 入口 B2：ComputeService.build()
+
+**代码位置**：`mage_ai/services/compute/models.py` L147-L156
+
+**调用方**：Mage 前端集群管理页面
 
 ```python
 @classmethod
 def build(self, project, with_clusters=False):
     service_class = self
-    if project and project.spark_config:
-        if project.emr_config:
-            from mage_ai.services.compute.aws.models import AWSEMRComputeService
+    if project and project.spark_config:      # 第 1 关
+        if project.emr_config:                 # 第 2 关
             service_class = AWSEMRComputeService
     return service_class(project=project, with_clusters=with_clusters)
 ```
 
-**代码位置 3**：`mage_ai/data_preparation/models/project/__init__.py` L154-L159
+**入口 B2 的判断条件**：
 
-```python
-@property
-def emr_config(self) -> Dict:
-    return self.repo_config.emr_config or None
+| 条件 | 说明 |
+|------|------|
+| `project.spark_config` 非 None | 经 `or None` 转换后，空 dict `{}` 也会变成 `None` |
+| `project.emr_config` 非 None | 经 `or None` 转换后，空 dict `{}` 也会变成 `None` |
+| **不检查** kernel | 此路径不关心 kernel 类型 |
 
-@property
-def spark_config(self) -> Dict:
-    return self.repo_config.spark_config or None
+### 配置值的完整传递链路
+
+#### emr_config 的传递链
+
+```
+metadata.yaml                    repo_config                    project
+─────────────                   ───────────                    ───────
+不写 emr_config       →  {}.get('emr_config') or dict()
+                        = {}               →        {}.emr_config or None = None
+
+emr_config: {}        →  {}.get('emr_config') or dict()
+                        = {}               →        {}.emr_config or None = None
+
+emr_config:           →  {}.get('emr_config') or dict()
+  master_instance_type: r5.xlarge  = {master...: r5...}  →  {master...: r5...}
 ```
 
-#### 3.1 空配置判断的完整链路
+**结论**：`project.emr_config` 永远不会是 `{}`，要么 `None` 要么非空 dict。
 
-两个判断入口（`get_compute_service()` 和 `ComputeService.build()`）的判断条件**不同**，必须分开分析。
+#### spark_config 的传递链
 
-**代码位置 4**：`mage_ai/data_preparation/repo_manager.py` L135, L139（配置加载）
+```
+metadata.yaml                    repo_config                    project
+─────────────                   ───────────                    ───────
+不写 spark_config      →  {}.get('spark_config')
+                        = None             →       None or None = None
 
-```python
-self.emr_config = repo_config.get('emr_config') or dict()  # 缺失/空 → {}
-self.spark_config = repo_config.get('spark_config')        # 缺失 → None, 空 → {}
+spark_config: {}       →  {}.get('spark_config')
+                        = {}               →       {} or None = None
+
+spark_config:          →  {}.get('spark_config')
+  app_name: my-app       = {app_name: my-app}  →  {app_name: my-app}
 ```
 
-**代码位置 5**：`mage_ai/data_preparation/models/project/__init__.py` L154-L159（属性转换）
+**结论**：`project.spark_config` 也永远不会是 `{}`，要么 `None` 要么非空 dict。
 
-```python
-@property
-def emr_config(self) -> Dict:
-    return self.repo_config.emr_config or None    # {} → None, {有key} → {有key}
+### 入口 B1 和 B2 的完整真值表
 
-@property
-def spark_config(self) -> Dict:
-    return self.repo_config.spark_config or None  # None→None, {}→None, {有key}→{有key}
-```
-
-> ⚠️ **关键**：`or None` 会把空 dict `{}` 转换为 `None`。所以 `project.spark_config` 和 `project.emr_config` 永远不会是 `{}`，要么是 `None`，要么是非空 dict。
-
-**入口 A**：`get_compute_service()`（`mage_ai/services/spark/utils.py` L30）
-
-```python
-if repo_config.emr_config and (KernelName.PYSPARK == kernel_name or ignore_active_kernel):
-    return ComputeServiceUUID.AWS_EMR
-```
-
-| 判断条件 | 说明 |
-|----------|------|
-| `repo_config.emr_config` | 直接用 repo_config，不经 project 属性转换；`{}` 是 falsy，`{有key}` 是 truthy |
-| kernel 条件 | kernel 是 PYSPARK **或** `ignore_active_kernel=True` |
-| **不检查** spark_config | AWS_EMR 路径完全不检查 spark_config |
-
-**入口 B**：`ComputeService.build()`（`mage_ai/services/compute/models.py` L147-L156）
-
-```python
-if project and project.spark_config:      # 第 1 关：spark_config 必须非 None
-    if project.emr_config:                 # 第 2 关：emr_config 必须非 None
-        service_class = AWSEMRComputeService
-```
-
-| 判断条件 | 说明 |
-|----------|------|
-| `project.spark_config` | 经 `or None` 转换后，**空 dict `{}` 也会变成 `None`**，所以 `spark_config: {}` 等效于缺失 |
-| `project.emr_config` | 经 `or None` 转换后，**空 dict `{}` 也会变成 `None`**，所以 `emr_config: {}` 等效于缺失 |
-| **不检查** kernel | 此路径不检查 kernel 类型 |
-
-#### 3.1.1 两个入口的完整真值表
-
-| # | metadata.yaml 中 | repo_config.emr_config | repo_config.spark_config | project.emr_config | project.spark_config | 入口A (utils.py) AWS_EMR? | 入口B (compute/models.py) AWSEMRComputeService? |
-|---|-------------------|------------------------|--------------------------|--------------------|----------------------|---------------------------|--------------------------------------------------|
+| # | metadata.yaml 中 | repo_config.emr_config | repo_config.spark_config | project.emr_config | project.spark_config | B1 (utils.py) AWS_EMR? | B2 (compute/models.py) AWSEMR? |
+|---|-------------------|------------------------|--------------------------|--------------------|----------------------|------------------------|--------------------------------|
 | 1 | 都不写 | `{}` | `None` | `None` | `None` | ❌ `if {}` → False | ❌ `if None` → False |
 | 2 | `emr_config: {}` | `{}` | `None` | `None` | `None` | ❌ `if {}` → False | ❌ `if None` → False |
 | 3 | `emr_config: {}` + `spark_config: {}` | `{}` | `{}` | `None` | `None` | ❌ `if {}` → False | ❌ `if None` → False |
@@ -256,28 +318,54 @@ if project and project.spark_config:      # 第 1 关：spark_config 必须非 N
 | 5 | `emr_config:` 有子项 + `spark_config: {}` | `{有key}` | `{}` | `{有key}` | `None` | ✅ (需 kernel=PYSPARK) | ❌ `{} or None = None` → False |
 | 6 | `emr_config:` 有子项 + `spark_config:` 有子项 | `{有key}` | `{有key}` | `{有key}` | `{有key}` | ✅ (需 kernel=PYSPARK) | ✅ |
 
-> ⚠️ **核心发现**：第 5 行是最容易误判的组合。`spark_config: {}` 写了空 dict，但经过 `project.spark_config` 属性的 `or None` 转换后变成 `None`，和完全不写效果一样，**不能触发 `ComputeService.build()` 的 AWS_EMR 路径**。
+### 两个入口的差异总结
 
-#### 3.1.2 两个入口的差异总结
-
-| 维度 | 入口A `get_compute_service()` | 入口B `ComputeService.build()` |
-|------|-------------------------------|-------------------------------|
+| 维度 | B1 `get_compute_service()` | B2 `ComputeService.build()` |
+|------|----------------------------|------------------------------|
 | 数据源 | `repo_config` 直接读取 | `project` 属性（经 `or None` 转换） |
-| emr_config | 必须非空 dict | 必须非空 dict（`{}` 被 `or None` 过滤） |
-| spark_config | **不检查** | 必须非空 dict（`{}` 被 `or None` 过滤） |
+| emr_config | 必须非空 dict | 必须非空 dict（`{}` 被 `or None` 过滤为 `None`） |
+| spark_config | **不检查** | 必须非空 dict（`{}` 被 `or None` 过滤为 `None`） |
 | kernel 条件 | kernel=PYSPARK 或 ignore_active_kernel | **不检查** |
+| 用途 | 决定 API.build() 走 AwsEmrAPI 还是 LocalAPI | 决定集群管理页显示哪种 ComputeService |
 
-#### 3.2 触发条件汇总
+### 路径 B 的完整前置条件
 
-两个入口在不同场景下被调用，最终要完整触发 AWS_EMR 需要**两个入口都通过**：
+要使 Spark UI 监控路由走 EMR 通道：
 
 1. ✅ `metadata.yaml` 中 `emr_config` 段至少配置一个子项（如 `master_instance_type`）
-2. ✅ `metadata.yaml` 中 `spark_config` 段至少配置一个子项（如 `app_name` 或 `spark_master`），**空 dict `{}` 不算配置**
-3. ✅ 当前 kernel 是 `pyspark`，或调用方传 `ignore_active_kernel=True`（仅入口A 需要）
+2. ✅ `metadata.yaml` 中 `spark_config` 段至少配置一个子项（如 `app_name`），**空 dict `{}` 等效于缺失**
+3. ✅ 当前 kernel 是 `pyspark`，或调用方传 `ignore_active_kernel=True`（仅 B1 需要）
 
 ---
 
-## 二、配置的完整加载链路
+## 四、两条路径的对照总结
+
+### 独立生效示例
+
+| 场景 | 路径 A（远程执行） | 路径 B（监控路由） |
+|------|-------------------|-------------------|
+| Pipeline type=pyspark + emr_config 有子项 + remote_variables_dir 有 + spark_config 未配 | ✅ 正常提交 EMR Step | ❌ B2 不通，Spark UI 空白 |
+| Pipeline type=pyspark + emr_config 有子项 + remote_variables_dir 有 + spark_config 有子项 | ✅ 正常提交 EMR Step | ✅ Spark UI 通过 SSH 隧道访问 |
+| Pipeline type=python + DEFAULT_EXECUTOR_TYPE=pyspark + emr_config 空 | ❌ EmrResourceManager 报错（缺 s3_bucket） | ❌ 两个入口都不通 |
+| 非 PYSPARK Pipeline + emr_config 有子项 + spark_config 有子项 | ❌ 走本地 BlockExecutor | ✅ B1/B2 都走 EMR 路由（但无实际集群可连） |
+
+### 配置依赖矩阵
+
+| 配置项 | 路径 A 是否依赖 | 路径 B 是否依赖 | 说明 |
+|--------|:---:|:---:|------|
+| `pipeline.type == pyspark` | ✅ | ❌ | 执行器选择的关键条件 |
+| `executor_type: pyspark` | ✅ | ❌ | Pipeline/Block 级配置 |
+| `DEFAULT_EXECUTOR_TYPE` | ✅ | ❌ | 环境变量兜底 |
+| `remote_variables_dir: s3://...` | ✅ | ❌ | 缺了直接报错 |
+| `emr_config` 有实际子项 | 间接（EmrConfig 默认值兜底） | ✅ | B1 和 B2 都检查 |
+| `spark_config` 有实际子项 | ❌ | ✅（仅 B2） | B1 不检查 |
+| kernel == PYSPARK | ❌ | ✅（仅 B1） | 执行器不检查 |
+
+> ⚠️ **emr_config 在路径 A 中的角色**：PySparkPipelineExecutor 不检查 emr_config 是否为空，空 dict 会传给 `EmrConfig.load()`，后者用硬编码默认值（如 `r5.4xlarge`、1 个 slave 节点）填充。所以 emr_config 对路径 A 是「有更好，没有也能跑（用默认值）」，而对路径 B 是「必须有（否则路由不通）」。
+
+---
+
+## 五、配置的完整加载链路
 
 ### 配置层级与合并顺序
 
@@ -329,7 +417,7 @@ if self.remote_variables_dir is not None and self.remote_variables_dir.startswit
 
 ---
 
-## 三、结果落点全图：状态与监控信息的精确边界
+## 六、结果落点全图：状态与监控信息的精确边界
 
 ### 3.1 状态更新的三层边界
 
@@ -455,7 +543,7 @@ else:
 
 ---
 
-## 四、远程执行的完整数据流图（按代码事实校正版）
+## 七、远程执行的完整数据流图（按代码事实校正版）
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -533,7 +621,7 @@ else:
 
 ---
 
-## 五、关键文件索引（相对路径）
+## 八、关键文件索引（相对路径）
 
 | 层级 | 文件路径 | 关键职责 |
 |------|----------|----------|
@@ -563,47 +651,48 @@ else:
 
 ---
 
-## 六、与代码事实核对的 5 个关键结论
+## 九、与代码事实核对的关键结论
 
-### 结论 1：非 SENSOR Block 在 PYSPARK Pipeline 中强制走 PySpark
+### 结论 1：远程执行和监控路由是两条独立的代码路径
 
-只要 `pipeline.type == PYSPARK`，非 SENSOR 类型的 Block（transformer/loader/scratchpad 等）不管代码写什么，**一定会走 PySpark 执行器**。这是 `block.type != BlockType.SENSOR` 这个条件决定的。
+| 维度 | 路径 A（远程执行） | 路径 B（监控路由） |
+|------|-------------------|-------------------|
+| 入口 | ExecutorFactory → PySparkExecutor | get_compute_service() / ComputeService.build() |
+| 关键配置 | executor_type + remote_variables_dir | emr_config + spark_config + kernel |
+| 检查 spark_config？ | ❌ | ✅（B2 要求） |
+| 检查 kernel？ | ❌ | ✅（B1 要求） |
 
-### 结论 2：SENSOR Block 含 spark 字面量也会走 PySpark
+两条路径可以独立生效。Pipeline 在 EMR 上跑起来了（路径 A 通），不代表 Spark UI 能看到（路径 B 可能不通）。
 
-布尔表达式 `block.type != BlockType.SENSOR or is_pyspark_code(block.content)` 意味着：
-- Block 是 SENSOR，但 `is_pyspark_code(block.content)` 返回 True → 依然走 PySpark
-- 上一版描述写反了，特此校正
+### 结论 2：路径 A 的唯一硬约束是 s3_bucket
 
-### 结论 3：空 dict `{}` 在 project 属性中等效于缺失
+PySpark 执行器初始化时，不检查 emr_config 是否为空、不检查 spark_config、不检查 kernel。唯一会导致初始化失败的是 `s3_bucket is None`，即 metadata.yaml 中缺少 `remote_variables_dir: s3://bucket/path`。
 
-`project/__init__.py` L155 和 L159 的 `or None` 转换，会把空 dict `{}` 统一转为 `None`：
+emr_config 为空 dict `{}` 时，`EmrConfig.load()` 用硬编码默认值填充，集群照样能创建。
 
-| metadata.yaml 写法 | repo_config 层 | project 层（经 `or None`） | `if` 判断结果 |
-|---------------------|----------------|---------------------------|---------------|
-| 不写 `spark_config` | `None` | `None` | False |
-| 写 `spark_config: {}` | `{}` | `None`（`{} or None`） | False |
-| 写 `spark_config: {app_name: x}` | `{app_name: x}` | `{app_name: x}` | True |
+### 结论 3：路径 B 中空 dict `{}` 等效于缺失
 
-**emr_config 同理**：不写、写 `emr_config: {}`、写 `emr_config: {有子项}` 三种情况，project 层分别是 `None`、`None`、`{有子项}`。
+`project/__init__.py` L155 和 L159 的 `or None` 转换，把空 dict `{}` 统一转为 `None`：
 
-所以 `spark_config: {}` 和完全不写 spark_config **效果完全相同**，都不能触发 `ComputeService.build()` 的 AWS_EMR 路径。
+| metadata.yaml 写法 | repo_config 层 | project 层 | `if` 判断结果 |
+|---------------------|----------------|------------|---------------|
+| 不写 | `None`（spark_config）或 `{}`（emr_config） | `None` | False |
+| 写 `{}` | `{}` | `None`（`{} or None`） | False |
+| 写有子项 | `{有key}` | `{有key}` | True |
 
-### 结论 4：两个判断入口的 spark_config 要求不同
+`spark_config: {}` 和完全不写 spark_config **效果完全相同**。
 
-| 入口 | 是否检查 spark_config | 空写 `spark_config: {}` 能否通过 |
-|------|-----------------------|----------------------------------|
-| `get_compute_service()` (utils.py) | **不检查** | 不涉及（只看 emr_config + kernel） |
-| `ComputeService.build()` (compute/models.py) | 必须非空 dict | ❌ `{} or None = None` → 不通过 |
+### 结论 4：路径 B 的两个入口要求不同
 
-要完整触发 AWS_EMR，两个入口都需要通过，所以 `spark_config` 必须**至少写一个实际的子项**（如 `app_name: 'my-app'`），不能写空 dict `{}`。
+| 入口 | 检查 spark_config | 检查 kernel | 用途 |
+|------|-------------------|-------------|------|
+| B1 `get_compute_service()` | ❌ | ✅（PYSPARK 或 ignore_active_kernel） | API.build() 路由 |
+| B2 `ComputeService.build()` | ✅（非空 dict） | ❌ | 集群管理页 |
+
+要 Spark UI 完整走 EMR 通道，两个入口都需要通过，所以 `spark_config` 必须**至少写一个实际的子项**。
 
 ### 结论 5：update_status 参数在 PySpark 执行器中被完全忽略
 
 - `PySparkPipelineExecutor.execute()` 有 `update_status` 参数，但方法体内**完全不用**
 - `spark_script.jinja` 中的 `update_status=False` 是**硬编码**，不是传参
 - 两层都不写 Mage DB，状态更新完全依赖上层调用方
-
-> 文档生成时间：2026-06-16  
-> 代码版本：328-mage-ai  
-> 核对方式：逐行比对源码，所有结论均有代码位置标注
