@@ -28,7 +28,7 @@ Mage AI 的文件浏览与 IDE 功能通过 **5 个主要入口** 挂载到不�
 
 ### 1.2 核心复用单元：useFileComponents
 
-**文件位置**：[useFileComponents.tsx](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/components/Files/useFileComponents.tsx#L146-L1226)
+**文件位置**：[useFileComponents.tsx](mage_ai/frontend/components/Files/useFileComponents.tsx#L146-L1226)
 
 这是文件浏览与编辑功能的**核心状态管理 Hook**，所有入口都通过它获得一致的文件操作能力。
 
@@ -55,7 +55,7 @@ Mage AI 的文件浏览与 IDE 功能通过 **5 个主要入口** 挂载到不�
 
 #### 入口 1：管道编辑页（主 IDE）
 
-**文件位置**：[edit.tsx](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/pages/pipelines/%5Bpipeline%5D/edit.tsx#L1103-L1150)
+**文件位置**：[edit.tsx](mage_ai/frontend/pages/pipelines/%5Bpipeline%5D/edit.tsx#L1103-L1150)
 
 **挂载方式**：
 ```typescript
@@ -87,7 +87,7 @@ const {
 
 #### 入口 2：文件管理页（独立页面）
 
-**文件位置**：[files.tsx](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/pages/files.tsx#L1-L20)
+**文件位置**：[files.tsx](mage_ai/frontend/pages/files.tsx#L1-L20)
 
 **挂载方式**：
 ```typescript
@@ -105,7 +105,7 @@ const {
 
 #### 入口 3：管理后台文件页
 
-**文件位置**：[manage/files/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/pages/manage/files/index.tsx#L1-L147)
+**文件位置**：[manage/files/index.tsx](mage_ai/frontend/pages/manage/files/index.tsx#L1-L147)
 
 **挂载方式**：
 ```typescript
@@ -131,7 +131,7 @@ const {
 
 #### 入口 4：版本控制页面
 
-**文件位置**：[VersionControl/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/components/VersionControl/index.tsx#L534-L540)
+**文件位置**：[VersionControl/index.tsx](mage_ai/frontend/components/VersionControl/index.tsx#L534-L540)
 
 **挂载方式**：
 ```typescript
@@ -155,7 +155,7 @@ const {
 
 #### 入口 5：文件选择弹窗
 
-**文件位置**：[FileSelectorPopup/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/components/FileSelectorPopup/index.tsx#L1-L67)
+**文件位置**：[FileSelectorPopup/index.tsx](mage_ai/frontend/components/FileSelectorPopup/index.tsx#L1-L67)
 
 **挂载方式**：
 ```typescript
@@ -203,7 +203,7 @@ useFileComponents (核心 Hook)
 
 ### 2.1 后端路由总览
 
-**文件位置**：[server.py](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/server.py#L236-L397)
+**文件位置**：[server.py](mage_ai/server/server.py#L236-L397)
 
 后端基于 Tornado Web 框架，采用**分层路由**策略：
 
@@ -225,12 +225,12 @@ useFileComponents (核心 Hook)
 
 | HTTP 方法 | 前端调用 | 后端路由模式 | 处理 Handler | 对应 Resource |
 |----------|---------|-------------|-------------|--------------|
-| GET | `api.files.list()` | `/api/files` | `ApiResourceListHandler` | [FileResource.collection()](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/api/resources/FileResource.py#L30-L127) |
-| POST | `api.files.useCreate()` | `/api/files` | `ApiResourceListHandler` | [FileResource.create()](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/api/resources/FileResource.py#L129-L200) |
+| GET | `api.files.list()` | `/api/files` | `ApiResourceListHandler` | [FileResource.collection()](mage_ai/api/resources/FileResource.py#L30-L127) |
+| POST | `api.files.useCreate()` | `/api/files` | `ApiResourceListHandler` | [FileResource.create()](mage_ai/api/resources/FileResource.py#L129-L200) |
 | GET | `api.files.detail(pk)` | `/api/files/{pk}` | `ApiResourceDetailHandler` | [FileResource.member()](#) |
 | PUT | `api.files.useUpdate(pk)` | `/api/files/{pk}` | `ApiResourceDetailHandler` | [FileResource.update()](#) |
 | DELETE | `api.files.useDelete(pk)` | `/api/files/{pk}` | `ApiResourceDetailHandler` | [FileResource.delete()](#) |
-| GET | `api.file_contents.detail(pk)` | `/api/file_contents/{pk}` | `ApiResourceDetailHandler` | [FileContentResource.member()](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/api/resources/FileContentResource.py#L1-L50) |
+| GET | `api.file_contents.detail(pk)` | `/api/file_contents/{pk}` | `ApiResourceDetailHandler` | [FileContentResource.member()](mage_ai/api/resources/FileContentResource.py#L1-L50) |
 | PUT | `api.file_contents.useUpdate(pk)` | `/api/file_contents/{pk}` | `ApiResourceDetailHandler` | [FileContentResource.update()](#) |
 | GET | `api.files.file_versions.list(parentId)` | `/api/files/{pk}/file_versions` | `ApiChildListHandler` | — |
 
@@ -249,7 +249,7 @@ useFileComponents (核心 Hook)
 
 ### 2.3 前端 API 层架构
 
-**文件位置**：[api/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/api/index.ts#L1-L473)
+**文件位置**：[api/index.ts](mage_ai/frontend/api/index.ts#L1-L473)
 
 前端 API 层采用**资源驱动的自动生成**模式：
 
@@ -318,7 +318,7 @@ Tornado 路由匹配
 | `/websocket/terminal` | `TerminalWebsocketServer` | 终端实时通信 |
 
 **终端 WebSocket 详情**：
-- **文件位置**：[terminal_server.py](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/terminal_server.py#L51-L157)
+- **文件位置**：[terminal_server.py](mage_ai/server/terminal_server.py#L51-L157)
 - **查询参数**：`term_name`（终端名称）、`cwd`（工作目录）
 - **消息协议**：JSON 格式的 stdin/stdout 消息
 
@@ -376,7 +376,7 @@ useFileComponents 接收内容变化
 
 #### 第一层：FileEditor 组件内保存
 
-**文件位置**：[FileEditor/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/components/FileEditor/index.tsx#L174-L232)
+**文件位置**：[FileEditor/index.tsx](mage_ai/frontend/components/FileEditor/index.tsx#L174-L232)
 
 ```typescript
 // Mutation 定义
@@ -434,7 +434,7 @@ const saveFile = useCallback((value: string, f: FileType) => {
 
 #### 第二层：useFileComponents 集中保存
 
-**文件位置**：[useFileComponents.tsx](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/components/Files/useFileComponents.tsx#L622-L671)
+**文件位置**：[useFileComponents.tsx](mage_ai/frontend/components/Files/useFileComponents.tsx#L622-L671)
 
 ```typescript
 const [updateFile, { isLoading: isLoadingUpdate }] = useMutation(
@@ -472,7 +472,7 @@ const [updateFile, { isLoading: isLoadingUpdate }] = useMutation(
 
 #### 第三层：后端 FileContentResource
 
-**文件位置**：[FileContentResource.py](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/api/resources/FileContentResource.py#L1-L80)
+**文件位置**：[FileContentResource.py](mage_ai/api/resources/FileContentResource.py#L1-L80)
 
 后端处理流程：
 1. **权限验证**：FileContentPolicy 检查用户是否有编辑权限
@@ -548,7 +548,7 @@ contentTouchedMapping: {
 
 ### 4.2 前端终端 Hook：useTerminal
 
-**文件位置**：[useTerminal/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/components/Terminal/useTerminal/index.tsx#L1-L350)
+**文件位置**：[useTerminal/index.tsx](mage_ai/frontend/components/Terminal/useTerminal/index.tsx#L1-L350)
 
 #### 核心状态
 
@@ -633,24 +633,24 @@ const handleKeyDown = useCallback((e) => {
 
 ### 4.3 后端终端服务器
 
-**文件位置**：[terminal_server.py](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/terminal_server.py#L1-L157)
+**文件位置**：[terminal_server.py](mage_ai/server/terminal_server.py#L1-L157)
 
 #### 终端管理器
 
-**命名终端管理器** ([MageTermManager](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/terminal_server.py#L22-L38))：
+**命名终端管理器** ([MageTermManager](mage_ai/server/terminal_server.py#L22-L38))：
 - 继承 `terminado.NamedTermManager`
 - 按 `term_name` 复用终端实例
 - 支持最大终端数限制
 - 同一个名称的连接共享同一个 pty 进程
 
-**唯一终端管理器** ([MageUniqueTermManager](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/terminal_server.py#L41-L48))：
+**唯一终端管理器** ([MageUniqueTermManager](mage_ai/server/terminal_server.py#L41-L48))：
 - 继承 `terminado.UniqueTermManager`
 - 每个连接创建新的终端实例
 - 由 `USE_UNIQUE_TERMINAL` 环境变量控制
 
 #### 连接建立流程
 
-**`open()` 方法** ([第 67-95 行](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/terminal_server.py#L67-L95))：
+**`open()` 方法** ([第 67-95 行](mage_ai/server/terminal_server.py#L67-L95))：
 
 ```
 WebSocket 连接请求
@@ -673,7 +673,7 @@ WebSocket 连接请求
 
 #### 命令处理流程
 
-**`on_message()` 方法** ([第 98-136 行](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/terminal_server.py#L98-L136))：
+**`on_message()` 方法** ([第 98-136 行](mage_ai/server/terminal_server.py#L98-L136))：
 
 ```
 接收 WebSocket 消息
@@ -697,7 +697,7 @@ WebSocket 连接请求
 
 #### 输出转发流程
 
-**`on_pty_read()` 方法** ([第 59-65 行](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/terminal_server.py#L59-L65))：
+**`on_pty_read()` 方法** ([第 59-65 行](mage_ai/server/terminal_server.py#L59-L65))：
 
 ```
 pty 进程产生输出
@@ -742,11 +742,11 @@ pty 进程产生输出
 
 | 安全层级 | 检查点 | 位置 |
 |---------|-------|------|
-| 路径安全 | `ensure_file_is_in_project(cwd)` | [terminal_server.py L80](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/terminal_server.py#L80) |
-| 禁用开关 | `DISABLE_TERMINAL` 环境变量 | [terminal_server.py L111](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/terminal_server.py#L111) |
-| 用户认证 | `REQUIRE_USER_AUTHENTICATION` | [terminal_server.py L115](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/terminal_server.py#L115) |
-| 角色权限 | `has_at_least_editor_role()` | [terminal_server.py L124](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/terminal_server.py#L124) |
-| 编辑权限 | `is_disable_pipeline_edit_access()` | [terminal_server.py L115](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/server/terminal_server.py#L115) |
+| 路径安全 | `ensure_file_is_in_project(cwd)` | [terminal_server.py L80](mage_ai/server/terminal_server.py#L80) |
+| 禁用开关 | `DISABLE_TERMINAL` 环境变量 | [terminal_server.py L111](mage_ai/server/terminal_server.py#L111) |
+| 用户认证 | `REQUIRE_USER_AUTHENTICATION` | [terminal_server.py L115](mage_ai/server/terminal_server.py#L115) |
+| 角色权限 | `has_at_least_editor_role()` | [terminal_server.py L124](mage_ai/server/terminal_server.py#L124) |
+| 编辑权限 | `is_disable_pipeline_edit_access()` | [terminal_server.py L115](mage_ai/server/terminal_server.py#L115) |
 
 ---
 
@@ -940,7 +940,7 @@ disconnected ──connect──▶ connecting ──setup──▶ connected
 
 #### 分支 1：树形结构 vs 扁平化结构
 
-**决策点**：[FileResource.collection()](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/api/resources/FileResource.py#L93-L127)
+**决策点**：[FileResource.collection()](mage_ai/api/resources/FileResource.py#L93-L127)
 
 | 模式 | 查询参数 | 数据结构 | 使用场景 |
 |------|---------|---------|---------|
@@ -1083,7 +1083,7 @@ if shell_command is None:
 
 ### 7.1 递归文件树渲染
 
-**核心组件**：[FileBrowser/Folder/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/components/FileBrowser/Folder/index.tsx)
+**核心组件**：[FileBrowser/Folder/index.tsx](mage_ai/frontend/components/FileBrowser/Folder/index.tsx)
 
 **特点**：
 - Folder 组件递归渲染自身
@@ -1093,7 +1093,7 @@ if shell_command is None:
 
 ### 7.2 多文件编辑器控制器
 
-**核心组件**：[FileEditor/Controller.tsx](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/components/FileEditor/Controller.tsx)
+**核心组件**：[FileEditor/Controller.tsx](mage_ai/frontend/components/FileEditor/Controller.tsx)
 
 **设计模式**：
 - 遍历 `openFilePaths` 渲染多个 FileEditor
@@ -1159,7 +1159,7 @@ if shell_command is None:
 
 | 键名 | 内容 | 位置 |
 |------|------|------|
-| `openFilePaths` | 已打开文件列表 | [@storage/files](file:///d:/fz/0601/solo-dogfeeding/code/330-mage-ai/mage_ai/frontend/storage/files.ts) |
+| `openFilePaths` | 已打开文件列表 | [@storage/files](mage_ai/frontend/storage/files.ts) |
 | `foldersState` | 文件夹展开状态 | `LOCAL_STORAGE_KEY_FOLDERS_STATE` |
 | `showHiddenFiles` | 显示隐藏文件 | `LOCAL_STORAGE_KEY_SHOW_HIDDEN_FILES` |
 | `selectedTab` | 选中的标签 | 各页面自定义 |
